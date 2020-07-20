@@ -3,7 +3,7 @@
  * copy_fetch.c
  *	  Functions for using a data directory as the source.
  *
- * Portions Copyright (c) 2013-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2020, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -76,7 +76,7 @@ recurse_dir(const char *datadir, const char *parentpath,
 			if (errno == ENOENT)
 			{
 				/*
-				 * File doesn't exist anymore. This is ok, if the new master
+				 * File doesn't exist anymore. This is ok, if the new primary
 				 * is running and the file was just removed. If it was a data
 				 * file, there should be a WAL record of the removal. If it
 				 * was something else, it couldn't have been anyway.

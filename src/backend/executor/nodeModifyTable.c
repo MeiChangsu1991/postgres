@@ -3,7 +3,7 @@
  * nodeModifyTable.c
  *	  routines to handle ModifyTable nodes.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -246,7 +246,7 @@ ExecCheckTIDVisible(EState *estate,
  * Compute stored generated columns for a tuple
  */
 void
-ExecComputeStoredGenerated(EState *estate, TupleTableSlot *slot)
+ExecComputeStoredGenerated(EState *estate, TupleTableSlot *slot, CmdType cmdtype)
 {
 	ResultRelInfo *resultRelInfo = estate->es_result_relation_info;
 	Relation	rel = resultRelInfo->ri_RelationDesc;
@@ -269,6 +269,7 @@ ExecComputeStoredGenerated(EState *estate, TupleTableSlot *slot)
 
 		resultRelInfo->ri_GeneratedExprs =
 			(ExprState **) palloc(natts * sizeof(ExprState *));
+		resultRelInfo->ri_NumGeneratedNeeded = 0;
 
 		for (int i = 0; i < natts; i++)
 		{
@@ -276,17 +277,40 @@ ExecComputeStoredGenerated(EState *estate, TupleTableSlot *slot)
 			{
 				Expr	   *expr;
 
+				/*
+				 * If it's an update and the current column was not marked as
+				 * being updated, then we can skip the computation.  But if
+				 * there is a BEFORE ROW UPDATE trigger, we cannot skip
+				 * because the trigger might affect additional columns.
+				 */
+				if (cmdtype == CMD_UPDATE &&
+					!(rel->trigdesc && rel->trigdesc->trig_update_before_row) &&
+					!bms_is_member(i + 1 - FirstLowInvalidHeapAttributeNumber,
+								   exec_rt_fetch(resultRelInfo->ri_RangeTableIndex, estate)->extraUpdatedCols))
+				{
+					resultRelInfo->ri_GeneratedExprs[i] = NULL;
+					continue;
+				}
+
 				expr = (Expr *) build_column_default(rel, i + 1);
 				if (expr == NULL)
 					elog(ERROR, "no generation expression found for column number %d of table \"%s\"",
 						 i + 1, RelationGetRelationName(rel));
 
 				resultRelInfo->ri_GeneratedExprs[i] = ExecPrepareExpr(expr, estate);
+				resultRelInfo->ri_NumGeneratedNeeded++;
 			}
 		}
 
 		MemoryContextSwitchTo(oldContext);
 	}
+
+	/*
+	 * If no generated columns have been affected by this change, then skip
+	 * the rest.
+	 */
+	if (resultRelInfo->ri_NumGeneratedNeeded == 0)
+		return;
 
 	oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
@@ -300,7 +324,8 @@ ExecComputeStoredGenerated(EState *estate, TupleTableSlot *slot)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
 
-		if (attr->attgenerated == ATTRIBUTE_GENERATED_STORED)
+		if (attr->attgenerated == ATTRIBUTE_GENERATED_STORED &&
+			resultRelInfo->ri_GeneratedExprs[i])
 		{
 			ExprContext *econtext;
 			Datum		val;
@@ -310,6 +335,13 @@ ExecComputeStoredGenerated(EState *estate, TupleTableSlot *slot)
 			econtext->ecxt_scantuple = slot;
 
 			val = ExecEvalExpr(resultRelInfo->ri_GeneratedExprs[i], econtext, &isnull);
+
+			/*
+			 * We must make a copy of val as we have no guarantees about where
+			 * memory for a pass-by-reference Datum is located.
+			 */
+			if (!isnull)
+				val = datumCopy(val, attr->attbyval, attr->attlen);
 
 			values[i] = val;
 			nulls[i] = isnull;
@@ -392,7 +424,7 @@ ExecInsert(ModifyTableState *mtstate,
 		 */
 		if (resultRelationDesc->rd_att->constr &&
 			resultRelationDesc->rd_att->constr->has_generated_stored)
-			ExecComputeStoredGenerated(estate, slot);
+			ExecComputeStoredGenerated(estate, slot, CMD_INSERT);
 
 		/*
 		 * insert into foreign table: let the FDW do it
@@ -411,7 +443,6 @@ ExecInsert(ModifyTableState *mtstate,
 		 * them.
 		 */
 		slot->tts_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-
 	}
 	else
 	{
@@ -428,7 +459,7 @@ ExecInsert(ModifyTableState *mtstate,
 		 */
 		if (resultRelationDesc->rd_att->constr &&
 			resultRelationDesc->rd_att->constr->has_generated_stored)
-			ExecComputeStoredGenerated(estate, slot);
+			ExecComputeStoredGenerated(estate, slot, CMD_INSERT);
 
 		/*
 		 * Check any RLS WITH CHECK policies.
@@ -828,7 +859,7 @@ ldelete:;
 					 * Already know that we're going to need to do EPQ, so
 					 * fetch tuple directly into the right slot.
 					 */
-					EvalPlanQualBegin(epqstate, estate);
+					EvalPlanQualBegin(epqstate);
 					inputslot = EvalPlanQualSlot(epqstate, resultRelationDesc,
 												 resultRelInfo->ri_RangeTableIndex);
 
@@ -843,8 +874,7 @@ ldelete:;
 					{
 						case TM_Ok:
 							Assert(tmfd.traversed);
-							epqslot = EvalPlanQual(estate,
-												   epqstate,
+							epqslot = EvalPlanQual(epqstate,
 												   resultRelationDesc,
 												   resultRelInfo->ri_RangeTableIndex,
 												   inputslot);
@@ -1090,7 +1120,7 @@ ExecUpdate(ModifyTableState *mtstate,
 		 */
 		if (resultRelationDesc->rd_att->constr &&
 			resultRelationDesc->rd_att->constr->has_generated_stored)
-			ExecComputeStoredGenerated(estate, slot);
+			ExecComputeStoredGenerated(estate, slot, CMD_UPDATE);
 
 		/*
 		 * update in foreign table: let the FDW do it
@@ -1127,7 +1157,7 @@ ExecUpdate(ModifyTableState *mtstate,
 		 */
 		if (resultRelationDesc->rd_att->constr &&
 			resultRelationDesc->rd_att->constr->has_generated_stored)
-			ExecComputeStoredGenerated(estate, slot);
+			ExecComputeStoredGenerated(estate, slot, CMD_UPDATE);
 
 		/*
 		 * Check any RLS UPDATE WITH CHECK policies
@@ -1370,7 +1400,6 @@ lreplace:;
 					 * Already know that we're going to need to do EPQ, so
 					 * fetch tuple directly into the right slot.
 					 */
-					EvalPlanQualBegin(epqstate, estate);
 					inputslot = EvalPlanQualSlot(epqstate, resultRelationDesc,
 												 resultRelInfo->ri_RangeTableIndex);
 
@@ -1386,8 +1415,7 @@ lreplace:;
 						case TM_Ok:
 							Assert(tmfd.traversed);
 
-							epqslot = EvalPlanQual(estate,
-												   epqstate,
+							epqslot = EvalPlanQual(epqstate,
 												   resultRelationDesc,
 												   resultRelInfo->ri_RangeTableIndex,
 												   inputslot);
@@ -1959,8 +1987,7 @@ ExecSetupChildParentMapForSubplan(ModifyTableState *mtstate)
 	{
 		mtstate->mt_per_subplan_tupconv_maps[i] =
 			convert_tuples_by_name(RelationGetDescr(resultRelInfos[i].ri_RelationDesc),
-								   outdesc,
-								   gettext_noop("could not convert row type"));
+								   outdesc);
 	}
 }
 
@@ -2014,7 +2041,7 @@ ExecModifyTable(PlanState *pstate)
 	 * case it is within a CTE subplan.  Hence this test must be here, not in
 	 * ExecInitModifyTable.)
 	 */
-	if (estate->es_epqTupleSlot != NULL)
+	if (estate->es_epq_active != NULL)
 		elog(ERROR, "ModifyTable should not be called during EvalPlanQual");
 
 	/*
@@ -2531,9 +2558,6 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		econtext = mtstate->ps.ps_ExprContext;
 		relationDesc = resultRelInfo->ri_RelationDesc->rd_att;
 
-		/* carried forward solely for the benefit of explain */
-		mtstate->mt_excludedtlist = node->exclRelTlist;
-
 		/* create state for DO UPDATE SET operation */
 		resultRelInfo->ri_onConflict = makeNode(OnConflictSetState);
 
@@ -2542,11 +2566,16 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 			table_slot_create(resultRelInfo->ri_RelationDesc,
 							  &mtstate->ps.state->es_tupleTable);
 
-		/* create the tuple slot for the UPDATE SET projection */
+		/*
+		 * Create the tuple slot for the UPDATE SET projection. We want a slot
+		 * of the table's type here, because the slot will be used to insert
+		 * into the table, and for RETURNING processing - which may access
+		 * system attributes.
+		 */
 		tupDesc = ExecTypeFromTL((List *) node->onConflictSet);
 		resultRelInfo->ri_onConflict->oc_ProjSlot =
 			ExecInitExtraTupleSlot(mtstate->ps.state, tupDesc,
-								   &TTSOpsVirtual);
+								   table_slot_callbacks(resultRelInfo->ri_RelationDesc));
 
 		/* build UPDATE SET projection state */
 		resultRelInfo->ri_onConflict->oc_ProjInfo =

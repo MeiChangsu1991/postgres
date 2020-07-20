@@ -3,7 +3,7 @@
  * spi.c
  *				Server Programming Interface
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -60,7 +60,8 @@ static void _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan);
 
 static int	_SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 							  Snapshot snapshot, Snapshot crosscheck_snapshot,
-							  bool read_only, bool fire_triggers, uint64 tcount);
+							  bool read_only, bool fire_triggers, uint64 tcount,
+							  DestReceiver *caller_dest);
 
 static ParamListInfo _SPI_convert_params(int nargs, Oid *argtypes,
 										 Datum *Values, const char *Nulls);
@@ -513,7 +514,7 @@ SPI_execute(const char *src, bool read_only, long tcount)
 
 	res = _SPI_execute_plan(&plan, NULL,
 							InvalidSnapshot, InvalidSnapshot,
-							read_only, true, tcount);
+							read_only, true, tcount, NULL);
 
 	_SPI_end_call(true);
 	return res;
@@ -547,7 +548,7 @@ SPI_execute_plan(SPIPlanPtr plan, Datum *Values, const char *Nulls,
 							_SPI_convert_params(plan->nargs, plan->argtypes,
 												Values, Nulls),
 							InvalidSnapshot, InvalidSnapshot,
-							read_only, true, tcount);
+							read_only, true, tcount, NULL);
 
 	_SPI_end_call(true);
 	return res;
@@ -576,7 +577,36 @@ SPI_execute_plan_with_paramlist(SPIPlanPtr plan, ParamListInfo params,
 
 	res = _SPI_execute_plan(plan, params,
 							InvalidSnapshot, InvalidSnapshot,
-							read_only, true, tcount);
+							read_only, true, tcount, NULL);
+
+	_SPI_end_call(true);
+	return res;
+}
+
+/*
+ * Execute a previously prepared plan.  If dest isn't NULL, we send result
+ * tuples to the caller-supplied DestReceiver rather than through the usual
+ * SPI output arrangements.  If dest is NULL this is equivalent to
+ * SPI_execute_plan_with_paramlist.
+ */
+int
+SPI_execute_plan_with_receiver(SPIPlanPtr plan,
+							   ParamListInfo params,
+							   bool read_only, long tcount,
+							   DestReceiver *dest)
+{
+	int			res;
+
+	if (plan == NULL || plan->magic != _SPI_PLAN_MAGIC || tcount < 0)
+		return SPI_ERROR_ARGUMENT;
+
+	res = _SPI_begin_call(true);
+	if (res < 0)
+		return res;
+
+	res = _SPI_execute_plan(plan, params,
+							InvalidSnapshot, InvalidSnapshot,
+							read_only, true, tcount, dest);
 
 	_SPI_end_call(true);
 	return res;
@@ -617,7 +647,7 @@ SPI_execute_snapshot(SPIPlanPtr plan,
 							_SPI_convert_params(plan->nargs, plan->argtypes,
 												Values, Nulls),
 							snapshot, crosscheck_snapshot,
-							read_only, fire_triggers, tcount);
+							read_only, fire_triggers, tcount, NULL);
 
 	_SPI_end_call(true);
 	return res;
@@ -664,7 +694,50 @@ SPI_execute_with_args(const char *src,
 
 	res = _SPI_execute_plan(&plan, paramLI,
 							InvalidSnapshot, InvalidSnapshot,
-							read_only, true, tcount);
+							read_only, true, tcount, NULL);
+
+	_SPI_end_call(true);
+	return res;
+}
+
+/*
+ * SPI_execute_with_receiver -- plan and execute a query with arguments
+ *
+ * This is the same as SPI_execute_with_args except that parameters are
+ * supplied through a ParamListInfo, and (if dest isn't NULL) we send
+ * result tuples to the caller-supplied DestReceiver rather than through
+ * the usual SPI output arrangements.
+ */
+int
+SPI_execute_with_receiver(const char *src,
+						  ParamListInfo params,
+						  bool read_only, long tcount,
+						  DestReceiver *dest)
+{
+	int			res;
+	_SPI_plan	plan;
+
+	if (src == NULL || tcount < 0)
+		return SPI_ERROR_ARGUMENT;
+
+	res = _SPI_begin_call(true);
+	if (res < 0)
+		return res;
+
+	memset(&plan, 0, sizeof(_SPI_plan));
+	plan.magic = _SPI_PLAN_MAGIC;
+	plan.cursor_options = CURSOR_OPT_PARALLEL_OK;
+	if (params)
+	{
+		plan.parserSetup = params->parserSetup;
+		plan.parserSetupArg = params->parserSetupArg;
+	}
+
+	_SPI_prepare_oneshot_plan(src, &plan);
+
+	res = _SPI_execute_plan(&plan, params,
+							InvalidSnapshot, InvalidSnapshot,
+							read_only, true, tcount, dest);
 
 	_SPI_end_call(true);
 	return res;
@@ -1303,6 +1376,49 @@ SPI_cursor_open_with_paramlist(const char *name, SPIPlanPtr plan,
 	return SPI_cursor_open_internal(name, plan, params, read_only);
 }
 
+/*
+ * SPI_cursor_parse_open_with_paramlist()
+ *
+ * Same as SPI_cursor_open_with_args except that parameters (if any) are passed
+ * as a ParamListInfo, which supports dynamic parameter set determination
+ */
+Portal
+SPI_cursor_parse_open_with_paramlist(const char *name,
+									 const char *src,
+									 ParamListInfo params,
+									 bool read_only, int cursorOptions)
+{
+	Portal		result;
+	_SPI_plan	plan;
+
+	if (src == NULL)
+		elog(ERROR, "SPI_cursor_parse_open_with_paramlist called with invalid arguments");
+
+	SPI_result = _SPI_begin_call(true);
+	if (SPI_result < 0)
+		elog(ERROR, "SPI_cursor_parse_open_with_paramlist called while not connected");
+
+	memset(&plan, 0, sizeof(_SPI_plan));
+	plan.magic = _SPI_PLAN_MAGIC;
+	plan.cursor_options = cursorOptions;
+	if (params)
+	{
+		plan.parserSetup = params->parserSetup;
+		plan.parserSetupArg = params->parserSetupArg;
+	}
+
+	_SPI_prepare_plan(src, &plan);
+
+	/* We needn't copy the plan; SPI_cursor_open_internal will do so */
+
+	result = SPI_cursor_open_internal(name, &plan, params, read_only);
+
+	/* And clean up */
+	_SPI_end_call(true);
+
+	return result;
+}
+
 
 /*
  * SPI_cursor_open_internal()
@@ -1338,7 +1454,7 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 				(errcode(ERRCODE_INVALID_CURSOR_DEFINITION),
 		/* translator: %s is name of a SQL command, eg INSERT */
 				 errmsg("cannot open %s query as cursor",
-						plansource->commandTag)));
+						GetCommandTagName(plansource->commandTag))));
 	}
 
 	Assert(list_length(plan->plancache_list) == 1);
@@ -1450,14 +1566,13 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 	portal->queryEnv = _SPI_current->queryEnv;
 
 	/*
-	 * If told to be read-only, or in parallel mode, verify that this query is
-	 * in fact read-only.  This can't be done earlier because we need to look
-	 * at the finished, planned queries.  (In particular, we don't want to do
-	 * it between GetCachedPlan and PortalDefineQuery, because throwing an
-	 * error between those steps would result in leaking our plancache
-	 * refcount.)
+	 * If told to be read-only, we'd better check for read-only queries. This
+	 * can't be done earlier because we need to look at the finished, planned
+	 * queries.  (In particular, we don't want to do it between GetCachedPlan
+	 * and PortalDefineQuery, because throwing an error between those steps
+	 * would result in leaking our plancache refcount.)
 	 */
-	if (read_only || IsInParallelMode())
+	if (read_only)
 	{
 		ListCell   *lc;
 
@@ -1466,16 +1581,11 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 			PlannedStmt *pstmt = lfirst_node(PlannedStmt, lc);
 
 			if (!CommandIsReadOnly(pstmt))
-			{
-				if (read_only)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					/* translator: %s is a SQL statement name */
-							 errmsg("%s is not allowed in a non-volatile function",
-									CreateCommandTag((Node *) pstmt))));
-				else
-					PreventCommandIfParallelMode(CreateCommandTag((Node *) pstmt));
-			}
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				/* translator: %s is a SQL statement name */
+						 errmsg("%s is not allowed in a non-volatile function",
+								CreateCommandName((Node *) pstmt))));
 		}
 	}
 
@@ -1872,8 +1982,9 @@ spi_dest_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	slist_push_head(&_SPI_current->tuptables, &tuptable->next);
 
 	/* set up initial allocations */
-	tuptable->alloced = tuptable->free = 128;
+	tuptable->alloced = 128;
 	tuptable->vals = (HeapTuple *) palloc(tuptable->alloced * sizeof(HeapTuple));
+	tuptable->numvals = 0;
 	tuptable->tupdesc = CreateTupleDescCopy(typeinfo);
 
 	MemoryContextSwitchTo(oldcxt);
@@ -1899,18 +2010,18 @@ spi_printtup(TupleTableSlot *slot, DestReceiver *self)
 
 	oldcxt = MemoryContextSwitchTo(tuptable->tuptabcxt);
 
-	if (tuptable->free == 0)
+	if (tuptable->numvals >= tuptable->alloced)
 	{
 		/* Double the size of the pointer array */
-		tuptable->free = tuptable->alloced;
-		tuptable->alloced += tuptable->free;
+		uint64		newalloced = tuptable->alloced * 2;
+
 		tuptable->vals = (HeapTuple *) repalloc_huge(tuptable->vals,
-													 tuptable->alloced * sizeof(HeapTuple));
+													 newalloced * sizeof(HeapTuple));
+		tuptable->alloced = newalloced;
 	}
 
-	tuptable->vals[tuptable->alloced - tuptable->free] =
-		ExecCopySlotHeapTuple(slot);
-	(tuptable->free)--;
+	tuptable->vals[tuptable->numvals] = ExecCopySlotHeapTuple(slot);
+	(tuptable->numvals)++;
 
 	MemoryContextSwitchTo(oldcxt);
 
@@ -2095,11 +2206,13 @@ _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan)
  * fire_triggers: true to fire AFTER triggers at end of query (normal case);
  *		false means any AFTER triggers are postponed to end of outer query
  * tcount: execution tuple-count limit, or 0 for none
+ * caller_dest: DestReceiver to receive output, or NULL for normal SPI output
  */
 static int
 _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				  Snapshot snapshot, Snapshot crosscheck_snapshot,
-				  bool read_only, bool fire_triggers, uint64 tcount)
+				  bool read_only, bool fire_triggers, uint64 tcount,
+				  DestReceiver *caller_dest)
 {
 	int			my_res = 0;
 	uint64		my_processed = 0;
@@ -2233,6 +2346,12 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 			bool		canSetTag = stmt->canSetTag;
 			DestReceiver *dest;
 
+			/*
+			 * Reset output state.  (Note that if a non-SPI receiver is used,
+			 * _SPI_current->processed will stay zero, and that's what we'll
+			 * report to the caller.  It's the receiver's job to count tuples
+			 * in that case.)
+			 */
 			_SPI_current->processed = 0;
 			_SPI_current->tuptable = NULL;
 
@@ -2260,10 +2379,7 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				/* translator: %s is a SQL statement name */
 						 errmsg("%s is not allowed in a non-volatile function",
-								CreateCommandTag((Node *) stmt))));
-
-			if (IsInParallelMode() && !CommandIsReadOnly(stmt))
-				PreventCommandIfParallelMode(CreateCommandTag((Node *) stmt));
+								CreateCommandName((Node *) stmt))));
 
 			/*
 			 * If not read-only mode, advance the command counter before each
@@ -2275,7 +2391,16 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				UpdateActiveSnapshotCommandId();
 			}
 
-			dest = CreateDestReceiver(canSetTag ? DestSPI : DestNone);
+			/*
+			 * Select appropriate tuple receiver.  Output from non-canSetTag
+			 * subqueries always goes to the bit bucket.
+			 */
+			if (!canSetTag)
+				dest = CreateDestReceiver(DestNone);
+			else if (caller_dest)
+				dest = caller_dest;
+			else
+				dest = CreateDestReceiver(DestSPI);
 
 			if (stmt->utilityStmt == NULL)
 			{
@@ -2299,8 +2424,8 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 			}
 			else
 			{
-				char		completionTag[COMPLETION_TAG_BUFSIZE];
 				ProcessUtilityContext context;
+				QueryCompletion qc;
 
 				/*
 				 * If the SPI context is atomic, or we are asked to manage
@@ -2314,18 +2439,18 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				else
 					context = PROCESS_UTILITY_QUERY_NONATOMIC;
 
+				InitializeQueryCompletion(&qc);
 				ProcessUtility(stmt,
 							   plansource->query_string,
 							   context,
 							   paramLI,
 							   _SPI_current->queryEnv,
 							   dest,
-							   completionTag);
+							   &qc);
 
 				/* Update "processed" if stmt returned tuples */
 				if (_SPI_current->tuptable)
-					_SPI_current->processed = _SPI_current->tuptable->alloced -
-						_SPI_current->tuptable->free;
+					_SPI_current->processed = _SPI_current->tuptable->numvals;
 
 				res = SPI_OK_UTILITY;
 
@@ -2337,9 +2462,8 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				{
 					CreateTableAsStmt *ctastmt = (CreateTableAsStmt *) stmt->utilityStmt;
 
-					if (strncmp(completionTag, "SELECT ", 7) == 0)
-						_SPI_current->processed =
-							pg_strtouint64(completionTag + 7, NULL, 10);
+					if (qc.commandTag == CMDTAG_SELECT)
+						_SPI_current->processed = qc.nprocessed;
 					else
 					{
 						/*
@@ -2360,16 +2484,15 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				}
 				else if (IsA(stmt->utilityStmt, CopyStmt))
 				{
-					Assert(strncmp(completionTag, "COPY ", 5) == 0);
-					_SPI_current->processed = pg_strtouint64(completionTag + 5,
-															 NULL, 10);
+					Assert(qc.commandTag == CMDTAG_COPY);
+					_SPI_current->processed = qc.nprocessed;
 				}
 			}
 
 			/*
 			 * The last canSetTag query sets the status values returned to the
 			 * caller.  Be careful to free any tuptables not returned, to
-			 * avoid intratransaction memory leak.
+			 * avoid intra-transaction memory leak.
 			 */
 			if (canSetTag)
 			{
@@ -2383,7 +2506,13 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				SPI_freetuptable(_SPI_current->tuptable);
 				_SPI_current->tuptable = NULL;
 			}
-			/* we know that the receiver doesn't need a destroy call */
+
+			/*
+			 * We don't issue a destroy call to the receiver.  The SPI and
+			 * None receivers would ignore it anyway, while if the caller
+			 * supplied a receiver, it's not our job to destroy it.
+			 */
+
 			if (res < 0)
 			{
 				my_res = res;
@@ -2475,7 +2604,7 @@ _SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, uint64 tcount)
 	switch (operation)
 	{
 		case CMD_SELECT:
-			if (queryDesc->dest->mydest != DestSPI)
+			if (queryDesc->dest->mydest == DestNone)
 			{
 				/* Don't return SPI_OK_SELECT if we're discarding result */
 				res = SPI_OK_UTILITY;
@@ -2603,7 +2732,7 @@ _SPI_cursor_operation(Portal portal, FetchDirection direction, long count,
 
 	/*
 	 * Think not to combine this store with the preceding function call. If
-	 * the portal contains calls to functions that use SPI, then SPI_stack is
+	 * the portal contains calls to functions that use SPI, then _SPI_stack is
 	 * likely to move around while the portal runs.  When control returns,
 	 * _SPI_current will point to the correct stack entry... but the pointer
 	 * may be different than it was beforehand. So we must be sure to re-fetch
@@ -2694,7 +2823,7 @@ _SPI_checktuples(void)
 
 	if (tuptable == NULL)		/* spi_dest_startup was not called */
 		failed = true;
-	else if (processed != (tuptable->alloced - tuptable->free))
+	else if (processed != tuptable->numvals)
 		failed = true;
 
 	return failed;
@@ -2733,7 +2862,7 @@ _SPI_make_plan_non_temp(SPIPlanPtr plan)
 									ALLOCSET_SMALL_SIZES);
 	oldcxt = MemoryContextSwitchTo(plancxt);
 
-	/* Copy the SPI_plan struct and subsidiary data into the new context */
+	/* Copy the _SPI_plan struct and subsidiary data into the new context */
 	newplan = (SPIPlanPtr) palloc0(sizeof(_SPI_plan));
 	newplan->magic = _SPI_PLAN_MAGIC;
 	newplan->plancxt = plancxt;

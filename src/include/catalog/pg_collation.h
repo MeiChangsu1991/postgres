@@ -4,7 +4,7 @@
  *	  definition of the "collation" system catalog (pg_collation)
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_collation.h
@@ -68,6 +68,5 @@ extern Oid	CollationCreate(const char *collname, Oid collnamespace,
 							const char *collversion,
 							bool if_not_exists,
 							bool quiet);
-extern void RemoveCollationById(Oid collationOid);
 
 #endif							/* PG_COLLATION_H */

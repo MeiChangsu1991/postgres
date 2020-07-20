@@ -3,7 +3,7 @@
  * schemacmds.c
  *	  schema creation/manipulation commands
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,8 +21,8 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
-#include "catalog/pg_authid.h"
 #include "catalog/objectaccess.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_namespace.h"
 #include "commands/dbcommands.h"
 #include "commands/event_trigger.h"
@@ -34,7 +34,6 @@
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
-
 
 static void AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId);
 
@@ -209,29 +208,6 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 	SetUserIdAndSecContext(saved_uid, save_sec_context);
 
 	return namespaceId;
-}
-
-/*
- * Guts of schema deletion.
- */
-void
-RemoveSchemaById(Oid schemaOid)
-{
-	Relation	relation;
-	HeapTuple	tup;
-
-	relation = table_open(NamespaceRelationId, RowExclusiveLock);
-
-	tup = SearchSysCache1(NAMESPACEOID,
-						  ObjectIdGetDatum(schemaOid));
-	if (!HeapTupleIsValid(tup)) /* should not happen */
-		elog(ERROR, "cache lookup failed for namespace %u", schemaOid);
-
-	CatalogTupleDelete(relation, &tup->t_self);
-
-	ReleaseSysCache(tup);
-
-	table_close(relation, RowExclusiveLock);
 }
 
 

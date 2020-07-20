@@ -16,7 +16,7 @@
  *		contents of records in here except turning them into a more usable
  *		format.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -31,19 +31,16 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
-#include "access/xlogutils.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
-
+#include "access/xlogutils.h"
 #include "catalog/pg_control.h"
-
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/message.h"
-#include "replication/reorderbuffer.h"
 #include "replication/origin.h"
+#include "replication/reorderbuffer.h"
 #include "replication/snapbuild.h"
-
 #include "storage/standby.h"
 
 typedef struct XLogRecordBuffer
@@ -97,13 +94,29 @@ void
 LogicalDecodingProcessRecord(LogicalDecodingContext *ctx, XLogReaderState *record)
 {
 	XLogRecordBuffer buf;
+	TransactionId txid;
 
 	buf.origptr = ctx->reader->ReadRecPtr;
 	buf.endptr = ctx->reader->EndRecPtr;
 	buf.record = record;
 
+	txid = XLogRecGetTopXid(record);
+
+	/*
+	 * If the top-level xid is valid, we need to assign the subxact to the
+	 * top-level xact. We need to do this for all records, hence we do it
+	 * before the switch.
+	 */
+	if (TransactionIdIsValid(txid))
+	{
+		ReorderBufferAssignChild(ctx->reorder,
+								 txid,
+								 record->decoded_record->xl_xid,
+								 buf.origptr);
+	}
+
 	/* cast so we get a warning when new rmgrs are added */
-	switch ((RmgrIds) XLogRecGetRmid(record))
+	switch ((RmgrId) XLogRecGetRmid(record))
 	{
 			/*
 			 * Rmgrs we care about for logical decoding. Add new rmgrs in
@@ -217,10 +230,8 @@ DecodeXactOp(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	uint8		info = XLogRecGetInfo(r) & XLOG_XACT_OPMASK;
 
 	/*
-	 * No point in doing anything yet, data could not be decoded anyway. It's
-	 * ok not to call ReorderBufferProcessXid() in that case, except in the
-	 * assignment case there'll not be any later records with the same xid;
-	 * and in the assignment case we'll not decode those xacts.
+	 * If the snapshot isn't yet fully built, we cannot decode anything, so
+	 * bail out.
 	 */
 	if (SnapBuildCurrentState(builder) < SNAPBUILD_FULL_SNAPSHOT)
 		return;
@@ -264,22 +275,13 @@ DecodeXactOp(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 				break;
 			}
 		case XLOG_XACT_ASSIGNMENT:
-			{
-				xl_xact_assignment *xlrec;
-				int			i;
-				TransactionId *sub_xid;
 
-				xlrec = (xl_xact_assignment *) XLogRecGetData(r);
-
-				sub_xid = &xlrec->xsub[0];
-
-				for (i = 0; i < xlrec->nsubxacts; i++)
-				{
-					ReorderBufferAssignChild(reorder, xlrec->xtop,
-											 *(sub_xid++), buf->origptr);
-				}
-				break;
-			}
+			/*
+			 * We assign subxact to the toplevel xact while processing each
+			 * record if required.  So, we don't need to do anything here.
+			 * See LogicalDecodingProcessRecord.
+			 */
+			break;
 		case XLOG_XACT_PREPARE:
 
 			/*
@@ -891,6 +893,13 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 	xlrec = (xl_heap_multi_insert *) XLogRecGetData(r);
 
+	/*
+	 * Ignore insert records without new tuples.  This happens when a
+	 * multi_insert is done on a catalog or on a non-persistent relation.
+	 */
+	if (!(xlrec->flags & XLH_INSERT_CONTAINS_NEW_TUPLE))
+		return;
+
 	/* only interested in our database */
 	XLogRecGetBlockTag(r, 0, &rnode, NULL, NULL);
 	if (rnode.dbNode != ctx->slot->data.database)
@@ -900,7 +909,12 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	if (FilterByOrigin(ctx, XLogRecGetOrigin(r)))
 		return;
 
+	/*
+	 * We know that this multi_insert isn't for a catalog, so the block should
+	 * always have data even if a full-page write of it is taken.
+	 */
 	tupledata = XLogRecGetBlockData(r, 0, &tuplelen);
+	Assert(tupledata != NULL);
 
 	data = tupledata;
 	for (i = 0; i < xlrec->ntuples; i++)
@@ -909,6 +923,7 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		xl_multi_insert_tuple *xlhdr;
 		int			datalen;
 		ReorderBufferTupleBuf *tuple;
+		HeapTupleHeader header;
 
 		change = ReorderBufferGetChange(ctx->reorder);
 		change->action = REORDER_BUFFER_CHANGE_INSERT;
@@ -916,49 +931,34 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 		memcpy(&change->data.tp.relnode, &rnode, sizeof(RelFileNode));
 
+		xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(data);
+		data = ((char *) xlhdr) + SizeOfMultiInsertTuple;
+		datalen = xlhdr->datalen;
+
+		change->data.tp.newtuple =
+			ReorderBufferGetTupleBuf(ctx->reorder, datalen);
+
+		tuple = change->data.tp.newtuple;
+		header = tuple->tuple.t_data;
+
+		/* not a disk based tuple */
+		ItemPointerSetInvalid(&tuple->tuple.t_self);
+
 		/*
-		 * CONTAINS_NEW_TUPLE will always be set currently as multi_insert
-		 * isn't used for catalogs, but better be future proof.
-		 *
-		 * We decode the tuple in pretty much the same way as DecodeXLogTuple,
-		 * but since the layout is slightly different, we can't use it here.
+		 * We can only figure this out after reassembling the transactions.
 		 */
-		if (xlrec->flags & XLH_INSERT_CONTAINS_NEW_TUPLE)
-		{
-			HeapTupleHeader header;
+		tuple->tuple.t_tableOid = InvalidOid;
 
-			xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(data);
-			data = ((char *) xlhdr) + SizeOfMultiInsertTuple;
-			datalen = xlhdr->datalen;
+		tuple->tuple.t_len = datalen + SizeofHeapTupleHeader;
 
-			change->data.tp.newtuple =
-				ReorderBufferGetTupleBuf(ctx->reorder, datalen);
+		memset(header, 0, SizeofHeapTupleHeader);
 
-			tuple = change->data.tp.newtuple;
-			header = tuple->tuple.t_data;
-
-			/* not a disk based tuple */
-			ItemPointerSetInvalid(&tuple->tuple.t_self);
-
-			/*
-			 * We can only figure this out after reassembling the
-			 * transactions.
-			 */
-			tuple->tuple.t_tableOid = InvalidOid;
-
-			tuple->tuple.t_len = datalen + SizeofHeapTupleHeader;
-
-			memset(header, 0, SizeofHeapTupleHeader);
-
-			memcpy((char *) tuple->tuple.t_data + SizeofHeapTupleHeader,
-				   (char *) data,
-				   datalen);
-			data += datalen;
-
-			header->t_infomask = xlhdr->t_infomask;
-			header->t_infomask2 = xlhdr->t_infomask2;
-			header->t_hoff = xlhdr->t_hoff;
-		}
+		memcpy((char *) tuple->tuple.t_data + SizeofHeapTupleHeader,
+			   (char *) data,
+			   datalen);
+		header->t_infomask = xlhdr->t_infomask;
+		header->t_infomask2 = xlhdr->t_infomask2;
+		header->t_hoff = xlhdr->t_hoff;
 
 		/*
 		 * Reset toast reassembly state only after the last row in the last
@@ -973,6 +973,9 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 		ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r),
 								 buf->origptr, change);
+
+		/* move to the next xl_multi_insert_tuple entry */
+		data += datalen;
 	}
 	Assert(data == tupledata + tuplelen);
 }

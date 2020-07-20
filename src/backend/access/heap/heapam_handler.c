@@ -3,7 +3,7 @@
  * heapam_handler.c
  *	  heap table access method code
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,15 +19,13 @@
  */
 #include "postgres.h"
 
-#include "miscadmin.h"
-
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
 #include "access/tableam.h"
 #include "access/tsmapi.h"
-#include "access/tuptoaster.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
@@ -35,17 +33,16 @@
 #include "catalog/storage_xlog.h"
 #include "commands/progress.h"
 #include "executor/executor.h"
+#include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
-#include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
-
 
 static void reform_and_rewrite_tuple(HeapTuple tuple,
 									 Relation OldHeap, Relation NewHeap,
@@ -371,9 +368,10 @@ tuple_lock_retry:
 	if (result == TM_Updated &&
 		(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION))
 	{
-		ReleaseBuffer(buffer);
 		/* Should not encounter speculative tuple on recheck */
 		Assert(!HeapTupleHeaderIsSpeculative(tuple->t_data));
+
+		ReleaseBuffer(buffer);
 
 		if (!ItemPointerEquals(&tmfd->ctid, &tuple->t_self))
 		{
@@ -423,7 +421,9 @@ tuple_lock_retry:
 
 					/* otherwise xmin should not be dirty... */
 					if (TransactionIdIsValid(SnapshotDirty.xmin))
-						elog(ERROR, "t_xmin is uncommitted in tuple to be updated");
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_CORRUPTED),
+								 errmsg_internal("t_xmin is uncommitted in tuple to be updated")));
 
 					/*
 					 * If tuple is being updated by other transaction then we
@@ -554,17 +554,6 @@ tuple_lock_retry:
 	ExecStorePinnedBufferHeapTuple(tuple, slot, buffer);
 
 	return result;
-}
-
-static void
-heapam_finish_bulk_insert(Relation relation, int options)
-{
-	/*
-	 * If we skipped writing WAL, then we need to sync the heap (but not
-	 * indexes since those use WAL anyway / don't go through tableam)
-	 */
-	if (options & HEAP_INSERT_SKIP_WAL)
-		heap_sync(relation);
 }
 
 
@@ -699,7 +688,6 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	IndexScanDesc indexScan;
 	TableScanDesc tableScan;
 	HeapScanDesc heapScan;
-	bool		use_wal;
 	bool		is_system_catalog;
 	Tuplesortstate *tuplesort;
 	TupleDesc	oldTupDesc = RelationGetDescr(OldHeap);
@@ -714,12 +702,9 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	is_system_catalog = IsSystemRelation(OldHeap);
 
 	/*
-	 * We need to log the copied data in WAL iff WAL archiving/streaming is
-	 * enabled AND it's a WAL-logged rel.
+	 * Valid smgr_targblock implies something already wrote to the relation.
+	 * This may be harmless, but this function hasn't planned for it.
 	 */
-	use_wal = XLogIsNeeded() && RelationNeedsWAL(NewHeap);
-
-	/* use_wal off requires smgr_targblock be initially invalid */
 	Assert(RelationGetTargetBlock(NewHeap) == InvalidBlockNumber);
 
 	/* Preallocate values/isnull arrays */
@@ -729,7 +714,7 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 
 	/* Initialize the rewrite operation */
 	rwstate = begin_heap_rewrite(OldHeap, NewHeap, OldestXmin, *xid_cutoff,
-								 *multi_cutoff, use_wal);
+								 *multi_cutoff);
 
 
 	/* Set up sorting if wanted */
@@ -1634,10 +1619,9 @@ heapam_index_build_range_scan(Relation heapRelation,
 			 * For a heap-only tuple, pretend its TID is that of the root. See
 			 * src/backend/access/heap/README.HOT for discussion.
 			 */
-			HeapTupleData rootTuple;
+			ItemPointerData tid;
 			OffsetNumber offnum;
 
-			rootTuple = *heapTuple;
 			offnum = ItemPointerGetOffsetNumber(&heapTuple->t_self);
 
 			if (!OffsetNumberIsValid(root_offsets[offnum - 1]))
@@ -1648,18 +1632,18 @@ heapam_index_build_range_scan(Relation heapRelation,
 										 offnum,
 										 RelationGetRelationName(heapRelation))));
 
-			ItemPointerSetOffsetNumber(&rootTuple.t_self,
-									   root_offsets[offnum - 1]);
+			ItemPointerSet(&tid, ItemPointerGetBlockNumber(&heapTuple->t_self),
+						   root_offsets[offnum - 1]);
 
 			/* Call the AM's callback routine to process the tuple */
-			callback(indexRelation, &rootTuple, values, isnull, tupleIsAlive,
+			callback(indexRelation, &tid, values, isnull, tupleIsAlive,
 					 callback_state);
 		}
 		else
 		{
 			/* Call the AM's callback routine to process the tuple */
-			callback(indexRelation, heapTuple, values, isnull, tupleIsAlive,
-					 callback_state);
+			callback(indexRelation, &heapTuple->t_self, values, isnull,
+					 tupleIsAlive, callback_state);
 		}
 	}
 
@@ -2025,7 +2009,7 @@ heapam_relation_needs_toast_table(Relation rel)
 				maxlength_unknown = true;
 			else
 				data_length += maxlen;
-			if (att->attstorage != 'p')
+			if (att->attstorage != TYPSTORAGE_PLAIN)
 				has_toastable_attrs = true;
 		}
 	}
@@ -2037,6 +2021,15 @@ heapam_relation_needs_toast_table(Relation rel)
 							BITMAPLEN(tupdesc->natts)) +
 		MAXALIGN(data_length);
 	return (tuple_length > TOAST_TUPLE_THRESHOLD);
+}
+
+/*
+ * TOAST tables for heap relations are just heap relations.
+ */
+static Oid
+heapam_relation_toast_am(Relation rel)
+{
+	return rel->rd_rel->relam;
 }
 
 
@@ -2164,10 +2157,11 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 			if (valid)
 			{
 				hscan->rs_vistuples[ntup++] = offnum;
-				PredicateLockTuple(scan->rs_rd, &loctup, snapshot);
+				PredicateLockTID(scan->rs_rd, &loctup.t_self, snapshot,
+								 HeapTupleHeaderGetXmin(loctup.t_data));
 			}
-			CheckForSerializableConflictOut(valid, scan->rs_rd, &loctup,
-											buffer, snapshot);
+			HeapCheckForSerializableConflictOut(valid, scan->rs_rd, &loctup,
+												buffer, snapshot);
 		}
 	}
 
@@ -2354,8 +2348,8 @@ heapam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 
 			/* in pagemode, heapgetpage did this for us */
 			if (!pagemode)
-				CheckForSerializableConflictOut(visible, scan->rs_rd, tuple,
-												hscan->rs_cbuf, scan->rs_snapshot);
+				HeapCheckForSerializableConflictOut(visible, scan->rs_rd, tuple,
+													hscan->rs_cbuf, scan->rs_snapshot);
 
 			/* Try next tuple from same page. */
 			if (!visible)
@@ -2517,7 +2511,6 @@ static const TableAmRoutine heapam_methods = {
 	.tuple_delete = heapam_tuple_delete,
 	.tuple_update = heapam_tuple_update,
 	.tuple_lock = heapam_tuple_lock,
-	.finish_bulk_insert = heapam_finish_bulk_insert,
 
 	.tuple_fetch_row_version = heapam_fetch_row_version,
 	.tuple_get_latest_tid = heap_get_latest_tid,
@@ -2537,6 +2530,8 @@ static const TableAmRoutine heapam_methods = {
 
 	.relation_size = table_block_relation_size,
 	.relation_needs_toast_table = heapam_relation_needs_toast_table,
+	.relation_toast_am = heapam_relation_toast_am,
+	.relation_fetch_toast_slice = heap_fetch_toast_slice,
 
 	.relation_estimate_size = heapam_estimate_rel_size,
 

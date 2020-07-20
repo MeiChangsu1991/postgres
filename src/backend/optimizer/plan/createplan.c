@@ -5,7 +5,7 @@
  *	  Planning is complete, we just need to convert the selected
  *	  Path into a Plan.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -98,6 +98,8 @@ static Plan *create_projection_plan(PlannerInfo *root,
 									int flags);
 static Plan *inject_projection_plan(Plan *subplan, List *tlist, bool parallel_safe);
 static Sort *create_sort_plan(PlannerInfo *root, SortPath *best_path, int flags);
+static IncrementalSort *create_incrementalsort_plan(PlannerInfo *root,
+													IncrementalSortPath *best_path, int flags);
 static Group *create_group_plan(PlannerInfo *root, GroupPath *best_path);
 static Unique *create_upper_unique_plan(PlannerInfo *root, UpperUniquePath *best_path,
 										int flags);
@@ -222,9 +224,12 @@ static NestLoop *make_nestloop(List *tlist,
 static HashJoin *make_hashjoin(List *tlist,
 							   List *joinclauses, List *otherclauses,
 							   List *hashclauses,
+							   List *hashoperators, List *hashcollations,
+							   List *hashkeys,
 							   Plan *lefttree, Plan *righttree,
 							   JoinType jointype, bool inner_unique);
 static Hash *make_hash(Plan *lefttree,
+					   List *hashkeys,
 					   Oid skewTable,
 					   AttrNumber skewColumn,
 					   bool skewInherit);
@@ -241,6 +246,10 @@ static MergeJoin *make_mergejoin(List *tlist,
 static Sort *make_sort(Plan *lefttree, int numCols,
 					   AttrNumber *sortColIdx, Oid *sortOperators,
 					   Oid *collations, bool *nullsFirst);
+static IncrementalSort *make_incrementalsort(Plan *lefttree,
+											 int numCols, int nPresortedCols,
+											 AttrNumber *sortColIdx, Oid *sortOperators,
+											 Oid *collations, bool *nullsFirst);
 static Plan *prepare_sort_from_pathkeys(Plan *lefttree, List *pathkeys,
 										Relids relids,
 										const AttrNumber *reqColIdx,
@@ -255,6 +264,8 @@ static EquivalenceMember *find_ec_member_for_tle(EquivalenceClass *ec,
 												 Relids relids);
 static Sort *make_sort_from_pathkeys(Plan *lefttree, List *pathkeys,
 									 Relids relids);
+static IncrementalSort *make_incrementalsort_from_pathkeys(Plan *lefttree,
+														   List *pathkeys, Relids relids, int nPresortedCols);
 static Sort *make_sort_from_groupcols(List *groupcls,
 									  AttrNumber *grpColIdx,
 									  Plan *lefttree);
@@ -457,6 +468,11 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 											 (SortPath *) best_path,
 											 flags);
 			break;
+		case T_IncrementalSort:
+			plan = (Plan *) create_incrementalsort_plan(root,
+														(IncrementalSortPath *) best_path,
+														flags);
+			break;
 		case T_Group:
 			plan = (Plan *) create_group_plan(root,
 											  (GroupPath *) best_path);
@@ -556,8 +572,8 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
 	 * For paranoia's sake, don't modify the stored baserestrictinfo list.
 	 */
 	if (best_path->param_info)
-		scan_clauses = list_concat(list_copy(scan_clauses),
-								   best_path->param_info->ppi_clauses);
+		scan_clauses = list_concat_copy(scan_clauses,
+										best_path->param_info->ppi_clauses);
 
 	/*
 	 * Detect whether we have any pseudoconstant quals to deal with.  Then, if
@@ -1115,6 +1131,7 @@ create_append_plan(PlannerInfo *root, AppendPath *best_path, int flags)
 	plan->plan.qual = NIL;
 	plan->plan.lefttree = NULL;
 	plan->plan.righttree = NULL;
+	plan->apprelids = rel->relids;
 
 	if (pathkeys != NIL)
 	{
@@ -1292,6 +1309,7 @@ create_merge_append_plan(PlannerInfo *root, MergeAppendPath *best_path,
 	plan->qual = NIL;
 	plan->lefttree = NULL;
 	plan->righttree = NULL;
+	node->apprelids = rel->relids;
 
 	/*
 	 * Compute sort column info, and adjust MergeAppend's tlist as needed.
@@ -1639,6 +1657,7 @@ create_unique_plan(PlannerInfo *root, UniquePath *best_path, int flags)
 								 NIL,
 								 NIL,
 								 best_path->path.rows,
+								 0,
 								 subplan);
 	}
 	else
@@ -1711,8 +1730,10 @@ create_gather_plan(PlannerInfo *root, GatherPath *best_path)
 	List	   *tlist;
 
 	/*
-	 * Although the Gather node can project, we prefer to push down such work
-	 * to its child node, so demand an exact tlist from the child.
+	 * Push projection down to the child node.  That way, the projection work
+	 * is parallelized, and there can be no system columns in the result (they
+	 * can't travel through a tuple queue because it uses MinimalTuple
+	 * representation).
 	 */
 	subplan = create_plan_recurse(root, best_path->subpath, CP_EXACT_TLIST);
 
@@ -1747,7 +1768,7 @@ create_gather_merge_plan(PlannerInfo *root, GatherMergePath *best_path)
 	List	   *pathkeys = best_path->path.pathkeys;
 	List	   *tlist = build_path_tlist(root, &best_path->path);
 
-	/* As with Gather, it's best to project away columns in the workers. */
+	/* As with Gather, project away columns in the workers. */
 	subplan = create_plan_recurse(root, best_path->subpath, CP_EXACT_TLIST);
 
 	/* Create a shell for a GatherMerge plan. */
@@ -1989,6 +2010,32 @@ create_sort_plan(PlannerInfo *root, SortPath *best_path, int flags)
 }
 
 /*
+ * create_incrementalsort_plan
+ *
+ *	  Do the same as create_sort_plan, but create IncrementalSort plan.
+ */
+static IncrementalSort *
+create_incrementalsort_plan(PlannerInfo *root, IncrementalSortPath *best_path,
+							int flags)
+{
+	IncrementalSort *plan;
+	Plan	   *subplan;
+
+	/* See comments in create_sort_plan() above */
+	subplan = create_plan_recurse(root, best_path->spath.subpath,
+								  flags | CP_SMALL_TLIST);
+	plan = make_incrementalsort_from_pathkeys(subplan,
+											  best_path->spath.path.pathkeys,
+											  IS_OTHER_REL(best_path->spath.subpath->parent) ?
+											  best_path->spath.path.parent->relids : NULL,
+											  best_path->nPresortedCols);
+
+	copy_generic_path_info(&plan->sort.plan, (Path *) best_path);
+
+	return plan;
+}
+
+/*
  * create_group_plan
  *
  *	  Create a Group plan for 'best_path' and (recursively) plans
@@ -2091,6 +2138,7 @@ create_agg_plan(PlannerInfo *root, AggPath *best_path)
 					NIL,
 					NIL,
 					best_path->numGroups,
+					best_path->transitionSpace,
 					subplan);
 
 	copy_generic_path_info(&plan->plan, (Path *) best_path);
@@ -2211,10 +2259,9 @@ create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path)
 	chain = NIL;
 	if (list_length(rollups) > 1)
 	{
-		ListCell   *lc2 = lnext(list_head(rollups));
 		bool		is_first_sort = ((RollupData *) linitial(rollups))->is_hashed;
 
-		for_each_cell(lc, lc2)
+		for_each_cell(lc, rollups, list_second_cell(rollups))
 		{
 			RollupData *rollup = lfirst(lc);
 			AttrNumber *new_grpColIdx;
@@ -2253,6 +2300,7 @@ create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path)
 										 rollup->gsets,
 										 NIL,
 										 rollup->numGroups,
+										 best_path->transitionSpace,
 										 sort_plan);
 
 			/*
@@ -2291,6 +2339,7 @@ create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path)
 						rollup->gsets,
 						chain,
 						rollup->numGroups,
+						best_path->transitionSpace,
 						subplan);
 
 		/* Copy cost data from Path to Plan */
@@ -2331,7 +2380,9 @@ create_minmaxagg_plan(PlannerInfo *root, MinMaxAggPath *best_path)
 
 		plan = (Plan *) make_limit(plan,
 								   subparse->limitOffset,
-								   subparse->limitCount);
+								   subparse->limitCount,
+								   subparse->limitOption,
+								   0, NULL, NULL, NULL);
 
 		/* Must apply correct cost/width data to Limit node */
 		plan->startup_cost = mminfo->path->startup_cost;
@@ -2395,10 +2446,13 @@ create_windowagg_plan(PlannerInfo *root, WindowAggPath *best_path)
 	ListCell   *lc;
 
 	/*
-	 * WindowAgg can project, so no need to be terribly picky about child
-	 * tlist, but we do need grouping columns to be available
+	 * Choice of tlist here is motivated by the fact that WindowAgg will be
+	 * storing the input rows of window frames in a tuplestore; it therefore
+	 * behooves us to request a small tlist to avoid wasting space. We do of
+	 * course need grouping columns to be available.
 	 */
-	subplan = create_plan_recurse(root, best_path->subpath, CP_LABEL_TLIST);
+	subplan = create_plan_recurse(root, best_path->subpath,
+								  CP_LABEL_TLIST | CP_SMALL_TLIST);
 
 	tlist = build_path_tlist(root, &best_path->path);
 
@@ -2638,13 +2692,43 @@ create_limit_plan(PlannerInfo *root, LimitPath *best_path, int flags)
 {
 	Limit	   *plan;
 	Plan	   *subplan;
+	int			numUniqkeys = 0;
+	AttrNumber *uniqColIdx = NULL;
+	Oid		   *uniqOperators = NULL;
+	Oid		   *uniqCollations = NULL;
 
 	/* Limit doesn't project, so tlist requirements pass through */
 	subplan = create_plan_recurse(root, best_path->subpath, flags);
 
+	/* Extract information necessary for comparing rows for WITH TIES. */
+	if (best_path->limitOption == LIMIT_OPTION_WITH_TIES)
+	{
+		Query	   *parse = root->parse;
+		ListCell   *l;
+
+		numUniqkeys = list_length(parse->sortClause);
+		uniqColIdx = (AttrNumber *) palloc(numUniqkeys * sizeof(AttrNumber));
+		uniqOperators = (Oid *) palloc(numUniqkeys * sizeof(Oid));
+		uniqCollations = (Oid *) palloc(numUniqkeys * sizeof(Oid));
+
+		numUniqkeys = 0;
+		foreach(l, parse->sortClause)
+		{
+			SortGroupClause *sortcl = (SortGroupClause *) lfirst(l);
+			TargetEntry *tle = get_sortgroupclause_tle(sortcl, parse->targetList);
+
+			uniqColIdx[numUniqkeys] = tle->resno;
+			uniqOperators[numUniqkeys] = sortcl->eqop;
+			uniqCollations[numUniqkeys] = exprCollation((Node *) tle->expr);
+			numUniqkeys++;
+		}
+	}
+
 	plan = make_limit(subplan,
 					  best_path->limitOffset,
-					  best_path->limitCount);
+					  best_path->limitCount,
+					  best_path->limitOption,
+					  numUniqkeys, uniqColIdx, uniqOperators, uniqCollations);
 
 	copy_generic_path_info(&plan->plan, (Path *) best_path);
 
@@ -4261,7 +4345,7 @@ create_mergejoin_plan(PlannerInfo *root,
 				elog(ERROR, "outer pathkeys do not match mergeclauses");
 			opathkey = (PathKey *) lfirst(lop);
 			opeclass = opathkey->pk_eclass;
-			lop = lnext(lop);
+			lop = lnext(outerpathkeys, lop);
 			if (oeclass != opeclass)
 				elog(ERROR, "outer pathkeys do not match mergeclauses");
 		}
@@ -4288,7 +4372,7 @@ create_mergejoin_plan(PlannerInfo *root,
 			if (ieclass == ipeclass)
 			{
 				/* successful first match to this inner pathkey */
-				lip = lnext(lip);
+				lip = lnext(innerpathkeys, lip);
 				first_inner_match = true;
 			}
 		}
@@ -4381,9 +4465,14 @@ create_hashjoin_plan(PlannerInfo *root,
 	List	   *joinclauses;
 	List	   *otherclauses;
 	List	   *hashclauses;
+	List	   *hashoperators = NIL;
+	List	   *hashcollations = NIL;
+	List	   *inner_hashkeys = NIL;
+	List	   *outer_hashkeys = NIL;
 	Oid			skewTable = InvalidOid;
 	AttrNumber	skewColumn = InvalidAttrNumber;
 	bool		skewInherit = false;
+	ListCell   *lc;
 
 	/*
 	 * HashJoin can project, so we don't have to demand exact tlists from the
@@ -4476,9 +4565,28 @@ create_hashjoin_plan(PlannerInfo *root,
 	}
 
 	/*
+	 * Collect hash related information. The hashed expressions are
+	 * deconstructed into outer/inner expressions, so they can be computed
+	 * separately (inner expressions are used to build the hashtable via Hash,
+	 * outer expressions to perform lookups of tuples from HashJoin's outer
+	 * plan in the hashtable). Also collect operator information necessary to
+	 * build the hashtable.
+	 */
+	foreach(lc, hashclauses)
+	{
+		OpExpr	   *hclause = lfirst_node(OpExpr, lc);
+
+		hashoperators = lappend_oid(hashoperators, hclause->opno);
+		hashcollations = lappend_oid(hashcollations, hclause->inputcollid);
+		outer_hashkeys = lappend(outer_hashkeys, linitial(hclause->args));
+		inner_hashkeys = lappend(inner_hashkeys, lsecond(hclause->args));
+	}
+
+	/*
 	 * Build the hash node and hash join node.
 	 */
 	hash_plan = make_hash(inner_plan,
+						  inner_hashkeys,
 						  skewTable,
 						  skewColumn,
 						  skewInherit);
@@ -4505,6 +4613,9 @@ create_hashjoin_plan(PlannerInfo *root,
 							  joinclauses,
 							  otherclauses,
 							  hashclauses,
+							  hashoperators,
+							  hashcollations,
+							  outer_hashkeys,
 							  outer_plan,
 							  (Plan *) hash_plan,
 							  best_path->jpath.jointype,
@@ -4820,7 +4931,7 @@ fix_indexqual_operand(Node *node, IndexOptInfo *index, int indexcol)
 				else
 					elog(ERROR, "index key does not match expected index column");
 			}
-			indexpr_item = lnext(indexpr_item);
+			indexpr_item = lnext(index->indexprs, indexpr_item);
 		}
 	}
 
@@ -5052,6 +5163,12 @@ label_sort_with_costsize(PlannerInfo *root, Sort *plan, double limit_tuples)
 	Plan	   *lefttree = plan->plan.lefttree;
 	Path		sort_path;		/* dummy for result of cost_sort */
 
+	/*
+	 * This function shouldn't have to deal with IncrementalSort plans because
+	 * they are only created from corresponding Path nodes.
+	 */
+	Assert(IsA(plan, Sort));
+
 	cost_sort(&sort_path, root, NIL,
 			  lefttree->total_cost,
 			  lefttree->plan_rows,
@@ -5076,13 +5193,11 @@ static void
 bitmap_subplan_mark_shared(Plan *plan)
 {
 	if (IsA(plan, BitmapAnd))
-		bitmap_subplan_mark_shared(
-								   linitial(((BitmapAnd *) plan)->bitmapplans));
+		bitmap_subplan_mark_shared(linitial(((BitmapAnd *) plan)->bitmapplans));
 	else if (IsA(plan, BitmapOr))
 	{
 		((BitmapOr *) plan)->isshared = true;
-		bitmap_subplan_mark_shared(
-								   linitial(((BitmapOr *) plan)->bitmapplans));
+		bitmap_subplan_mark_shared(linitial(((BitmapOr *) plan)->bitmapplans));
 	}
 	else if (IsA(plan, BitmapIndexScan))
 		((BitmapIndexScan *) plan)->isshared = true;
@@ -5546,6 +5661,9 @@ make_hashjoin(List *tlist,
 			  List *joinclauses,
 			  List *otherclauses,
 			  List *hashclauses,
+			  List *hashoperators,
+			  List *hashcollations,
+			  List *hashkeys,
 			  Plan *lefttree,
 			  Plan *righttree,
 			  JoinType jointype,
@@ -5559,6 +5677,9 @@ make_hashjoin(List *tlist,
 	plan->lefttree = lefttree;
 	plan->righttree = righttree;
 	node->hashclauses = hashclauses;
+	node->hashoperators = hashoperators;
+	node->hashcollations = hashcollations;
+	node->hashkeys = hashkeys;
 	node->join.jointype = jointype;
 	node->join.inner_unique = inner_unique;
 	node->join.joinqual = joinclauses;
@@ -5568,6 +5689,7 @@ make_hashjoin(List *tlist,
 
 static Hash *
 make_hash(Plan *lefttree,
+		  List *hashkeys,
 		  Oid skewTable,
 		  AttrNumber skewColumn,
 		  bool skewInherit)
@@ -5580,6 +5702,7 @@ make_hash(Plan *lefttree,
 	plan->lefttree = lefttree;
 	plan->righttree = NULL;
 
+	node->hashkeys = hashkeys;
 	node->skewTable = skewTable;
 	node->skewColumn = skewColumn;
 	node->skewInherit = skewInherit;
@@ -5633,9 +5756,12 @@ make_sort(Plan *lefttree, int numCols,
 		  AttrNumber *sortColIdx, Oid *sortOperators,
 		  Oid *collations, bool *nullsFirst)
 {
-	Sort	   *node = makeNode(Sort);
-	Plan	   *plan = &node->plan;
+	Sort	   *node;
+	Plan	   *plan;
 
+	node = makeNode(Sort);
+
+	plan = &node->plan;
 	plan->targetlist = lefttree->targetlist;
 	plan->qual = NIL;
 	plan->lefttree = lefttree;
@@ -5645,6 +5771,37 @@ make_sort(Plan *lefttree, int numCols,
 	node->sortOperators = sortOperators;
 	node->collations = collations;
 	node->nullsFirst = nullsFirst;
+
+	return node;
+}
+
+/*
+ * make_incrementalsort --- basic routine to build an IncrementalSort plan node
+ *
+ * Caller must have built the sortColIdx, sortOperators, collations, and
+ * nullsFirst arrays already.
+ */
+static IncrementalSort *
+make_incrementalsort(Plan *lefttree, int numCols, int nPresortedCols,
+					 AttrNumber *sortColIdx, Oid *sortOperators,
+					 Oid *collations, bool *nullsFirst)
+{
+	IncrementalSort *node;
+	Plan	   *plan;
+
+	node = makeNode(IncrementalSort);
+
+	plan = &node->sort.plan;
+	plan->targetlist = lefttree->targetlist;
+	plan->qual = NIL;
+	plan->lefttree = lefttree;
+	plan->righttree = NULL;
+	node->nPresortedCols = nPresortedCols;
+	node->sort.numCols = numCols;
+	node->sort.sortColIdx = sortColIdx;
+	node->sort.sortOperators = sortOperators;
+	node->sort.collations = collations;
+	node->sort.nullsFirst = nullsFirst;
 
 	return node;
 }
@@ -5996,6 +6153,42 @@ make_sort_from_pathkeys(Plan *lefttree, List *pathkeys, Relids relids)
 }
 
 /*
+ * make_incrementalsort_from_pathkeys
+ *	  Create sort plan to sort according to given pathkeys
+ *
+ *	  'lefttree' is the node which yields input tuples
+ *	  'pathkeys' is the list of pathkeys by which the result is to be sorted
+ *	  'relids' is the set of relations required by prepare_sort_from_pathkeys()
+ *	  'nPresortedCols' is the number of presorted columns in input tuples
+ */
+static IncrementalSort *
+make_incrementalsort_from_pathkeys(Plan *lefttree, List *pathkeys,
+								   Relids relids, int nPresortedCols)
+{
+	int			numsortkeys;
+	AttrNumber *sortColIdx;
+	Oid		   *sortOperators;
+	Oid		   *collations;
+	bool	   *nullsFirst;
+
+	/* Compute sort column info, and adjust lefttree as needed */
+	lefttree = prepare_sort_from_pathkeys(lefttree, pathkeys,
+										  relids,
+										  NULL,
+										  false,
+										  &numsortkeys,
+										  &sortColIdx,
+										  &sortOperators,
+										  &collations,
+										  &nullsFirst);
+
+	/* Now build the Sort node */
+	return make_incrementalsort(lefttree, numsortkeys, nPresortedCols,
+								sortColIdx, sortOperators,
+								collations, nullsFirst);
+}
+
+/*
  * make_sort_from_sortclauses
  *	  Create sort plan to sort according to given sortclauses
  *
@@ -6152,8 +6345,8 @@ Agg *
 make_agg(List *tlist, List *qual,
 		 AggStrategy aggstrategy, AggSplit aggsplit,
 		 int numGroupCols, AttrNumber *grpColIdx, Oid *grpOperators, Oid *grpCollations,
-		 List *groupingSets, List *chain,
-		 double dNumGroups, Plan *lefttree)
+		 List *groupingSets, List *chain, double dNumGroups,
+		 Size transitionSpace, Plan *lefttree)
 {
 	Agg		   *node = makeNode(Agg);
 	Plan	   *plan = &node->plan;
@@ -6169,6 +6362,7 @@ make_agg(List *tlist, List *qual,
 	node->grpOperators = grpOperators;
 	node->grpCollations = grpCollations;
 	node->numGroups = numGroups;
+	node->transitionSpace = transitionSpace;
 	node->aggParams = NULL;		/* SS_finalize_plan() will fill this */
 	node->groupingSets = groupingSets;
 	node->chain = chain;
@@ -6512,7 +6706,9 @@ make_lockrows(Plan *lefttree, List *rowMarks, int epqParam)
  *	  Build a Limit plan node
  */
 Limit *
-make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount)
+make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount,
+		   LimitOption limitOption, int uniqNumCols, AttrNumber *uniqColIdx,
+		   Oid *uniqOperators, Oid *uniqCollations)
 {
 	Limit	   *node = makeNode(Limit);
 	Plan	   *plan = &node->plan;
@@ -6524,6 +6720,11 @@ make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount)
 
 	node->limitOffset = limitOffset;
 	node->limitCount = limitCount;
+	node->limitOption = limitOption;
+	node->uniqNumCols = uniqNumCols;
+	node->uniqColIdx = uniqColIdx;
+	node->uniqOperators = uniqOperators;
+	node->uniqCollations = uniqCollations;
 
 	return node;
 }
@@ -6729,6 +6930,7 @@ is_projection_capable_path(Path *path)
 		case T_Hash:
 		case T_Material:
 		case T_Sort:
+		case T_IncrementalSort:
 		case T_Unique:
 		case T_SetOp:
 		case T_LockRows:

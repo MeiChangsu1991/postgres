@@ -7,9 +7,9 @@
 #include <math.h>
 
 #include "common/string.h"
-#include "pgtypeslib_extern.h"
 #include "dt.h"
 #include "pgtypes_timestamp.h"
+#include "pgtypeslib_extern.h"
 
 const int	day_tab[2][13] = {
 	{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0},
@@ -172,7 +172,7 @@ static const datetkn datetktbl[] = {
 	ghst
 #endif
 	{"gilt", TZ, 43200},		/* Gilbert Islands Time */
-	{"gmt", TZ, 0},				/* Greenwish Mean Time */
+	{"gmt", TZ, 0},				/* Greenwich Mean Time */
 	{"gst", TZ, 36000},			/* Guam Std Time, USSR Zone 9 */
 	{"gyt", TZ, -14400},		/* Guyana Time */
 	{"h", UNITS, DTK_HOUR},		/* "hour" */
@@ -624,8 +624,6 @@ j2date(int jd, int *year, int *month, int *day)
 	quad = julian * 2141 / 65536;
 	*day = julian - 7834 * quad / 256;
 	*month = (quad + 10) % 12 + 1;
-
-	return;
 }								/* j2date() */
 
 /* DecodeSpecial()
@@ -828,7 +826,8 @@ EncodeDateTime(struct tm *tm, fsec_t fsec, bool print_tz, int tz, const char *tz
 
 			/*
 			 * Note: the uses of %.*s in this function would be risky if the
-			 * timezone names ever contain non-ASCII characters.  However, all
+			 * timezone names ever contain non-ASCII characters, since we are
+			 * not being careful to do encoding-aware clipping.  However, all
 			 * TZ abbreviations in the IANA database are plain ASCII.
 			 */
 
@@ -995,7 +994,7 @@ abstime2tm(AbsoluteTime _time, int *tzp, struct tm *tm, char **tzn)
 	tm->tm_sec = tx->tm_sec;
 	tm->tm_isdst = tx->tm_isdst;
 
-#if defined(HAVE_TM_ZONE)
+#if defined(HAVE_STRUCT_TM_TM_ZONE)
 	tm->tm_gmtoff = tx->tm_gmtoff;
 	tm->tm_zone = tx->tm_zone;
 
@@ -1041,7 +1040,8 @@ abstime2tm(AbsoluteTime _time, int *tzp, struct tm *tm, char **tzn)
 	}
 	else
 		tm->tm_isdst = -1;
-#else							/* not (HAVE_TM_ZONE || HAVE_INT_TIMEZONE) */
+#else							/* not (HAVE_STRUCT_TM_TM_ZONE ||
+								 * HAVE_INT_TIMEZONE) */
 	if (tzp != NULL)
 	{
 		/* default to UTC */

@@ -7,7 +7,7 @@
  *		 miscellaneous useful functions
  *
  * The communication routines here are analogous to the ones in
- * backend/libpq/pqcomm.c and backend/libpq/pqcomprim.c, but operate
+ * backend/libpq/pqcomm.c and backend/libpq/pqformat.c, but operate
  * in the considerably different environment of the frontend libpq.
  * In particular, we work with a bare nonblock-mode socket, rather than
  * a stdio stream, so that we can avoid unwanted blocking of the application.
@@ -19,7 +19,7 @@
  * routines.
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -50,9 +50,8 @@
 #include "libpq-fe.h"
 #include "libpq-int.h"
 #include "mb/pg_wchar.h"
-#include "port/pg_bswap.h"
 #include "pg_config_paths.h"
-
+#include "port/pg_bswap.h"
 
 static int	pqPutMsgBytes(const void *buf, size_t len, PGconn *conn);
 static int	pqSendSome(PGconn *conn, int len);
@@ -67,19 +66,6 @@ int
 PQlibVersion(void)
 {
 	return PG_VERSION_NUM;
-}
-
-/*
- * fputnbytes: print exactly N bytes to a file
- *
- * We avoid using %.*s here because it can misbehave if the data
- * is not valid in what libc thinks is the prevailing encoding.
- */
-static void
-fputnbytes(FILE *f, const char *str, size_t n)
-{
-	while (n-- > 0)
-		fputc(*str++, f);
 }
 
 
@@ -205,7 +191,7 @@ pqGetnchar(char *s, size_t len, PGconn *conn)
 	if (conn->Pfdebug)
 	{
 		fprintf(conn->Pfdebug, "From backend (%lu)> ", (unsigned long) len);
-		fputnbytes(conn->Pfdebug, s, len);
+		fwrite(s, 1, len, conn->Pfdebug);
 		fprintf(conn->Pfdebug, "\n");
 	}
 
@@ -229,7 +215,7 @@ pqSkipnchar(size_t len, PGconn *conn)
 	if (conn->Pfdebug)
 	{
 		fprintf(conn->Pfdebug, "From backend (%lu)> ", (unsigned long) len);
-		fputnbytes(conn->Pfdebug, conn->inBuffer + conn->inCursor, len);
+		fwrite(conn->inBuffer + conn->inCursor, 1, len, conn->Pfdebug);
 		fprintf(conn->Pfdebug, "\n");
 	}
 
@@ -251,7 +237,7 @@ pqPutnchar(const char *s, size_t len, PGconn *conn)
 	if (conn->Pfdebug)
 	{
 		fprintf(conn->Pfdebug, "To backend> ");
-		fputnbytes(conn->Pfdebug, s, len);
+		fwrite(s, 1, len, conn->Pfdebug);
 		fprintf(conn->Pfdebug, "\n");
 	}
 
@@ -803,8 +789,7 @@ retry4:
 	 */
 definitelyEOF:
 	printfPQExpBuffer(&conn->errorMessage,
-					  libpq_gettext(
-									"server closed the connection unexpectedly\n"
+					  libpq_gettext("server closed the connection unexpectedly\n"
 									"\tThis probably means the server terminated abnormally\n"
 									"\tbefore or while processing the request.\n"));
 
@@ -825,6 +810,10 @@ definitelyFailed:
  * Return 0 on success, -1 on failure and 1 when not all data could be sent
  * because the socket would block and the connection is non-blocking.
  *
+ * Note that this is also responsible for consuming data from the socket
+ * (putting it in conn->inBuffer) in any situation where we can't send
+ * all the specified data immediately.
+ *
  * Upon write failure, conn->write_failed is set and the error message is
  * saved in conn->write_err_msg, but we clear the output buffer and return
  * zero anyway; this is because callers should soldier on until it's possible
@@ -844,12 +833,20 @@ pqSendSome(PGconn *conn, int len)
 	 * on that connection.  Even if the kernel would let us, we've probably
 	 * lost message boundary sync with the server.  conn->write_failed
 	 * therefore persists until the connection is reset, and we just discard
-	 * all data presented to be written.
+	 * all data presented to be written.  However, as long as we still have a
+	 * valid socket, we should continue to absorb data from the backend, so
+	 * that we can collect any final error messages.
 	 */
 	if (conn->write_failed)
 	{
 		/* conn->write_err_msg should be set up already */
 		conn->outCount = 0;
+		/* Absorb input data if any, and detect socket closure */
+		if (conn->sock != PGINVALID_SOCKET)
+		{
+			if (pqReadData(conn) < 0)
+				return -1;
+		}
 		return 0;
 	}
 
@@ -919,6 +916,13 @@ pqSendSome(PGconn *conn, int len)
 
 					/* Discard queued data; no chance it'll ever be sent */
 					conn->outCount = 0;
+
+					/* Absorb input data if any, and detect socket closure */
+					if (conn->sock != PGINVALID_SOCKET)
+					{
+						if (pqReadData(conn) < 0)
+							return -1;
+					}
 					return 0;
 			}
 		}
@@ -1252,7 +1256,7 @@ PQenv2encoding(void)
 #ifdef ENABLE_NLS
 
 static void
-libpq_binddomain()
+libpq_binddomain(void)
 {
 	static bool already_bound = false;
 

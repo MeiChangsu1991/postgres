@@ -3,7 +3,7 @@
  * pg_conversion.h
  *	  definition of the "conversion" system catalog (pg_conversion)
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_conversion.h
@@ -18,9 +18,8 @@
 #define PG_CONVERSION_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_conversion_d.h"
-
 #include "catalog/objectaddress.h"
+#include "catalog/pg_conversion_d.h"
 
 /* ----------------
  *		pg_conversion definition.  cpp turns this into
@@ -66,7 +65,6 @@ extern ObjectAddress ConversionCreate(const char *conname, Oid connamespace,
 									  Oid conowner,
 									  int32 conforencoding, int32 contoencoding,
 									  Oid conproc, bool def);
-extern void RemoveConversionById(Oid conversionOid);
 extern Oid	FindDefaultConversion(Oid connamespace, int32 for_encoding,
 								  int32 to_encoding);
 
