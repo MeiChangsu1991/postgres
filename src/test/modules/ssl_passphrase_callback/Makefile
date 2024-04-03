@@ -1,6 +1,6 @@
 # ssl_passphrase_callback Makefile
 
-export with_openssl
+export with_ssl
 
 MODULE_big = ssl_passphrase_func
 OBJS = ssl_passphrase_func.o $(WIN32RES)
@@ -31,9 +31,9 @@ PASS = FooBaR1
 .PHONY: ssl-files ssl-files-clean
 
 ssl-files:
-	openssl req -new -x509 -days 10000 -nodes -out server.crt \
+	$(OPENSSL) req -new -x509 -days 10000 -nodes -out server.crt \
 		-keyout server.ckey -subj "/CN=localhost"
-	openssl rsa -aes256 -in server.ckey -out server.key -passout pass:$(PASS)
+	$(OPENSSL) pkey -aes256 -in server.ckey -out server.key -passout pass:$(PASS)
 	rm server.ckey
 
 ssl-files-clean:

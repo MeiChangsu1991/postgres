@@ -43,12 +43,13 @@ override CPPFLAGS += -DVAL_LIBS="\"$(LIBS)\""
 override CPPFLAGS := -DFRONTEND -I. -I$(top_srcdir)/src/common $(CPPFLAGS)
 LIBS += $(PTHREAD_LIBS)
 
-# If you add objects here, see also src/tools/msvc/Mkvcbuild.pm
-
 OBJS_COMMON = \
 	archive.o \
 	base64.o \
+	binaryheap.o \
+	blkreftable.o \
 	checksum_helper.o \
+	compression.o \
 	config_info.o \
 	controldata_utils.o \
 	d2s.o \
@@ -56,14 +57,19 @@ OBJS_COMMON = \
 	exec.o \
 	f2s.o \
 	file_perm.o \
+	file_utils.o \
 	hashfn.o \
 	ip.o \
 	jsonapi.o \
 	keywords.o \
 	kwlookup.o \
 	link-canary.o \
-	md5.o \
+	md5_common.o \
+	parse_manifest.o \
+	percentrepl.o \
+	pg_get_line.o \
 	pg_lzcompress.o \
+	pg_prng.o \
 	pgfnames.o \
 	psprintf.o \
 	relpath.o \
@@ -72,30 +78,42 @@ OBJS_COMMON = \
 	scram-common.o \
 	string.o \
 	stringinfo.o \
+	unicode_case.o \
+	unicode_category.o \
 	unicode_norm.o \
 	username.o \
 	wait_error.o \
 	wchar.o
 
-ifeq ($(with_openssl),yes)
+ifeq ($(with_ssl),openssl)
 OBJS_COMMON += \
-	protocol_openssl.o \
-	sha2_openssl.o
+	cryptohash_openssl.o \
+	hmac_openssl.o \
+	protocol_openssl.o
 else
-OBJS_COMMON += sha2.o
+OBJS_COMMON += \
+	cryptohash.o \
+	hmac.o \
+	md5.o \
+	sha1.o \
+	sha2.o
 endif
 
-# A few files are currently only built for frontend, not server
-# (Mkvcbuild.pm has a copy of this list, too)
-OBJS_FRONTEND = \
+# A few files are currently only built for frontend, not server.
+# logging.c is excluded from OBJS_FRONTEND_SHLIB (shared library) as
+# a matter of policy, because it is not appropriate for general purpose
+# libraries such as libpq to report errors directly.
+OBJS_FRONTEND_SHLIB = \
 	$(OBJS_COMMON) \
 	fe_memutils.o \
-	file_utils.o \
-	logging.o \
-	restricted_token.o
+	restricted_token.o \
+	sprompt.o
+OBJS_FRONTEND = \
+	$(OBJS_FRONTEND_SHLIB) \
+	logging.o
 
 # foo.o, foo_shlib.o, and foo_srv.o are all built from foo.c
-OBJS_SHLIB = $(OBJS_FRONTEND:%.o=%_shlib.o)
+OBJS_SHLIB = $(OBJS_FRONTEND_SHLIB:%.o=%_shlib.o)
 OBJS_SRV = $(OBJS_COMMON:%.o=%_srv.o)
 
 # where to find gen_keywordlist.pl and subsidiary files
@@ -104,8 +122,6 @@ GEN_KEYWORDLIST = $(PERL) -I $(TOOLSDIR) $(TOOLSDIR)/gen_keywordlist.pl
 GEN_KEYWORDLIST_DEPS = $(TOOLSDIR)/gen_keywordlist.pl $(TOOLSDIR)/PerfectHash.pm
 
 all: libpgcommon.a libpgcommon_shlib.a libpgcommon_srv.a
-
-distprep: kwlist_d.h
 
 # libpgcommon is needed by some contrib
 install: all installdirs
@@ -122,6 +138,13 @@ uninstall:
 libpgcommon.a: $(OBJS_FRONTEND)
 	rm -f $@
 	$(AR) $(AROPT) $@ $^
+
+#
+# Files in libpgcommon.a should use/export the "xxx_private" versions
+# of pg_char_to_encoding() and friends.
+#
+$(OBJS_FRONTEND): CPPFLAGS += -DUSE_PRIVATE_ENCODING_FUNCS
+
 
 #
 # Shared library versions of object files
@@ -172,10 +195,7 @@ RYU_OBJS = $(RYU_FILES) $(RYU_FILES:%.o=%_shlib.o) $(RYU_FILES:%.o=%_srv.o)
 
 $(RYU_OBJS): CFLAGS += $(PERMIT_DECLARATION_AFTER_STATEMENT)
 
-# kwlist_d.h is in the distribution tarball, so it is not cleaned here.
 clean distclean:
 	rm -f libpgcommon.a libpgcommon_shlib.a libpgcommon_srv.a
 	rm -f $(OBJS_FRONTEND) $(OBJS_SHLIB) $(OBJS_SRV)
-
-maintainer-clean: distclean
 	rm -f kwlist_d.h

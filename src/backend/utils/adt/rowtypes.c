@@ -3,7 +3,7 @@
  * rowtypes.c
  *	  I/O and comparison functions for generic composite types.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -76,6 +76,7 @@ record_in(PG_FUNCTION_ARGS)
 	char	   *string = PG_GETARG_CSTRING(0);
 	Oid			tupType = PG_GETARG_OID(1);
 	int32		tupTypmod = PG_GETARG_INT32(2);
+	Node	   *escontext = fcinfo->context;
 	HeapTupleHeader result;
 	TupleDesc	tupdesc;
 	HeapTuple	tuple;
@@ -99,7 +100,7 @@ record_in(PG_FUNCTION_ARGS)
 	 * supply a valid typmod, and then we can do something useful for RECORD.
 	 */
 	if (tupType == RECORDOID && tupTypmod < 0)
-		ereport(ERROR,
+		ereturn(escontext, (Datum) 0,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("input of anonymous composite types is not implemented")));
 
@@ -151,10 +152,13 @@ record_in(PG_FUNCTION_ARGS)
 	while (*ptr && isspace((unsigned char) *ptr))
 		ptr++;
 	if (*ptr++ != '(')
-		ereport(ERROR,
+	{
+		errsave(escontext,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("malformed record literal: \"%s\"", string),
 				 errdetail("Missing left parenthesis.")));
+		goto fail;
+	}
 
 	initStringInfo(&buf);
 
@@ -180,10 +184,13 @@ record_in(PG_FUNCTION_ARGS)
 				ptr++;
 			else
 				/* *ptr must be ')' */
-				ereport(ERROR,
+			{
+				errsave(escontext,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("malformed record literal: \"%s\"", string),
 						 errdetail("Too few columns.")));
+				goto fail;
+			}
 		}
 
 		/* Check for null: completely empty input means null */
@@ -203,19 +210,25 @@ record_in(PG_FUNCTION_ARGS)
 				char		ch = *ptr++;
 
 				if (ch == '\0')
-					ereport(ERROR,
+				{
+					errsave(escontext,
 							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 							 errmsg("malformed record literal: \"%s\"",
 									string),
 							 errdetail("Unexpected end of input.")));
+					goto fail;
+				}
 				if (ch == '\\')
 				{
 					if (*ptr == '\0')
-						ereport(ERROR,
+					{
+						errsave(escontext,
 								(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 								 errmsg("malformed record literal: \"%s\"",
 										string),
 								 errdetail("Unexpected end of input.")));
+						goto fail;
+					}
 					appendStringInfoChar(&buf, *ptr++);
 				}
 				else if (ch == '"')
@@ -251,10 +264,13 @@ record_in(PG_FUNCTION_ARGS)
 			column_info->column_type = column_type;
 		}
 
-		values[i] = InputFunctionCall(&column_info->proc,
-									  column_data,
-									  column_info->typioparam,
-									  att->atttypmod);
+		if (!InputFunctionCallSafe(&column_info->proc,
+								   column_data,
+								   column_info->typioparam,
+								   att->atttypmod,
+								   escontext,
+								   &values[i]))
+			goto fail;
 
 		/*
 		 * Prep for next column
@@ -263,18 +279,24 @@ record_in(PG_FUNCTION_ARGS)
 	}
 
 	if (*ptr++ != ')')
-		ereport(ERROR,
+	{
+		errsave(escontext,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("malformed record literal: \"%s\"", string),
 				 errdetail("Too many columns.")));
+		goto fail;
+	}
 	/* Allow trailing whitespace */
 	while (*ptr && isspace((unsigned char) *ptr))
 		ptr++;
 	if (*ptr)
-		ereport(ERROR,
+	{
+		errsave(escontext,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("malformed record literal: \"%s\"", string),
 				 errdetail("Junk after right parenthesis.")));
+		goto fail;
+	}
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 
@@ -293,6 +315,11 @@ record_in(PG_FUNCTION_ARGS)
 	ReleaseTupleDesc(tupdesc);
 
 	PG_RETURN_HEAPTUPLEHEADER(result);
+
+	/* exit here once we've done lookup_rowtype_tupdesc */
+fail:
+	ReleaseTupleDesc(tupdesc);
+	PG_RETURN_NULL();
 }
 
 /*
@@ -541,7 +568,6 @@ record_recv(PG_FUNCTION_ARGS)
 		int			itemlen;
 		StringInfoData item_buf;
 		StringInfo	bufptr;
-		char		csave;
 
 		/* Ignore dropped columns in datatype, but fill with nulls */
 		if (att->attisdropped)
@@ -551,13 +577,33 @@ record_recv(PG_FUNCTION_ARGS)
 			continue;
 		}
 
-		/* Verify column datatype */
+		/* Check column type recorded in the data */
 		coltypoid = pq_getmsgint(buf, sizeof(Oid));
-		if (coltypoid != column_type)
+
+		/*
+		 * From a security standpoint, it doesn't matter whether the input's
+		 * column type matches what we expect: the column type's receive
+		 * function has to be robust enough to cope with invalid data.
+		 * However, from a user-friendliness standpoint, it's nicer to
+		 * complain about type mismatches than to throw "improper binary
+		 * format" errors.  But there's a problem: only built-in types have
+		 * OIDs that are stable enough to believe that a mismatch is a real
+		 * issue.  So complain only if both OIDs are in the built-in range.
+		 * Otherwise, carry on with the column type we "should" be getting.
+		 */
+		if (coltypoid != column_type &&
+			coltypoid < FirstGenbkiObjectId &&
+			column_type < FirstGenbkiObjectId)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("wrong data type: %u, expected %u",
-							coltypoid, column_type)));
+					 errmsg("binary data has type %u (%s) instead of expected %u (%s) in record column %d",
+							coltypoid,
+							format_type_extended(coltypoid, -1,
+												 FORMAT_TYPE_ALLOW_INVALID),
+							column_type,
+							format_type_extended(column_type, -1,
+												 FORMAT_TYPE_ALLOW_INVALID),
+							i + 1)));
 
 		/* Get and check the item length */
 		itemlen = pq_getmsgint(buf, 4);
@@ -571,25 +617,19 @@ record_recv(PG_FUNCTION_ARGS)
 			/* -1 length means NULL */
 			bufptr = NULL;
 			nulls[i] = true;
-			csave = 0;			/* keep compiler quiet */
 		}
 		else
 		{
+			char	   *strbuff;
+
 			/*
-			 * Rather than copying data around, we just set up a phony
-			 * StringInfo pointing to the correct portion of the input buffer.
-			 * We assume we can scribble on the input buffer so as to maintain
-			 * the convention that StringInfos have a trailing null.
+			 * Rather than copying data around, we just initialize a
+			 * StringInfo pointing to the correct portion of the message
+			 * buffer.
 			 */
-			item_buf.data = &buf->data[buf->cursor];
-			item_buf.maxlen = itemlen + 1;
-			item_buf.len = itemlen;
-			item_buf.cursor = 0;
-
+			strbuff = &buf->data[buf->cursor];
 			buf->cursor += itemlen;
-
-			csave = buf->data[buf->cursor];
-			buf->data[buf->cursor] = '\0';
+			initReadOnlyStringInfo(&item_buf, strbuff, itemlen);
 
 			bufptr = &item_buf;
 			nulls[i] = false;
@@ -619,8 +659,6 @@ record_recv(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
 						 errmsg("improper binary format in record column %d",
 								i + 1)));
-
-			buf->data[buf->cursor] = csave;
 		}
 	}
 
@@ -1745,4 +1783,252 @@ Datum
 btrecordimagecmp(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT32(record_image_cmp(fcinfo));
+}
+
+
+/*
+ * Row type hash functions
+ */
+
+Datum
+hash_record(PG_FUNCTION_ARGS)
+{
+	HeapTupleHeader record = PG_GETARG_HEAPTUPLEHEADER(0);
+	uint32		result = 0;
+	Oid			tupType;
+	int32		tupTypmod;
+	TupleDesc	tupdesc;
+	HeapTupleData tuple;
+	int			ncolumns;
+	RecordCompareData *my_extra;
+	Datum	   *values;
+	bool	   *nulls;
+
+	check_stack_depth();		/* recurses for record-type columns */
+
+	/* Extract type info from tuple */
+	tupType = HeapTupleHeaderGetTypeId(record);
+	tupTypmod = HeapTupleHeaderGetTypMod(record);
+	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+	ncolumns = tupdesc->natts;
+
+	/* Build temporary HeapTuple control structure */
+	tuple.t_len = HeapTupleHeaderGetDatumLength(record);
+	ItemPointerSetInvalid(&(tuple.t_self));
+	tuple.t_tableOid = InvalidOid;
+	tuple.t_data = record;
+
+	/*
+	 * We arrange to look up the needed hashing info just once per series of
+	 * calls, assuming the record type doesn't change underneath us.
+	 */
+	my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
+	if (my_extra == NULL ||
+		my_extra->ncolumns < ncolumns)
+	{
+		fcinfo->flinfo->fn_extra =
+			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
+							   offsetof(RecordCompareData, columns) +
+							   ncolumns * sizeof(ColumnCompareData));
+		my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
+		my_extra->ncolumns = ncolumns;
+		my_extra->record1_type = InvalidOid;
+		my_extra->record1_typmod = 0;
+	}
+
+	if (my_extra->record1_type != tupType ||
+		my_extra->record1_typmod != tupTypmod)
+	{
+		MemSet(my_extra->columns, 0, ncolumns * sizeof(ColumnCompareData));
+		my_extra->record1_type = tupType;
+		my_extra->record1_typmod = tupTypmod;
+	}
+
+	/* Break down the tuple into fields */
+	values = (Datum *) palloc(ncolumns * sizeof(Datum));
+	nulls = (bool *) palloc(ncolumns * sizeof(bool));
+	heap_deform_tuple(&tuple, tupdesc, values, nulls);
+
+	for (int i = 0; i < ncolumns; i++)
+	{
+		Form_pg_attribute att;
+		TypeCacheEntry *typentry;
+		uint32		element_hash;
+
+		att = TupleDescAttr(tupdesc, i);
+
+		if (att->attisdropped)
+			continue;
+
+		/*
+		 * Lookup the hash function if not done already
+		 */
+		typentry = my_extra->columns[i].typentry;
+		if (typentry == NULL ||
+			typentry->type_id != att->atttypid)
+		{
+			typentry = lookup_type_cache(att->atttypid,
+										 TYPECACHE_HASH_PROC_FINFO);
+			if (!OidIsValid(typentry->hash_proc_finfo.fn_oid))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_FUNCTION),
+						 errmsg("could not identify a hash function for type %s",
+								format_type_be(typentry->type_id))));
+			my_extra->columns[i].typentry = typentry;
+		}
+
+		/* Compute hash of element */
+		if (nulls[i])
+		{
+			element_hash = 0;
+		}
+		else
+		{
+			LOCAL_FCINFO(locfcinfo, 1);
+
+			InitFunctionCallInfoData(*locfcinfo, &typentry->hash_proc_finfo, 1,
+									 att->attcollation, NULL, NULL);
+			locfcinfo->args[0].value = values[i];
+			locfcinfo->args[0].isnull = false;
+			element_hash = DatumGetUInt32(FunctionCallInvoke(locfcinfo));
+
+			/* We don't expect hash support functions to return null */
+			Assert(!locfcinfo->isnull);
+		}
+
+		/* see hash_array() */
+		result = (result << 5) - result + element_hash;
+	}
+
+	pfree(values);
+	pfree(nulls);
+	ReleaseTupleDesc(tupdesc);
+
+	/* Avoid leaking memory when handed toasted input. */
+	PG_FREE_IF_COPY(record, 0);
+
+	PG_RETURN_UINT32(result);
+}
+
+Datum
+hash_record_extended(PG_FUNCTION_ARGS)
+{
+	HeapTupleHeader record = PG_GETARG_HEAPTUPLEHEADER(0);
+	uint64		seed = PG_GETARG_INT64(1);
+	uint64		result = 0;
+	Oid			tupType;
+	int32		tupTypmod;
+	TupleDesc	tupdesc;
+	HeapTupleData tuple;
+	int			ncolumns;
+	RecordCompareData *my_extra;
+	Datum	   *values;
+	bool	   *nulls;
+
+	check_stack_depth();		/* recurses for record-type columns */
+
+	/* Extract type info from tuple */
+	tupType = HeapTupleHeaderGetTypeId(record);
+	tupTypmod = HeapTupleHeaderGetTypMod(record);
+	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+	ncolumns = tupdesc->natts;
+
+	/* Build temporary HeapTuple control structure */
+	tuple.t_len = HeapTupleHeaderGetDatumLength(record);
+	ItemPointerSetInvalid(&(tuple.t_self));
+	tuple.t_tableOid = InvalidOid;
+	tuple.t_data = record;
+
+	/*
+	 * We arrange to look up the needed hashing info just once per series of
+	 * calls, assuming the record type doesn't change underneath us.
+	 */
+	my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
+	if (my_extra == NULL ||
+		my_extra->ncolumns < ncolumns)
+	{
+		fcinfo->flinfo->fn_extra =
+			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
+							   offsetof(RecordCompareData, columns) +
+							   ncolumns * sizeof(ColumnCompareData));
+		my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
+		my_extra->ncolumns = ncolumns;
+		my_extra->record1_type = InvalidOid;
+		my_extra->record1_typmod = 0;
+	}
+
+	if (my_extra->record1_type != tupType ||
+		my_extra->record1_typmod != tupTypmod)
+	{
+		MemSet(my_extra->columns, 0, ncolumns * sizeof(ColumnCompareData));
+		my_extra->record1_type = tupType;
+		my_extra->record1_typmod = tupTypmod;
+	}
+
+	/* Break down the tuple into fields */
+	values = (Datum *) palloc(ncolumns * sizeof(Datum));
+	nulls = (bool *) palloc(ncolumns * sizeof(bool));
+	heap_deform_tuple(&tuple, tupdesc, values, nulls);
+
+	for (int i = 0; i < ncolumns; i++)
+	{
+		Form_pg_attribute att;
+		TypeCacheEntry *typentry;
+		uint64		element_hash;
+
+		att = TupleDescAttr(tupdesc, i);
+
+		if (att->attisdropped)
+			continue;
+
+		/*
+		 * Lookup the hash function if not done already
+		 */
+		typentry = my_extra->columns[i].typentry;
+		if (typentry == NULL ||
+			typentry->type_id != att->atttypid)
+		{
+			typentry = lookup_type_cache(att->atttypid,
+										 TYPECACHE_HASH_EXTENDED_PROC_FINFO);
+			if (!OidIsValid(typentry->hash_extended_proc_finfo.fn_oid))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_FUNCTION),
+						 errmsg("could not identify an extended hash function for type %s",
+								format_type_be(typentry->type_id))));
+			my_extra->columns[i].typentry = typentry;
+		}
+
+		/* Compute hash of element */
+		if (nulls[i])
+		{
+			element_hash = 0;
+		}
+		else
+		{
+			LOCAL_FCINFO(locfcinfo, 2);
+
+			InitFunctionCallInfoData(*locfcinfo, &typentry->hash_extended_proc_finfo, 2,
+									 att->attcollation, NULL, NULL);
+			locfcinfo->args[0].value = values[i];
+			locfcinfo->args[0].isnull = false;
+			locfcinfo->args[1].value = Int64GetDatum(seed);
+			locfcinfo->args[0].isnull = false;
+			element_hash = DatumGetUInt64(FunctionCallInvoke(locfcinfo));
+
+			/* We don't expect hash support functions to return null */
+			Assert(!locfcinfo->isnull);
+		}
+
+		/* see hash_array_extended() */
+		result = (result << 5) - result + element_hash;
+	}
+
+	pfree(values);
+	pfree(nulls);
+	ReleaseTupleDesc(tupdesc);
+
+	/* Avoid leaking memory when handed toasted input. */
+	PG_FREE_IF_COPY(record, 0);
+
+	PG_RETURN_UINT64(result);
 }

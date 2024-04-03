@@ -20,7 +20,7 @@
 # not in the set.
 #
 #
-# Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/tools/PerfectHash.pm
@@ -30,7 +30,7 @@
 package PerfectHash;
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 
 # At runtime, we'll compute two simple hash functions of the input key,
@@ -81,21 +81,22 @@ sub generate_hash_function
 	# to calculate via shift-and-add, so don't change them without care.
 	# (Commonly, random seeds are tried, but we want reproducible results
 	# from this program so we don't do that.)
-	my $hash_mult1 = 31;
+	my $hash_mult1 = 257;
 	my $hash_mult2;
 	my $hash_seed1;
 	my $hash_seed2;
 	my @subresult;
   FIND_PARAMS:
-	foreach (127, 257, 521, 1033, 2053)
+	for ($hash_seed1 = 0; $hash_seed1 < 10; $hash_seed1++)
 	{
-		$hash_mult2 = $_;    # "foreach $hash_mult2" doesn't work
-		for ($hash_seed1 = 0; $hash_seed1 < 10; $hash_seed1++)
+
+		for ($hash_seed2 = 0; $hash_seed2 < 10; $hash_seed2++)
 		{
-			for ($hash_seed2 = 0; $hash_seed2 < 10; $hash_seed2++)
+			foreach (17, 31, 127, 8191)
 			{
+				$hash_mult2 = $_;    # "foreach $hash_mult2" doesn't work
 				@subresult = _construct_hash_table(
-					$keys_ref,   $hash_mult1, $hash_mult2,
+					$keys_ref, $hash_mult1, $hash_mult2,
 					$hash_seed1, $hash_seed2);
 				last FIND_PARAMS if @subresult;
 			}
@@ -107,8 +108,8 @@ sub generate_hash_function
 
 	# Extract info from _construct_hash_table's result array.
 	my $elemtype = $subresult[0];
-	my @hashtab  = @{ $subresult[1] };
-	my $nhash    = scalar(@hashtab);
+	my @hashtab = @{ $subresult[1] };
+	my $nhash = scalar(@hashtab);
 
 	# OK, construct the hash function definition including the hash table.
 	my $f = '';
@@ -121,24 +122,27 @@ sub generate_hash_function
 	{
 		$f .= sprintf "%s(const void *key, size_t keylen)\n{\n", $funcname;
 	}
-	$f .= sprintf "\tstatic const %s h[%d] = {\n", $elemtype, $nhash;
+	$f .= sprintf "\tstatic const %s h[%d] = {\n\t\t", $elemtype, $nhash;
 	for (my $i = 0; $i < $nhash; $i++)
 	{
-		$f .= sprintf "%s%6d,%s",
-		  ($i % 8 == 0 ? "\t\t" : " "),
-		  $hashtab[$i],
-		  ($i % 8 == 7 ? "\n" : "");
+		# Hash element.
+		$f .= sprintf "%d", $hashtab[$i];
+		next if ($i == $nhash - 1);
+
+		# Optional indentation and newline, with eight items per line.
+		$f .= sprintf ",%s",
+		  ($i % 8 == 7 ? "\n\t\t" : ' ' x (6 - length($hashtab[$i])));
 	}
 	$f .= sprintf "\n" if ($nhash % 8 != 0);
 	$f .= sprintf "\t};\n\n";
 	$f .= sprintf "\tconst unsigned char *k = (const unsigned char *) key;\n";
 	$f .= sprintf "\tsize_t\t\tkeylen = %d;\n", $options{fixed_key_length}
 	  if (defined $options{fixed_key_length});
-	$f .= sprintf "\tuint32\t\ta = %d;\n",   $hash_seed1;
+	$f .= sprintf "\tuint32\t\ta = %d;\n", $hash_seed1;
 	$f .= sprintf "\tuint32\t\tb = %d;\n\n", $hash_seed2;
 	$f .= sprintf "\twhile (keylen--)\n\t{\n";
 	$f .= sprintf "\t\tunsigned char c = *k++";
-	$f .= sprintf " | 0x20" if $case_fold;    # see comment below
+	$f .= sprintf " | 0x20" if $case_fold;                 # see comment below
 	$f .= sprintf ";\n\n";
 	$f .= sprintf "\t\ta = a * %d + c;\n", $hash_mult1;
 	$f .= sprintf "\t\tb = b * %d + c;\n", $hash_mult2;
@@ -340,7 +344,7 @@ sub _construct_hash_table
 		&& $hmin + 0x7F >= $nedges)
 	{
 		# int8 will work
-		$elemtype    = 'int8';
+		$elemtype = 'int8';
 		$unused_flag = 0x7F;
 	}
 	elsif ($hmin >= -0x7FFF
@@ -348,7 +352,7 @@ sub _construct_hash_table
 		&& $hmin + 0x7FFF >= $nedges)
 	{
 		# int16 will work
-		$elemtype    = 'int16';
+		$elemtype = 'int16';
 		$unused_flag = 0x7FFF;
 	}
 	elsif ($hmin >= -0x7FFFFFFF
@@ -356,7 +360,7 @@ sub _construct_hash_table
 		&& $hmin + 0x3FFFFFFF >= $nedges)
 	{
 		# int32 will work
-		$elemtype    = 'int32';
+		$elemtype = 'int32';
 		$unused_flag = 0x3FFFFFFF;
 	}
 	else

@@ -15,8 +15,13 @@ include $(top_builddir)/src/Makefile.global
 override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
 
 OBJS = \
+	conffiles.o \
 	guc.o \
+	guc-file.o \
+	guc_funcs.o \
+	guc_tables.o \
 	help_config.o \
+	injection_point.o \
 	pg_config.o \
 	pg_controldata.o \
 	pg_rusage.o \
@@ -36,10 +41,5 @@ endif
 
 include $(top_srcdir)/src/backend/common.mk
 
-# guc-file is compiled as part of guc
-guc.o: guc-file.c
-
-# Note: guc-file.c is not deleted by 'make clean',
-# since we want to ship it in distribution tarballs.
 clean:
-	@rm -f lex.yy.c
+	rm -f guc-file.c

@@ -3,7 +3,7 @@
  * pathnode.c
  *	  Routines to manipulate pathlists and create path nodes
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,7 +19,6 @@
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
-#include "nodes/nodeFuncs.h"
 #include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
@@ -27,11 +26,8 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
-#include "optimizer/prep.h"
-#include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
-#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/selfuncs.h"
 
@@ -40,7 +36,7 @@ typedef enum
 	COSTS_EQUAL,				/* path costs are fuzzily equal */
 	COSTS_BETTER1,				/* first path is cheaper than second */
 	COSTS_BETTER2,				/* second path is cheaper than first */
-	COSTS_DIFFERENT				/* neither path dominates the other on cost */
+	COSTS_DIFFERENT,			/* neither path dominates the other on cost */
 } PathCostComparison;
 
 /*
@@ -56,6 +52,8 @@ static int	append_startup_cost_compare(const ListCell *a, const ListCell *b);
 static List *reparameterize_pathlist_by_child(PlannerInfo *root,
 											  List *pathlist,
 											  RelOptInfo *child_rel);
+static bool pathlist_is_reparameterizable_by_child(List *pathlist,
+												   RelOptInfo *child_rel);
 
 
 /*****************************************************************************
@@ -105,7 +103,7 @@ compare_path_costs(Path *path1, Path *path2, CostSelector criterion)
 }
 
 /*
- * compare_path_fractional_costs
+ * compare_fractional_path_costs
  *	  Return -1, 0, or +1 according as path1 is cheaper, the same cost,
  *	  or more expensive than path2 for fetching the specified fraction
  *	  of the total tuples.
@@ -936,7 +934,7 @@ create_seqscan_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
-	pathnode->parallel_aware = parallel_workers > 0 ? true : false;
+	pathnode->parallel_aware = (parallel_workers > 0);
 	pathnode->parallel_safe = rel->consider_parallel;
 	pathnode->parallel_workers = parallel_workers;
 	pathnode->pathkeys = NIL;	/* seqscan has unordered result */
@@ -982,9 +980,7 @@ create_samplescan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer
  * 'indexorderbycols' is an integer list of index column numbers (zero based)
  *			the ordering operators can be used with.
  * 'pathkeys' describes the ordering of the path.
- * 'indexscandir' is ForwardScanDirection or BackwardScanDirection
- *			for an ordered index, or NoMovementScanDirection for
- *			an unordered index.
+ * 'indexscandir' is either ForwardScanDirection or BackwardScanDirection.
  * 'indexonly' is true if an index-only scan is wanted.
  * 'required_outer' is the set of outer relids for a parameterized path.
  * 'loop_count' is the number of repetitions of the indexscan to factor into
@@ -1057,7 +1053,7 @@ create_bitmap_heap_path(PlannerInfo *root,
 	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
-	pathnode->path.parallel_aware = parallel_degree > 0 ? true : false;
+	pathnode->path.parallel_aware = (parallel_degree > 0);
 	pathnode->path.parallel_safe = rel->consider_parallel;
 	pathnode->path.parallel_workers = parallel_degree;
 	pathnode->path.pathkeys = NIL;	/* always unordered */
@@ -1204,12 +1200,45 @@ create_tidscan_path(PlannerInfo *root, RelOptInfo *rel, List *tidquals,
 }
 
 /*
+ * create_tidrangescan_path
+ *	  Creates a path corresponding to a scan by a range of TIDs, returning
+ *	  the pathnode.
+ */
+TidRangePath *
+create_tidrangescan_path(PlannerInfo *root, RelOptInfo *rel,
+						 List *tidrangequals, Relids required_outer)
+{
+	TidRangePath *pathnode = makeNode(TidRangePath);
+
+	pathnode->path.pathtype = T_TidRangeScan;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
+	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
+														  required_outer);
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
+	pathnode->path.pathkeys = NIL;	/* always unordered */
+
+	pathnode->tidrangequals = tidrangequals;
+
+	cost_tidrangescan(&pathnode->path, root, rel, tidrangequals,
+					  pathnode->path.param_info);
+
+	return pathnode;
+}
+
+/*
  * create_append_path
  *	  Creates a path corresponding to an Append plan, returning the
  *	  pathnode.
  *
  * Note that we must handle subpaths = NIL, representing a dummy access path.
  * Also, there are callers that pass root = NULL.
+ *
+ * 'rows', when passed as a non-negative number, will be used to overwrite the
+ * returned path's row estimate.  Otherwise, the row estimate is calculated
+ * by totalling the row estimates from the 'subpaths' list.
  */
 AppendPath *
 create_append_path(PlannerInfo *root,
@@ -1217,7 +1246,7 @@ create_append_path(PlannerInfo *root,
 				   List *subpaths, List *partial_subpaths,
 				   List *pathkeys, Relids required_outer,
 				   int parallel_workers, bool parallel_aware,
-				   List *partitioned_rels, double rows)
+				   double rows)
 {
 	AppendPath *pathnode = makeNode(AppendPath);
 	ListCell   *l;
@@ -1229,16 +1258,17 @@ create_append_path(PlannerInfo *root,
 	pathnode->path.pathtarget = rel->reltarget;
 
 	/*
-	 * When generating an Append path for a partitioned table, there may be
-	 * parameters that are useful so we can eliminate certain partitions
-	 * during execution.  Here we'll go all the way and fully populate the
-	 * parameter info data as we do for normal base relations.  However, we
-	 * need only bother doing this for RELOPT_BASEREL rels, as
-	 * RELOPT_OTHER_MEMBER_REL's Append paths are merged into the base rel's
-	 * Append subpaths.  It would do no harm to do this, we just avoid it to
-	 * save wasting effort.
+	 * If this is for a baserel (not a join or non-leaf partition), we prefer
+	 * to apply get_baserel_parampathinfo to construct a full ParamPathInfo
+	 * for the path.  This supports building a Memoize path atop this path,
+	 * and if this is a partitioned table the info may be useful for run-time
+	 * pruning (cf make_partition_pruneinfo()).
+	 *
+	 * However, if we don't have "root" then that won't work and we fall back
+	 * on the simpler get_appendrel_parampathinfo.  There's no point in doing
+	 * the more expensive thing for a dummy path, either.
 	 */
-	if (partitioned_rels != NIL && root && rel->reloptkind == RELOPT_BASEREL)
+	if (rel->reloptkind == RELOPT_BASEREL && root && subpaths != NIL)
 		pathnode->path.param_info = get_baserel_parampathinfo(root,
 															  rel,
 															  required_outer);
@@ -1250,7 +1280,6 @@ create_append_path(PlannerInfo *root,
 	pathnode->path.parallel_safe = rel->consider_parallel;
 	pathnode->path.parallel_workers = parallel_workers;
 	pathnode->path.pathkeys = pathkeys;
-	pathnode->partitioned_rels = list_copy(partitioned_rels);
 
 	/*
 	 * For parallel append, non-partial paths are sorted by descending total
@@ -1280,7 +1309,7 @@ create_append_path(PlannerInfo *root,
 	 * Apply query-wide LIMIT if known and path is for sole base relation.
 	 * (Handling this at this low level is a bit klugy.)
 	 */
-	if (root != NULL && bms_equal(rel->relids, root->all_baserels))
+	if (root != NULL && bms_equal(rel->relids, root->all_query_rels))
 		pathnode->limit_tuples = root->limit_tuples;
 	else
 		pathnode->limit_tuples = -1.0;
@@ -1299,19 +1328,28 @@ create_append_path(PlannerInfo *root,
 	Assert(!parallel_aware || pathnode->path.parallel_safe);
 
 	/*
-	 * If there's exactly one child path, the Append is a no-op and will be
-	 * discarded later (in setrefs.c); therefore, we can inherit the child's
-	 * size and cost, as well as its pathkeys if any (overriding whatever the
-	 * caller might've said).  Otherwise, we must do the normal costsize
+	 * If there's exactly one child path then the output of the Append is
+	 * necessarily ordered the same as the child's, so we can inherit the
+	 * child's pathkeys if any, overriding whatever the caller might've said.
+	 * Furthermore, if the child's parallel awareness matches the Append's,
+	 * then the Append is a no-op and will be discarded later (in setrefs.c).
+	 * Then we can inherit the child's size and cost too, effectively charging
+	 * zero for the Append.  Otherwise, we must do the normal costsize
 	 * calculation.
 	 */
 	if (list_length(pathnode->subpaths) == 1)
 	{
 		Path	   *child = (Path *) linitial(pathnode->subpaths);
 
-		pathnode->path.rows = child->rows;
-		pathnode->path.startup_cost = child->startup_cost;
-		pathnode->path.total_cost = child->total_cost;
+		if (child->parallel_aware == parallel_aware)
+		{
+			pathnode->path.rows = child->rows;
+			pathnode->path.startup_cost = child->startup_cost;
+			pathnode->path.total_cost = child->total_cost;
+		}
+		else
+			cost_append(pathnode);
+		/* Must do this last, else cost_append complains */
 		pathnode->path.pathkeys = child->pathkeys;
 	}
 	else
@@ -1378,8 +1416,7 @@ create_merge_append_path(PlannerInfo *root,
 						 RelOptInfo *rel,
 						 List *subpaths,
 						 List *pathkeys,
-						 Relids required_outer,
-						 List *partitioned_rels)
+						 Relids required_outer)
 {
 	MergeAppendPath *pathnode = makeNode(MergeAppendPath);
 	Cost		input_startup_cost;
@@ -1395,14 +1432,13 @@ create_merge_append_path(PlannerInfo *root,
 	pathnode->path.parallel_safe = rel->consider_parallel;
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = pathkeys;
-	pathnode->partitioned_rels = list_copy(partitioned_rels);
 	pathnode->subpaths = subpaths;
 
 	/*
 	 * Apply query-wide LIMIT if known and path is for sole base relation.
 	 * (Handling this at this low level is a bit klugy.)
 	 */
-	if (bms_equal(rel->relids, root->all_baserels))
+	if (bms_equal(rel->relids, root->all_query_rels))
 		pathnode->limit_tuples = root->limit_tuples;
 	else
 		pathnode->limit_tuples = -1.0;
@@ -1436,7 +1472,7 @@ create_merge_append_path(PlannerInfo *root,
 					  root,
 					  pathkeys,
 					  subpath->total_cost,
-					  subpath->parent->tuples,
+					  subpath->rows,
 					  subpath->pathtarget->width,
 					  0.0,
 					  work_mem,
@@ -1451,10 +1487,13 @@ create_merge_append_path(PlannerInfo *root,
 
 	/*
 	 * Now we can compute total costs of the MergeAppend.  If there's exactly
-	 * one child path, the MergeAppend is a no-op and will be discarded later
-	 * (in setrefs.c); otherwise we do the normal cost calculation.
+	 * one child path and its parallel awareness matches that of the
+	 * MergeAppend, then the MergeAppend is a no-op and will be discarded
+	 * later (in setrefs.c); otherwise we do the normal cost calculation.
 	 */
-	if (list_length(subpaths) == 1)
+	if (list_length(subpaths) == 1 &&
+		((Path *) linitial(subpaths))->parallel_aware ==
+		pathnode->path.parallel_aware)
 	{
 		pathnode->path.startup_cost = input_startup_cost;
 		pathnode->path.total_cost = input_total_cost;
@@ -1552,6 +1591,55 @@ create_material_path(RelOptInfo *rel, Path *subpath)
 }
 
 /*
+ * create_memoize_path
+ *	  Creates a path corresponding to a Memoize plan, returning the pathnode.
+ */
+MemoizePath *
+create_memoize_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
+					List *param_exprs, List *hash_operators,
+					bool singlerow, bool binary_mode, double calls)
+{
+	MemoizePath *pathnode = makeNode(MemoizePath);
+
+	Assert(subpath->parent == rel);
+
+	pathnode->path.pathtype = T_Memoize;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
+	pathnode->path.param_info = subpath->param_info;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	pathnode->path.pathkeys = subpath->pathkeys;
+
+	pathnode->subpath = subpath;
+	pathnode->hash_operators = hash_operators;
+	pathnode->param_exprs = param_exprs;
+	pathnode->singlerow = singlerow;
+	pathnode->binary_mode = binary_mode;
+	pathnode->calls = calls;
+
+	/*
+	 * For now we set est_entries to 0.  cost_memoize_rescan() does all the
+	 * hard work to determine how many cache entries there are likely to be,
+	 * so it seems best to leave it up to that function to fill this field in.
+	 * If left at 0, the executor will make a guess at a good value.
+	 */
+	pathnode->est_entries = 0;
+
+	/*
+	 * Add a small additional charge for caching the first entry.  All the
+	 * harder calculations for rescans are performed in cost_memoize_rescan().
+	 */
+	pathnode->path.startup_cost = subpath->startup_cost + cpu_tuple_cost;
+	pathnode->path.total_cost = subpath->total_cost + cpu_tuple_cost;
+	pathnode->path.rows = subpath->rows;
+
+	return pathnode;
+}
+
+/*
  * create_unique_path
  *	  Creates a path representing elimination of distinct rows from the
  *	  input data.  Distinct-ness is defined according to the needs of the
@@ -1617,8 +1705,14 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->path.pathkeys = NIL;
 
 	pathnode->subpath = subpath;
-	pathnode->in_operators = sjinfo->semi_operators;
-	pathnode->uniq_exprs = sjinfo->semi_rhs_exprs;
+
+	/*
+	 * Under GEQO and when planning child joins, the sjinfo might be
+	 * short-lived, so we'd better make copies of data structures we extract
+	 * from it.
+	 */
+	pathnode->in_operators = copyObject(sjinfo->semi_operators);
+	pathnode->uniq_exprs = copyObject(sjinfo->semi_rhs_exprs);
 
 	/*
 	 * If the input is a relation and it has a unique index that proves the
@@ -1688,6 +1782,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->path.rows = estimate_num_groups(root,
 											  sjinfo->semi_rhs_exprs,
 											  rel->rows,
+											  NULL,
 											  NULL);
 	numCols = list_length(sjinfo->semi_rhs_exprs);
 
@@ -1721,7 +1816,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 		 */
 		int			hashentrysize = subpath->pathtarget->width + 64;
 
-		if (hashentrysize * pathnode->path.rows > work_mem * 1024L)
+		if (hashentrysize * pathnode->path.rows > get_hash_memory_limit())
 		{
 			/*
 			 * We should not try to hash.  Hack the SpecialJoinInfo to
@@ -1911,9 +2006,15 @@ create_gather_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
  * create_subqueryscan_path
  *	  Creates a path corresponding to a scan of a subquery,
  *	  returning the pathnode.
+ *
+ * Caller must pass trivial_pathtarget = true if it believes rel->reltarget to
+ * be trivial, ie just a fetch of all the subquery output columns in order.
+ * While we could determine that here, the caller can usually do it more
+ * efficiently (or at least amortize it over multiple calls).
  */
 SubqueryScanPath *
 create_subqueryscan_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
+						 bool trivial_pathtarget,
 						 List *pathkeys, Relids required_outer)
 {
 	SubqueryScanPath *pathnode = makeNode(SubqueryScanPath);
@@ -1930,7 +2031,8 @@ create_subqueryscan_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->path.pathkeys = pathkeys;
 	pathnode->subpath = subpath;
 
-	cost_subqueryscan(pathnode, root, rel, pathnode->path.param_info);
+	cost_subqueryscan(pathnode, root, rel, pathnode->path.param_info,
+					  trivial_pathtarget);
 
 	return pathnode;
 }
@@ -2019,7 +2121,8 @@ create_valuesscan_path(PlannerInfo *root, RelOptInfo *rel,
  *	  returning the pathnode.
  */
 Path *
-create_ctescan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer)
+create_ctescan_path(PlannerInfo *root, RelOptInfo *rel,
+					List *pathkeys, Relids required_outer)
 {
 	Path	   *pathnode = makeNode(Path);
 
@@ -2031,7 +2134,7 @@ create_ctescan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer)
 	pathnode->parallel_aware = false;
 	pathnode->parallel_safe = rel->consider_parallel;
 	pathnode->parallel_workers = 0;
-	pathnode->pathkeys = NIL;	/* XXX for now, result is always unordered */
+	pathnode->pathkeys = pathkeys;
 
 	cost_ctescan(pathnode, root, rel, pathnode->param_info);
 
@@ -2135,6 +2238,7 @@ create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 						List *pathkeys,
 						Relids required_outer,
 						Path *fdw_outerpath,
+						List *fdw_restrictinfo,
 						List *fdw_private)
 {
 	ForeignPath *pathnode = makeNode(ForeignPath);
@@ -2156,6 +2260,7 @@ create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.pathkeys = pathkeys;
 
 	pathnode->fdw_outerpath = fdw_outerpath;
+	pathnode->fdw_restrictinfo = fdw_restrictinfo;
 	pathnode->fdw_private = fdw_private;
 
 	return pathnode;
@@ -2179,6 +2284,7 @@ create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
 						 List *pathkeys,
 						 Relids required_outer,
 						 Path *fdw_outerpath,
+						 List *fdw_restrictinfo,
 						 List *fdw_private)
 {
 	ForeignPath *pathnode = makeNode(ForeignPath);
@@ -2206,6 +2312,7 @@ create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.pathkeys = pathkeys;
 
 	pathnode->fdw_outerpath = fdw_outerpath;
+	pathnode->fdw_restrictinfo = fdw_restrictinfo;
 	pathnode->fdw_private = fdw_private;
 
 	return pathnode;
@@ -2228,6 +2335,7 @@ create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
 						  double rows, Cost startup_cost, Cost total_cost,
 						  List *pathkeys,
 						  Path *fdw_outerpath,
+						  List *fdw_restrictinfo,
 						  List *fdw_private)
 {
 	ForeignPath *pathnode = makeNode(ForeignPath);
@@ -2251,6 +2359,7 @@ create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.pathkeys = pathkeys;
 
 	pathnode->fdw_outerpath = fdw_outerpath;
+	pathnode->fdw_restrictinfo = fdw_restrictinfo;
 	pathnode->fdw_private = fdw_private;
 
 	return pathnode;
@@ -2259,6 +2368,9 @@ create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
 /*
  * calc_nestloop_required_outer
  *	  Compute the required_outer set for a nestloop join path
+ *
+ * Note: when considering a child join, the inputs nonetheless use top-level
+ * parent relids
  *
  * Note: result must not share storage with either input
  */
@@ -2280,12 +2392,6 @@ calc_nestloop_required_outer(Relids outerrelids,
 	/* ... and remove any mention of now-satisfied outer rels */
 	required_outer = bms_del_members(required_outer,
 									 outerrelids);
-	/* maintain invariant that required_outer is exactly NULL if empty */
-	if (bms_is_empty(required_outer))
-	{
-		bms_free(required_outer);
-		required_outer = NULL;
-	}
 	return required_outer;
 }
 
@@ -2300,11 +2406,30 @@ calc_non_nestloop_required_outer(Path *outer_path, Path *inner_path)
 {
 	Relids		outer_paramrels = PATH_REQ_OUTER(outer_path);
 	Relids		inner_paramrels = PATH_REQ_OUTER(inner_path);
+	Relids		innerrelids PG_USED_FOR_ASSERTS_ONLY;
+	Relids		outerrelids PG_USED_FOR_ASSERTS_ONLY;
 	Relids		required_outer;
 
+	/*
+	 * Any parameterization of the input paths refers to topmost parents of
+	 * the relevant relations, because reparameterize_path_by_child() hasn't
+	 * been called yet.  So we must consider topmost parents of the relations
+	 * being joined, too, while checking for disallowed parameterization
+	 * cases.
+	 */
+	if (inner_path->parent->top_parent_relids)
+		innerrelids = inner_path->parent->top_parent_relids;
+	else
+		innerrelids = inner_path->parent->relids;
+
+	if (outer_path->parent->top_parent_relids)
+		outerrelids = outer_path->parent->top_parent_relids;
+	else
+		outerrelids = outer_path->parent->relids;
+
 	/* neither path can require rels from the other */
-	Assert(!bms_overlap(outer_paramrels, inner_path->parent->relids));
-	Assert(!bms_overlap(inner_paramrels, outer_path->parent->relids));
+	Assert(!bms_overlap(outer_paramrels, innerrelids));
+	Assert(!bms_overlap(inner_paramrels, outerrelids));
 	/* form the union ... */
 	required_outer = bms_union(outer_paramrels, inner_paramrels);
 	/* we do not need an explicit test for empty; bms_union gets it right */
@@ -2342,18 +2467,28 @@ create_nestloop_path(PlannerInfo *root,
 {
 	NestPath   *pathnode = makeNode(NestPath);
 	Relids		inner_req_outer = PATH_REQ_OUTER(inner_path);
+	Relids		outerrelids;
+
+	/*
+	 * Paths are parameterized by top-level parents, so run parameterization
+	 * tests on the parent relids.
+	 */
+	if (outer_path->parent->top_parent_relids)
+		outerrelids = outer_path->parent->top_parent_relids;
+	else
+		outerrelids = outer_path->parent->relids;
 
 	/*
 	 * If the inner path is parameterized by the outer, we must drop any
 	 * restrict_clauses that are due to be moved into the inner path.  We have
 	 * to do this now, rather than postpone the work till createplan time,
 	 * because the restrict_clauses list can affect the size and cost
-	 * estimates for this path.
+	 * estimates for this path.  We detect such clauses by checking for serial
+	 * number match to clauses already enforced in the inner path.
 	 */
-	if (bms_overlap(inner_req_outer, outer_path->parent->relids))
+	if (bms_overlap(inner_req_outer, outerrelids))
 	{
-		Relids		inner_and_outer = bms_union(inner_path->parent->relids,
-												inner_req_outer);
+		Bitmapset  *enforced_serials = get_param_path_clause_serials(inner_path);
 		List	   *jclauses = NIL;
 		ListCell   *lc;
 
@@ -2361,18 +2496,16 @@ create_nestloop_path(PlannerInfo *root,
 		{
 			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-			if (!join_clause_is_movable_into(rinfo,
-											 inner_path->parent->relids,
-											 inner_and_outer))
+			if (!bms_is_member(rinfo->rinfo_serial, enforced_serials))
 				jclauses = lappend(jclauses, rinfo);
 		}
 		restrict_clauses = jclauses;
 	}
 
-	pathnode->path.pathtype = T_NestLoop;
-	pathnode->path.parent = joinrel;
-	pathnode->path.pathtarget = joinrel->reltarget;
-	pathnode->path.param_info =
+	pathnode->jpath.path.pathtype = T_NestLoop;
+	pathnode->jpath.path.parent = joinrel;
+	pathnode->jpath.path.pathtarget = joinrel->reltarget;
+	pathnode->jpath.path.param_info =
 		get_joinrel_parampathinfo(root,
 								  joinrel,
 								  outer_path,
@@ -2380,17 +2513,17 @@ create_nestloop_path(PlannerInfo *root,
 								  extra->sjinfo,
 								  required_outer,
 								  &restrict_clauses);
-	pathnode->path.parallel_aware = false;
-	pathnode->path.parallel_safe = joinrel->consider_parallel &&
+	pathnode->jpath.path.parallel_aware = false;
+	pathnode->jpath.path.parallel_safe = joinrel->consider_parallel &&
 		outer_path->parallel_safe && inner_path->parallel_safe;
 	/* This is a foolish way to estimate parallel_workers, but for now... */
-	pathnode->path.parallel_workers = outer_path->parallel_workers;
-	pathnode->path.pathkeys = pathkeys;
-	pathnode->jointype = jointype;
-	pathnode->inner_unique = extra->inner_unique;
-	pathnode->outerjoinpath = outer_path;
-	pathnode->innerjoinpath = inner_path;
-	pathnode->joinrestrictinfo = restrict_clauses;
+	pathnode->jpath.path.parallel_workers = outer_path->parallel_workers;
+	pathnode->jpath.path.pathkeys = pathkeys;
+	pathnode->jpath.jointype = jointype;
+	pathnode->jpath.inner_unique = extra->inner_unique;
+	pathnode->jpath.outerjoinpath = outer_path;
+	pathnode->jpath.innerjoinpath = inner_path;
+	pathnode->jpath.joinrestrictinfo = restrict_clauses;
 
 	final_cost_nestloop(root, pathnode, workspace, extra);
 
@@ -2555,7 +2688,23 @@ create_projection_path(PlannerInfo *root,
 					   PathTarget *target)
 {
 	ProjectionPath *pathnode = makeNode(ProjectionPath);
-	PathTarget *oldtarget = subpath->pathtarget;
+	PathTarget *oldtarget;
+
+	/*
+	 * We mustn't put a ProjectionPath directly above another; it's useless
+	 * and will confuse create_projection_plan.  Rather than making sure all
+	 * callers handle that, let's implement it here, by stripping off any
+	 * ProjectionPath in what we're given.  Given this rule, there won't be
+	 * more than one.
+	 */
+	if (IsA(subpath, ProjectionPath))
+	{
+		ProjectionPath *subpp = (ProjectionPath *) subpath;
+
+		Assert(subpp->path.parent == rel);
+		subpath = subpp->subpath;
+		Assert(!IsA(subpath, ProjectionPath));
+	}
 
 	pathnode->path.pathtype = T_Result;
 	pathnode->path.parent = rel;
@@ -2581,6 +2730,7 @@ create_projection_path(PlannerInfo *root,
 	 * Note: in the latter case, create_projection_plan has to recheck our
 	 * conclusion; see comments therein.
 	 */
+	oldtarget = subpath->pathtarget;
 	if (is_projection_capable_path(subpath) ||
 		equal(oldtarget->exprs, target->exprs))
 	{
@@ -2797,7 +2947,7 @@ create_set_projection_path(PlannerInfo *root,
  * 'limit_tuples' is the estimated bound on the number of output tuples,
  *		or -1 if no LIMIT or couldn't estimate
  */
-SortPath *
+IncrementalSortPath *
 create_incremental_sort_path(PlannerInfo *root,
 							 RelOptInfo *rel,
 							 Path *subpath,
@@ -2833,7 +2983,7 @@ create_incremental_sort_path(PlannerInfo *root,
 
 	sort->nPresortedCols = presorted_keys;
 
-	return pathnode;
+	return sort;
 }
 
 /*
@@ -3024,10 +3174,26 @@ create_agg_path(PlannerInfo *root,
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
+
 	if (aggstrategy == AGG_SORTED)
-		pathnode->path.pathkeys = subpath->pathkeys;	/* preserves order */
+	{
+		/*
+		 * Attempt to preserve the order of the subpath.  Additional pathkeys
+		 * may have been added in adjust_group_pathkeys_for_groupagg() to
+		 * support ORDER BY / DISTINCT aggregates.  Pathkeys added there
+		 * belong to columns within the aggregate function, so we must strip
+		 * these additional pathkeys off as those columns are unavailable
+		 * above the aggregate node.
+		 */
+		if (list_length(subpath->pathkeys) > root->num_groupby_pathkeys)
+			pathnode->path.pathkeys = list_copy_head(subpath->pathkeys,
+													 root->num_groupby_pathkeys);
+		else
+			pathnode->path.pathkeys = subpath->pathkeys;	/* preserves order */
+	}
 	else
 		pathnode->path.pathkeys = NIL;	/* output is unordered */
+
 	pathnode->subpath = subpath;
 
 	pathnode->aggstrategy = aggstrategy;
@@ -3066,7 +3232,6 @@ create_agg_path(PlannerInfo *root,
  * 'having_qual' is the HAVING quals if any
  * 'rollups' is a list of RollupData nodes
  * 'agg_costs' contains cost info about the aggregate functions to be computed
- * 'numGroups' is the estimated total number of groups
  */
 GroupingSetsPath *
 create_groupingsets_path(PlannerInfo *root,
@@ -3075,8 +3240,7 @@ create_groupingsets_path(PlannerInfo *root,
 						 List *having_qual,
 						 AggStrategy aggstrategy,
 						 List *rollups,
-						 const AggClauseCosts *agg_costs,
-						 double numGroups)
+						 const AggClauseCosts *agg_costs)
 {
 	GroupingSetsPath *pathnode = makeNode(GroupingSetsPath);
 	PathTarget *target = rel->reltarget;
@@ -3247,8 +3411,7 @@ create_minmaxagg_path(PlannerInfo *root,
 	/* For now, assume we are above any joins, so no parameterization */
 	pathnode->path.param_info = NULL;
 	pathnode->path.parallel_aware = false;
-	/* A MinMaxAggPath implies use of subplans, so cannot be parallel-safe */
-	pathnode->path.parallel_safe = false;
+	pathnode->path.parallel_safe = true;	/* might change below */
 	pathnode->path.parallel_workers = 0;
 	/* Result is one unordered row */
 	pathnode->path.rows = 1;
@@ -3257,13 +3420,15 @@ create_minmaxagg_path(PlannerInfo *root,
 	pathnode->mmaggregates = mmaggregates;
 	pathnode->quals = quals;
 
-	/* Calculate cost of all the initplans ... */
+	/* Calculate cost of all the initplans, and check parallel safety */
 	initplan_cost = 0;
 	foreach(lc, mmaggregates)
 	{
 		MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
 
 		initplan_cost += mminfo->pathcost;
+		if (!mminfo->path->parallel_safe)
+			pathnode->path.parallel_safe = false;
 	}
 
 	/* add tlist eval cost for each output row, plus cpu_tuple_cost */
@@ -3284,6 +3449,17 @@ create_minmaxagg_path(PlannerInfo *root,
 		pathnode->path.total_cost += qual_cost.startup + qual_cost.per_tuple;
 	}
 
+	/*
+	 * If the initplans were all parallel-safe, also check safety of the
+	 * target and quals.  (The Result node itself isn't parallelizable, but if
+	 * we are in a subquery then it can be useful for the outer query to know
+	 * that this one is parallel-safe.)
+	 */
+	if (pathnode->path.parallel_safe)
+		pathnode->path.parallel_safe =
+			is_parallel_safe(root, (Node *) target->exprs) &&
+			is_parallel_safe(root, (Node *) quals);
+
 	return pathnode;
 }
 
@@ -3296,6 +3472,10 @@ create_minmaxagg_path(PlannerInfo *root,
  * 'target' is the PathTarget to be computed
  * 'windowFuncs' is a list of WindowFunc structs
  * 'winclause' is a WindowClause that is common to all the WindowFuncs
+ * 'qual' WindowClause.runconditions from lower-level WindowAggPaths.
+ *		Must always be NIL when topwindow == false
+ * 'topwindow' pass as true only for the top-level WindowAgg. False for all
+ *		intermediate WindowAggs.
  *
  * The input must be sorted according to the WindowClause's PARTITION keys
  * plus ORDER BY keys.
@@ -3306,9 +3486,14 @@ create_windowagg_path(PlannerInfo *root,
 					  Path *subpath,
 					  PathTarget *target,
 					  List *windowFuncs,
-					  WindowClause *winclause)
+					  WindowClause *winclause,
+					  List *qual,
+					  bool topwindow)
 {
 	WindowAggPath *pathnode = makeNode(WindowAggPath);
+
+	/* qual can only be set for the topwindow */
+	Assert(qual == NIL || topwindow);
 
 	pathnode->path.pathtype = T_WindowAgg;
 	pathnode->path.parent = rel;
@@ -3324,6 +3509,8 @@ create_windowagg_path(PlannerInfo *root,
 
 	pathnode->subpath = subpath;
 	pathnode->winclause = winclause;
+	pathnode->qual = qual;
+	pathnode->topwindow = topwindow;
 
 	/*
 	 * For costing purposes, assume that there are no redundant partitioning
@@ -3333,8 +3520,7 @@ create_windowagg_path(PlannerInfo *root,
 	 */
 	cost_windowagg(&pathnode->path, root,
 				   windowFuncs,
-				   list_length(winclause->partitionClause),
-				   list_length(winclause->orderClause),
+				   winclause,
 				   subpath->startup_cost,
 				   subpath->total_cost,
 				   subpath->rows);
@@ -3510,41 +3696,47 @@ create_lockrows_path(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * create_modifytable_path
- *	  Creates a pathnode that represents performing INSERT/UPDATE/DELETE mods
+ *	  Creates a pathnode that represents performing INSERT/UPDATE/DELETE/MERGE
+ *	  mods
  *
  * 'rel' is the parent relation associated with the result
+ * 'subpath' is a Path producing source data
  * 'operation' is the operation type
  * 'canSetTag' is true if we set the command tag/es_processed
  * 'nominalRelation' is the parent RT index for use of EXPLAIN
- * 'rootRelation' is the partitioned table root RT index, or 0 if none
+ * 'rootRelation' is the partitioned/inherited table root RTI, or 0 if none
  * 'partColsUpdated' is true if any partitioning columns are being updated,
  *		either from the target relation or a descendent partitioned table.
  * 'resultRelations' is an integer list of actual RT indexes of target rel(s)
- * 'subpaths' is a list of Path(s) producing source data (one per rel)
- * 'subroots' is a list of PlannerInfo structs (one per rel)
+ * 'updateColnosLists' is a list of UPDATE target column number lists
+ *		(one sublist per rel); or NIL if not an UPDATE
  * 'withCheckOptionLists' is a list of WCO lists (one per rel)
  * 'returningLists' is a list of RETURNING tlists (one per rel)
  * 'rowMarks' is a list of PlanRowMarks (non-locking only)
  * 'onconflict' is the ON CONFLICT clause, or NULL
  * 'epqParam' is the ID of Param for EvalPlanQual re-eval
+ * 'mergeActionLists' is a list of lists of MERGE actions (one per rel)
+ * 'mergeJoinConditions' is a list of join conditions for MERGE (one per rel)
  */
 ModifyTablePath *
 create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
+						Path *subpath,
 						CmdType operation, bool canSetTag,
 						Index nominalRelation, Index rootRelation,
 						bool partColsUpdated,
-						List *resultRelations, List *subpaths,
-						List *subroots,
+						List *resultRelations,
+						List *updateColnosLists,
 						List *withCheckOptionLists, List *returningLists,
 						List *rowMarks, OnConflictExpr *onconflict,
+						List *mergeActionLists, List *mergeJoinConditions,
 						int epqParam)
 {
 	ModifyTablePath *pathnode = makeNode(ModifyTablePath);
-	double		total_size;
-	ListCell   *lc;
 
-	Assert(list_length(resultRelations) == list_length(subpaths));
-	Assert(list_length(resultRelations) == list_length(subroots));
+	Assert(operation == CMD_MERGE ||
+		   (operation == CMD_UPDATE ?
+			list_length(resultRelations) == list_length(updateColnosLists) :
+			updateColnosLists == NIL));
 	Assert(withCheckOptionLists == NIL ||
 		   list_length(resultRelations) == list_length(withCheckOptionLists));
 	Assert(returningLists == NIL ||
@@ -3562,7 +3754,7 @@ create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.pathkeys = NIL;
 
 	/*
-	 * Compute cost & rowcount as sum of subpath costs & rowcounts.
+	 * Compute cost & rowcount as subpath cost & rowcount (if RETURNING)
 	 *
 	 * Currently, we don't charge anything extra for the actual table
 	 * modification work, nor for the WITH CHECK OPTIONS or RETURNING
@@ -3571,44 +3763,41 @@ create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
 	 * costs to change any higher-level planning choices.  But we might want
 	 * to make it look better sometime.
 	 */
-	pathnode->path.startup_cost = 0;
-	pathnode->path.total_cost = 0;
-	pathnode->path.rows = 0;
-	total_size = 0;
-	foreach(lc, subpaths)
+	pathnode->path.startup_cost = subpath->startup_cost;
+	pathnode->path.total_cost = subpath->total_cost;
+	if (returningLists != NIL)
 	{
-		Path	   *subpath = (Path *) lfirst(lc);
+		pathnode->path.rows = subpath->rows;
 
-		if (lc == list_head(subpaths))	/* first node? */
-			pathnode->path.startup_cost = subpath->startup_cost;
-		pathnode->path.total_cost += subpath->total_cost;
-		pathnode->path.rows += subpath->rows;
-		total_size += subpath->pathtarget->width * subpath->rows;
+		/*
+		 * Set width to match the subpath output.  XXX this is totally wrong:
+		 * we should return an average of the RETURNING tlist widths.  But
+		 * it's what happened historically, and improving it is a task for
+		 * another day.  (Again, it's mostly window dressing.)
+		 */
+		pathnode->path.pathtarget->width = subpath->pathtarget->width;
+	}
+	else
+	{
+		pathnode->path.rows = 0;
+		pathnode->path.pathtarget->width = 0;
 	}
 
-	/*
-	 * Set width to the average width of the subpath outputs.  XXX this is
-	 * totally wrong: we should report zero if no RETURNING, else an average
-	 * of the RETURNING tlist widths.  But it's what happened historically,
-	 * and improving it is a task for another day.
-	 */
-	if (pathnode->path.rows > 0)
-		total_size /= pathnode->path.rows;
-	pathnode->path.pathtarget->width = rint(total_size);
-
+	pathnode->subpath = subpath;
 	pathnode->operation = operation;
 	pathnode->canSetTag = canSetTag;
 	pathnode->nominalRelation = nominalRelation;
 	pathnode->rootRelation = rootRelation;
 	pathnode->partColsUpdated = partColsUpdated;
 	pathnode->resultRelations = resultRelations;
-	pathnode->subpaths = subpaths;
-	pathnode->subroots = subroots;
+	pathnode->updateColnosLists = updateColnosLists;
 	pathnode->withCheckOptionLists = withCheckOptionLists;
 	pathnode->returningLists = returningLists;
 	pathnode->rowMarks = rowMarks;
 	pathnode->onconflict = onconflict;
 	pathnode->epqParam = epqParam;
+	pathnode->mergeActionLists = mergeActionLists;
+	pathnode->mergeJoinConditions = mergeJoinConditions;
 
 	return pathnode;
 }
@@ -3801,10 +3990,23 @@ reparameterize_path(PlannerInfo *root, Path *path,
 		case T_SubqueryScan:
 			{
 				SubqueryScanPath *spath = (SubqueryScanPath *) path;
+				Path	   *subpath = spath->subpath;
+				bool		trivial_pathtarget;
+
+				/*
+				 * If existing node has zero extra cost, we must have decided
+				 * its target is trivial.  (The converse is not true, because
+				 * it might have a trivial target but quals to enforce; but in
+				 * that case the new node will too, so it doesn't matter
+				 * whether we get the right answer here.)
+				 */
+				trivial_pathtarget =
+					(subpath->total_cost == spath->path.total_cost);
 
 				return (Path *) create_subqueryscan_path(root,
 														 rel,
-														 spath->subpath,
+														 subpath,
+														 trivial_pathtarget,
 														 spath->path.pathkeys,
 														 required_outer);
 			}
@@ -3844,8 +4046,37 @@ reparameterize_path(PlannerInfo *root, Path *path,
 									   apath->path.pathkeys, required_outer,
 									   apath->path.parallel_workers,
 									   apath->path.parallel_aware,
-									   apath->partitioned_rels,
 									   -1);
+			}
+		case T_Material:
+			{
+				MaterialPath *mpath = (MaterialPath *) path;
+				Path	   *spath = mpath->subpath;
+
+				spath = reparameterize_path(root, spath,
+											required_outer,
+											loop_count);
+				if (spath == NULL)
+					return NULL;
+				return (Path *) create_material_path(rel, spath);
+			}
+		case T_Memoize:
+			{
+				MemoizePath *mpath = (MemoizePath *) path;
+				Path	   *spath = mpath->subpath;
+
+				spath = reparameterize_path(root, spath,
+											required_outer,
+											loop_count);
+				if (spath == NULL)
+					return NULL;
+				return (Path *) create_memoize_path(root, rel,
+													spath,
+													mpath->param_exprs,
+													mpath->hash_operators,
+													mpath->singlerow,
+													mpath->binary_mode,
+													mpath->calls);
 			}
 		default:
 			break;
@@ -3858,33 +4089,39 @@ reparameterize_path(PlannerInfo *root, Path *path,
  * 		Given a path parameterized by the parent of the given child relation,
  * 		translate the path to be parameterized by the given child relation.
  *
- * The function creates a new path of the same type as the given path, but
- * parameterized by the given child relation.  Most fields from the original
- * path can simply be flat-copied, but any expressions must be adjusted to
- * refer to the correct varnos, and any paths must be recursively
- * reparameterized.  Other fields that refer to specific relids also need
- * adjustment.
+ * Most fields in the path are not changed, but any expressions must be
+ * adjusted to refer to the correct varnos, and any subpaths must be
+ * recursively reparameterized.  Other fields that refer to specific relids
+ * also need adjustment.
  *
  * The cost, number of rows, width and parallel path properties depend upon
- * path->parent, which does not change during the translation. Hence those
- * members are copied as they are.
+ * path->parent, which does not change during the translation.  So we need
+ * not change those.
  *
- * If the given path can not be reparameterized, the function returns NULL.
+ * Currently, only a few path types are supported here, though more could be
+ * added at need.  We return NULL if we can't reparameterize the given path.
+ *
+ * Note that this function can change referenced RangeTblEntries, RelOptInfos
+ * and IndexOptInfos as well as the Path structures.  Therefore, it's only safe
+ * to call during create_plan(), when we have made a final choice of which Path
+ * to use for each RangeTblEntry/RelOptInfo/IndexOptInfo.
+ *
+ * Keep this code in sync with path_is_reparameterizable_by_child()!
  */
 Path *
 reparameterize_path_by_child(PlannerInfo *root, Path *path,
 							 RelOptInfo *child_rel)
 {
-
-#define FLAT_COPY_PATH(newnode, node, nodetype)  \
-	( (newnode) = makeNode(nodetype), \
-	  memcpy((newnode), (node), sizeof(nodetype)) )
+	Path	   *new_path;
+	ParamPathInfo *new_ppi;
+	ParamPathInfo *old_ppi;
+	Relids		required_outer;
 
 #define ADJUST_CHILD_ATTRS(node) \
-	((node) = \
-	 (List *) adjust_appendrel_attrs_multilevel(root, (Node *) (node), \
-												child_rel->relids, \
-												child_rel->top_parent_relids))
+	((node) = (void *) adjust_appendrel_attrs_multilevel(root, \
+														 (Node *) (node), \
+														 child_rel, \
+														 child_rel->top_parent))
 
 #define REPARAMETERIZE_CHILD_PATH(path) \
 do { \
@@ -3904,21 +4141,16 @@ do { \
 	} \
 } while(0)
 
-	Path	   *new_path;
-	ParamPathInfo *new_ppi;
-	ParamPathInfo *old_ppi;
-	Relids		required_outer;
-
 	/*
-	 * If the path is not parameterized by parent of the given relation, it
-	 * doesn't need reparameterization.
+	 * If the path is not parameterized by the parent of the given relation,
+	 * it doesn't need reparameterization.
 	 */
 	if (!path->param_info ||
 		!bms_overlap(PATH_REQ_OUTER(path), child_rel->top_parent_relids))
 		return path;
 
 	/*
-	 * If possible, reparameterize the given path, making a copy.
+	 * If possible, reparameterize the given path.
 	 *
 	 * This function is currently only applied to the inner side of a nestloop
 	 * join that is being partitioned by the partitionwise-join code.  Hence,
@@ -3932,14 +4164,28 @@ do { \
 	switch (nodeTag(path))
 	{
 		case T_Path:
-			FLAT_COPY_PATH(new_path, path, Path);
+			new_path = path;
+			ADJUST_CHILD_ATTRS(new_path->parent->baserestrictinfo);
+			if (path->pathtype == T_SampleScan)
+			{
+				Index		scan_relid = path->parent->relid;
+				RangeTblEntry *rte;
+
+				/* it should be a base rel with a tablesample clause... */
+				Assert(scan_relid > 0);
+				rte = planner_rt_fetch(scan_relid, root);
+				Assert(rte->rtekind == RTE_RELATION);
+				Assert(rte->tablesample != NULL);
+
+				ADJUST_CHILD_ATTRS(rte->tablesample);
+			}
 			break;
 
 		case T_IndexPath:
 			{
-				IndexPath  *ipath;
+				IndexPath  *ipath = (IndexPath *) path;
 
-				FLAT_COPY_PATH(ipath, path, IndexPath);
+				ADJUST_CHILD_ATTRS(ipath->indexinfo->indrestrictinfo);
 				ADJUST_CHILD_ATTRS(ipath->indexclauses);
 				new_path = (Path *) ipath;
 			}
@@ -3947,9 +4193,9 @@ do { \
 
 		case T_BitmapHeapPath:
 			{
-				BitmapHeapPath *bhpath;
+				BitmapHeapPath *bhpath = (BitmapHeapPath *) path;
 
-				FLAT_COPY_PATH(bhpath, path, BitmapHeapPath);
+				ADJUST_CHILD_ATTRS(bhpath->path.parent->baserestrictinfo);
 				REPARAMETERIZE_CHILD_PATH(bhpath->bitmapqual);
 				new_path = (Path *) bhpath;
 			}
@@ -3957,9 +4203,8 @@ do { \
 
 		case T_BitmapAndPath:
 			{
-				BitmapAndPath *bapath;
+				BitmapAndPath *bapath = (BitmapAndPath *) path;
 
-				FLAT_COPY_PATH(bapath, path, BitmapAndPath);
 				REPARAMETERIZE_CHILD_PATH_LIST(bapath->bitmapquals);
 				new_path = (Path *) bapath;
 			}
@@ -3967,9 +4212,8 @@ do { \
 
 		case T_BitmapOrPath:
 			{
-				BitmapOrPath *bopath;
+				BitmapOrPath *bopath = (BitmapOrPath *) path;
 
-				FLAT_COPY_PATH(bopath, path, BitmapOrPath);
 				REPARAMETERIZE_CHILD_PATH_LIST(bopath->bitmapquals);
 				new_path = (Path *) bopath;
 			}
@@ -3977,12 +4221,14 @@ do { \
 
 		case T_ForeignPath:
 			{
-				ForeignPath *fpath;
+				ForeignPath *fpath = (ForeignPath *) path;
 				ReparameterizeForeignPathByChild_function rfpc_func;
 
-				FLAT_COPY_PATH(fpath, path, ForeignPath);
+				ADJUST_CHILD_ATTRS(fpath->path.parent->baserestrictinfo);
 				if (fpath->fdw_outerpath)
 					REPARAMETERIZE_CHILD_PATH(fpath->fdw_outerpath);
+				if (fpath->fdw_restrictinfo)
+					ADJUST_CHILD_ATTRS(fpath->fdw_restrictinfo);
 
 				/* Hand over to FDW if needed. */
 				rfpc_func =
@@ -3996,10 +4242,12 @@ do { \
 
 		case T_CustomPath:
 			{
-				CustomPath *cpath;
+				CustomPath *cpath = (CustomPath *) path;
 
-				FLAT_COPY_PATH(cpath, path, CustomPath);
+				ADJUST_CHILD_ATTRS(cpath->path.parent->baserestrictinfo);
 				REPARAMETERIZE_CHILD_PATH_LIST(cpath->custom_paths);
+				if (cpath->custom_restrictinfo)
+					ADJUST_CHILD_ATTRS(cpath->custom_restrictinfo);
 				if (cpath->methods &&
 					cpath->methods->ReparameterizeCustomPathByChild)
 					cpath->custom_private =
@@ -4012,25 +4260,21 @@ do { \
 
 		case T_NestPath:
 			{
-				JoinPath   *jpath;
-
-				FLAT_COPY_PATH(jpath, path, NestPath);
+				NestPath   *npath = (NestPath *) path;
+				JoinPath   *jpath = (JoinPath *) npath;
 
 				REPARAMETERIZE_CHILD_PATH(jpath->outerjoinpath);
 				REPARAMETERIZE_CHILD_PATH(jpath->innerjoinpath);
 				ADJUST_CHILD_ATTRS(jpath->joinrestrictinfo);
-				new_path = (Path *) jpath;
+				new_path = (Path *) npath;
 			}
 			break;
 
 		case T_MergePath:
 			{
-				JoinPath   *jpath;
-				MergePath  *mpath;
+				MergePath  *mpath = (MergePath *) path;
+				JoinPath   *jpath = (JoinPath *) mpath;
 
-				FLAT_COPY_PATH(mpath, path, MergePath);
-
-				jpath = (JoinPath *) mpath;
 				REPARAMETERIZE_CHILD_PATH(jpath->outerjoinpath);
 				REPARAMETERIZE_CHILD_PATH(jpath->innerjoinpath);
 				ADJUST_CHILD_ATTRS(jpath->joinrestrictinfo);
@@ -4041,12 +4285,9 @@ do { \
 
 		case T_HashPath:
 			{
-				JoinPath   *jpath;
-				HashPath   *hpath;
+				HashPath   *hpath = (HashPath *) path;
+				JoinPath   *jpath = (JoinPath *) hpath;
 
-				FLAT_COPY_PATH(hpath, path, HashPath);
-
-				jpath = (JoinPath *) hpath;
 				REPARAMETERIZE_CHILD_PATH(jpath->outerjoinpath);
 				REPARAMETERIZE_CHILD_PATH(jpath->innerjoinpath);
 				ADJUST_CHILD_ATTRS(jpath->joinrestrictinfo);
@@ -4057,26 +4298,42 @@ do { \
 
 		case T_AppendPath:
 			{
-				AppendPath *apath;
+				AppendPath *apath = (AppendPath *) path;
 
-				FLAT_COPY_PATH(apath, path, AppendPath);
 				REPARAMETERIZE_CHILD_PATH_LIST(apath->subpaths);
 				new_path = (Path *) apath;
 			}
 			break;
 
+		case T_MaterialPath:
+			{
+				MaterialPath *mpath = (MaterialPath *) path;
+
+				REPARAMETERIZE_CHILD_PATH(mpath->subpath);
+				new_path = (Path *) mpath;
+			}
+			break;
+
+		case T_MemoizePath:
+			{
+				MemoizePath *mpath = (MemoizePath *) path;
+
+				REPARAMETERIZE_CHILD_PATH(mpath->subpath);
+				ADJUST_CHILD_ATTRS(mpath->param_exprs);
+				new_path = (Path *) mpath;
+			}
+			break;
+
 		case T_GatherPath:
 			{
-				GatherPath *gpath;
+				GatherPath *gpath = (GatherPath *) path;
 
-				FLAT_COPY_PATH(gpath, path, GatherPath);
 				REPARAMETERIZE_CHILD_PATH(gpath->subpath);
 				new_path = (Path *) gpath;
 			}
 			break;
 
 		default:
-
 			/* We don't know how to reparameterize this path. */
 			return NULL;
 	}
@@ -4089,8 +4346,8 @@ do { \
 	old_ppi = new_path->param_info;
 	required_outer =
 		adjust_child_relids_multilevel(root, old_ppi->ppi_req_outer,
-									   child_rel->relids,
-									   child_rel->top_parent_relids);
+									   child_rel,
+									   child_rel->top_parent);
 
 	/* If we already have a PPI for this parameterization, just return it */
 	new_ppi = find_param_path_info(new_path->parent, required_outer);
@@ -4112,6 +4369,7 @@ do { \
 		new_ppi->ppi_rows = old_ppi->ppi_rows;
 		new_ppi->ppi_clauses = old_ppi->ppi_clauses;
 		ADJUST_CHILD_ATTRS(new_ppi->ppi_clauses);
+		new_ppi->ppi_serials = bms_copy(old_ppi->ppi_serials);
 		rel->ppilist = lappend(rel->ppilist, new_ppi);
 
 		MemoryContextSwitchTo(oldcontext);
@@ -4136,8 +4394,146 @@ do { \
 }
 
 /*
+ * path_is_reparameterizable_by_child
+ * 		Given a path parameterized by the parent of the given child relation,
+ * 		see if it can be translated to be parameterized by the child relation.
+ *
+ * This must return true if and only if reparameterize_path_by_child()
+ * would succeed on this path.  Currently it's sufficient to verify that
+ * the path and all of its subpaths (if any) are of the types handled by
+ * that function.  However, subpaths that are not parameterized can be
+ * disregarded since they won't require translation.
+ */
+bool
+path_is_reparameterizable_by_child(Path *path, RelOptInfo *child_rel)
+{
+#define REJECT_IF_PATH_NOT_REPARAMETERIZABLE(path) \
+do { \
+	if (!path_is_reparameterizable_by_child(path, child_rel)) \
+		return false; \
+} while(0)
+
+#define REJECT_IF_PATH_LIST_NOT_REPARAMETERIZABLE(pathlist) \
+do { \
+	if (!pathlist_is_reparameterizable_by_child(pathlist, child_rel)) \
+		return false; \
+} while(0)
+
+	/*
+	 * If the path is not parameterized by the parent of the given relation,
+	 * it doesn't need reparameterization.
+	 */
+	if (!path->param_info ||
+		!bms_overlap(PATH_REQ_OUTER(path), child_rel->top_parent_relids))
+		return true;
+
+	/*
+	 * Check that the path type is one that reparameterize_path_by_child() can
+	 * handle, and recursively check subpaths.
+	 */
+	switch (nodeTag(path))
+	{
+		case T_Path:
+		case T_IndexPath:
+			break;
+
+		case T_BitmapHeapPath:
+			{
+				BitmapHeapPath *bhpath = (BitmapHeapPath *) path;
+
+				REJECT_IF_PATH_NOT_REPARAMETERIZABLE(bhpath->bitmapqual);
+			}
+			break;
+
+		case T_BitmapAndPath:
+			{
+				BitmapAndPath *bapath = (BitmapAndPath *) path;
+
+				REJECT_IF_PATH_LIST_NOT_REPARAMETERIZABLE(bapath->bitmapquals);
+			}
+			break;
+
+		case T_BitmapOrPath:
+			{
+				BitmapOrPath *bopath = (BitmapOrPath *) path;
+
+				REJECT_IF_PATH_LIST_NOT_REPARAMETERIZABLE(bopath->bitmapquals);
+			}
+			break;
+
+		case T_ForeignPath:
+			{
+				ForeignPath *fpath = (ForeignPath *) path;
+
+				if (fpath->fdw_outerpath)
+					REJECT_IF_PATH_NOT_REPARAMETERIZABLE(fpath->fdw_outerpath);
+			}
+			break;
+
+		case T_CustomPath:
+			{
+				CustomPath *cpath = (CustomPath *) path;
+
+				REJECT_IF_PATH_LIST_NOT_REPARAMETERIZABLE(cpath->custom_paths);
+			}
+			break;
+
+		case T_NestPath:
+		case T_MergePath:
+		case T_HashPath:
+			{
+				JoinPath   *jpath = (JoinPath *) path;
+
+				REJECT_IF_PATH_NOT_REPARAMETERIZABLE(jpath->outerjoinpath);
+				REJECT_IF_PATH_NOT_REPARAMETERIZABLE(jpath->innerjoinpath);
+			}
+			break;
+
+		case T_AppendPath:
+			{
+				AppendPath *apath = (AppendPath *) path;
+
+				REJECT_IF_PATH_LIST_NOT_REPARAMETERIZABLE(apath->subpaths);
+			}
+			break;
+
+		case T_MaterialPath:
+			{
+				MaterialPath *mpath = (MaterialPath *) path;
+
+				REJECT_IF_PATH_NOT_REPARAMETERIZABLE(mpath->subpath);
+			}
+			break;
+
+		case T_MemoizePath:
+			{
+				MemoizePath *mpath = (MemoizePath *) path;
+
+				REJECT_IF_PATH_NOT_REPARAMETERIZABLE(mpath->subpath);
+			}
+			break;
+
+		case T_GatherPath:
+			{
+				GatherPath *gpath = (GatherPath *) path;
+
+				REJECT_IF_PATH_NOT_REPARAMETERIZABLE(gpath->subpath);
+			}
+			break;
+
+		default:
+			/* We don't know how to reparameterize this path. */
+			return false;
+	}
+
+	return true;
+}
+
+/*
  * reparameterize_pathlist_by_child
  * 		Helper function to reparameterize a list of paths by given child rel.
+ *
+ * Returns NIL to indicate failure, so pathlist had better not be NIL.
  */
 static List *
 reparameterize_pathlist_by_child(PlannerInfo *root,
@@ -4162,4 +4558,24 @@ reparameterize_pathlist_by_child(PlannerInfo *root,
 	}
 
 	return result;
+}
+
+/*
+ * pathlist_is_reparameterizable_by_child
+ *		Helper function to check if a list of paths can be reparameterized.
+ */
+static bool
+pathlist_is_reparameterizable_by_child(List *pathlist, RelOptInfo *child_rel)
+{
+	ListCell   *lc;
+
+	foreach(lc, pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+
+		if (!path_is_reparameterizable_by_child(path, child_rel))
+			return false;
+	}
+
+	return true;
 }

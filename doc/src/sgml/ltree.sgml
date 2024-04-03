@@ -1,7 +1,7 @@
 <!-- doc/src/sgml/ltree.sgml -->
 
 <sect1 id="ltree" xreflabel="ltree">
- <title>ltree</title>
+ <title>ltree &mdash; hierarchical tree-like data type</title>
 
  <indexterm zone="ltree">
   <primary>ltree</primary>
@@ -19,14 +19,15 @@
   on the current database.
  </para>
 
- <sect2>
+ <sect2 id="ltree-definitions">
   <title>Definitions</title>
 
   <para>
-   A <firstterm>label</firstterm> is a sequence of alphanumeric characters
-   and underscores (for example, in C locale the characters
-   <literal>A-Za-z0-9_</literal> are allowed).
-   Labels must be less than 256 characters long.
+   A <firstterm>label</firstterm> is a sequence of alphanumeric characters,
+   underscores, and hyphens. Valid alphanumeric character ranges are
+   dependent on the database locale. For example, in C locale, the characters
+   <literal>A-Za-z0-9_-</literal> are allowed.
+   Labels must be no more than 1000 characters long.
   </para>
 
   <para>
@@ -187,7 +188,7 @@ Europe &amp; Russia*@ &amp; !Transportation
   </para>
  </sect2>
 
- <sect2>
+ <sect2 id="ltree-ops-funcs">
   <title>Operators and Functions</title>
 
   <para>
@@ -460,7 +461,7 @@ Europe &amp; Russia*@ &amp; !Transportation
         position <parameter>end</parameter>-1 (counting from 0).
        </para>
        <para>
-        <literal>subltree('Top.Child1.Child2',1,2)</literal>
+        <literal>subltree('Top.Child1.Child2', 1, 2)</literal>
         <returnvalue>Child1</returnvalue>
        </para></entry>
       </row>
@@ -480,7 +481,7 @@ Europe &amp; Russia*@ &amp; !Transportation
         the end of the path.
        </para>
        <para>
-        <literal>subpath('Top.Child1.Child2',0,2)</literal>
+        <literal>subpath('Top.Child1.Child2', 0, 2)</literal>
         <returnvalue>Top.Child1</returnvalue>
        </para></entry>
       </row>
@@ -497,7 +498,7 @@ Europe &amp; Russia*@ &amp; !Transportation
         from the end of the path.
        </para>
        <para>
-        <literal>subpath('Top.Child1.Child2',1)</literal>
+        <literal>subpath('Top.Child1.Child2', 1)</literal>
         <returnvalue>Child1.Child2</returnvalue>
        </para></entry>
       </row>
@@ -528,7 +529,7 @@ Europe &amp; Russia*@ &amp; !Transportation
         <parameter>a</parameter>, or -1 if not found.
        </para>
        <para>
-        <literal>index('0.1.2.3.5.4.5.6.8.5.6.8','5.6')</literal>
+        <literal>index('0.1.2.3.5.4.5.6.8.5.6.8', '5.6')</literal>
         <returnvalue>6</returnvalue>
        </para></entry>
       </row>
@@ -546,7 +547,7 @@ Europe &amp; Russia*@ &amp; !Transportation
         start <parameter>-offset</parameter> labels from the end of the path.
        </para>
        <para>
-        <literal>index('0.1.2.3.5.4.5.6.8.5.6.8','5.6',-4)</literal>
+        <literal>index('0.1.2.3.5.4.5.6.8.5.6.8', '5.6', -4)</literal>
         <returnvalue>9</returnvalue>
        </para></entry>
       </row>
@@ -584,7 +585,7 @@ Europe &amp; Russia*@ &amp; !Transportation
         (up to 8 arguments are supported).
        </para>
        <para>
-        <literal>lca('1.2.3','1.2.3.4.5.6')</literal>
+        <literal>lca('1.2.3', '1.2.3.4.5.6')</literal>
         <returnvalue>1.2</returnvalue>
        </para></entry>
       </row>
@@ -607,7 +608,7 @@ Europe &amp; Russia*@ &amp; !Transportation
   </table>
  </sect2>
 
- <sect2>
+ <sect2 id="ltree-indexes">
   <title>Indexes</title>
   <para>
    <filename>ltree</filename> supports several types of indexes that can speed
@@ -624,6 +625,13 @@ Europe &amp; Russia*@ &amp; !Transportation
    </listitem>
    <listitem>
     <para>
+     Hash index over <type>ltree</type>:
+     <literal>=</literal>
+    </para>
+   </listitem>
+
+   <listitem>
+    <para>
      GiST index over <type>ltree</type> (<literal>gist_ltree_ops</literal>
      opclass):
      <literal>&lt;</literal>, <literal>&lt;=</literal>, <literal>=</literal>,
@@ -636,7 +644,8 @@ Europe &amp; Russia*@ &amp; !Transportation
      path labels as a bitmap signature.  Its optional integer parameter
      <literal>siglen</literal> determines the
      signature length in bytes.  The default signature length is 8 bytes.
-     Valid values of signature length are between 1 and 2024 bytes.  Longer
+     The length must be a positive multiple of <type>int</type> alignment
+     (4 bytes on most machines)) up to 2024.  Longer
      signatures lead to a more precise search (scanning a smaller fraction of the index and
      fewer heap pages), at the cost of a larger index.
     </para>
@@ -685,7 +694,7 @@ CREATE INDEX path_gist_idx ON test USING GIST (array_path gist__ltree_ops(siglen
   </itemizedlist>
  </sect2>
 
- <sect2>
+ <sect2 id="ltree-example">
   <title>Example</title>
 
   <para>
@@ -710,6 +719,7 @@ INSERT INTO test VALUES ('Top.Collections.Pictures.Astronomy.Galaxies');
 INSERT INTO test VALUES ('Top.Collections.Pictures.Astronomy.Astronauts');
 CREATE INDEX path_gist_idx ON test USING GIST (path);
 CREATE INDEX path_idx ON test USING BTREE (path);
+CREATE INDEX path_hash_idx ON test USING HASH (path);
 </programlisting>
 
   <para>
@@ -804,7 +814,7 @@ ltreetest=&gt; SELECT subpath(path,0,2)||'Space'||subpath(path,2) FROM test WHER
   </para>
 
   <para>
-   We could simplify this by creating a SQL function that inserts a label
+   We could simplify this by creating an SQL function that inserts a label
    at a specified position in a path:
 <screen>
 CREATE FUNCTION ins_label(ltree, int, text) RETURNS ltree
@@ -822,22 +832,27 @@ ltreetest=&gt; SELECT ins_label(path,2,'Space') FROM test WHERE path &lt;@ 'Top.
   </para>
  </sect2>
 
- <sect2>
+ <sect2 id="ltree-transforms">
   <title>Transforms</title>
 
   <para>
-   Additional extensions are available that implement transforms for
-   the <type>ltree</type> type for PL/Python.  The extensions are
-   called <literal>ltree_plpythonu</literal>, <literal>ltree_plpython2u</literal>,
-   and <literal>ltree_plpython3u</literal>
-   (see <xref linkend="plpython-python23"/> for the PL/Python naming
-   convention).  If you install these transforms and specify them when
+   The <literal>ltree_plpython3u</literal> extension implements transforms for
+   the <type>ltree</type> type for PL/Python. If installed and specified when
    creating a function, <type>ltree</type> values are mapped to Python lists.
    (The reverse is currently not supported, however.)
   </para>
+
+  <caution>
+   <para>
+    It is strongly recommended that the transform extension be installed in
+    the same schema as <filename>ltree</filename>.  Otherwise there are
+    installation-time security hazards if a transform extension's schema
+    contains objects defined by a hostile user.
+   </para>
+  </caution>
  </sect2>
 
- <sect2>
+ <sect2 id="ltree-authors">
   <title>Authors</title>
 
   <para>

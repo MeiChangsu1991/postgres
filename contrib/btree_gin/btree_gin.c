@@ -306,9 +306,8 @@ leftmostvalue_interval(void)
 {
 	Interval   *v = palloc(sizeof(Interval));
 
-	v->time = DT_NOBEGIN;
-	v->day = 0;
-	v->month = 0;
+	INTERVAL_NOBEGIN(v);
+
 	return IntervalPGetDatum(v);
 }
 
@@ -357,7 +356,7 @@ GIN_SUPPORT(bpchar, true, leftmostvalue_text, bpcharcmp)
 static Datum
 leftmostvalue_char(void)
 {
-	return CharGetDatum(SCHAR_MIN);
+	return CharGetDatum(0);
 }
 
 GIN_SUPPORT(char, false, leftmostvalue_char, btcharcmp)

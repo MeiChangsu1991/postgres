@@ -3,7 +3,7 @@
  * llvmjit_wrap.cpp
  *	  Parts of the LLVM interface not (yet) exposed to C.
  *
- * Copyright (c) 2016-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/lib/llvm/llvmjit_wrap.cpp
@@ -16,8 +16,12 @@ extern "C"
 #include "postgres.h"
 }
 
-#include <llvm/MC/SubtargetFeature.h>
-#include <llvm/Support/Host.h>
+#include <llvm-c/Core.h>
+
+/* Avoid macro clash with LLVM's C++ headers */
+#undef Min
+
+#include <llvm/IR/Function.h>
 
 #include "jit/llvmjit.h"
 
@@ -25,22 +29,15 @@ extern "C"
 /*
  * C-API extensions.
  */
-#if defined(HAVE_DECL_LLVMGETHOSTCPUNAME) && !HAVE_DECL_LLVMGETHOSTCPUNAME
-char *LLVMGetHostCPUName(void) {
-	return strdup(llvm::sys::getHostCPUName().data());
+
+LLVMTypeRef
+LLVMGetFunctionReturnType(LLVMValueRef r)
+{
+	return llvm::wrap(llvm::unwrap<llvm::Function>(r)->getReturnType());
 }
-#endif
 
-
-#if defined(HAVE_DECL_LLVMGETHOSTCPUFEATURES) && !HAVE_DECL_LLVMGETHOSTCPUFEATURES
-char *LLVMGetHostCPUFeatures(void) {
-	llvm::SubtargetFeatures Features;
-	llvm::StringMap<bool> HostFeatures;
-
-	if (llvm::sys::getHostCPUFeatures(HostFeatures))
-		for (auto &F : HostFeatures)
-			Features.AddFeature(F.first(), F.second);
-
-	return strdup(Features.getString().c_str());
+LLVMTypeRef
+LLVMGetFunctionType(LLVMValueRef r)
+{
+	return llvm::wrap(llvm::unwrap<llvm::Function>(r)->getFunctionType());
 }
-#endif

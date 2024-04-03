@@ -46,7 +46,7 @@
  * exported rather than being "static" in this file.)
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -63,14 +63,17 @@
 #include "executor/nodeSubplan.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "nodes/miscnodes.h"
 #include "nodes/nodeFuncs.h"
-#include "parser/parsetree.h"
 #include "pgstat.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datum.h"
 #include "utils/expandedrecord.h"
+#include "utils/json.h"
+#include "utils/jsonfuncs.h"
+#include "utils/jsonpath.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
@@ -145,8 +148,8 @@ static void ExecInitInterpreter(void);
 static void CheckVarSlotCompatibility(TupleTableSlot *slot, int attnum, Oid vartype);
 static void CheckOpSlotCompatibility(ExprEvalStep *op, TupleTableSlot *slot);
 static TupleDesc get_cached_rowtype(Oid type_id, int32 typmod,
-									TupleDesc *cache_field, ExprContext *econtext);
-static void ShutdownTupleDescRef(Datum arg);
+									ExprEvalRowtypeCache *rowcache,
+									bool *changed);
 static void ExecEvalRowNullInt(ExprState *state, ExprEvalStep *op,
 							   ExprContext *econtext, bool checkisnull);
 
@@ -177,6 +180,54 @@ static pg_attribute_always_inline void ExecAggPlainTransByRef(AggState *aggstate
 															  AggStatePerGroup pergroup,
 															  ExprContext *aggcontext,
 															  int setno);
+static char *ExecGetJsonValueItemString(JsonbValue *item, bool *resnull);
+
+/*
+ * ScalarArrayOpExprHashEntry
+ * 		Hash table entry type used during EEOP_HASHED_SCALARARRAYOP
+ */
+typedef struct ScalarArrayOpExprHashEntry
+{
+	Datum		key;
+	uint32		status;			/* hash status */
+	uint32		hash;			/* hash value (cached) */
+} ScalarArrayOpExprHashEntry;
+
+#define SH_PREFIX saophash
+#define SH_ELEMENT_TYPE ScalarArrayOpExprHashEntry
+#define SH_KEY_TYPE Datum
+#define SH_SCOPE static inline
+#define SH_DECLARE
+#include "lib/simplehash.h"
+
+static bool saop_hash_element_match(struct saophash_hash *tb, Datum key1,
+									Datum key2);
+static uint32 saop_element_hash(struct saophash_hash *tb, Datum key);
+
+/*
+ * ScalarArrayOpExprHashTable
+ *		Hash table for EEOP_HASHED_SCALARARRAYOP
+ */
+typedef struct ScalarArrayOpExprHashTable
+{
+	saophash_hash *hashtab;		/* underlying hash table */
+	struct ExprEvalStep *op;
+	FmgrInfo	hash_finfo;		/* function's lookup data */
+	FunctionCallInfoBaseData hash_fcinfo_data;	/* arguments etc */
+} ScalarArrayOpExprHashTable;
+
+/* Define parameters for ScalarArrayOpExpr hash table code generation. */
+#define SH_PREFIX saophash
+#define SH_ELEMENT_TYPE ScalarArrayOpExprHashEntry
+#define SH_KEY_TYPE Datum
+#define SH_KEY key
+#define SH_HASH_KEY(tb, key) saop_element_hash(tb, key)
+#define SH_EQUAL(tb, a, b) saop_hash_element_match(tb, a, b)
+#define SH_SCOPE static inline
+#define SH_STORE_HASH
+#define SH_GET_HASH(tb, a) a->hash
+#define SH_DEFINE
+#include "lib/simplehash.h"
 
 /*
  * Prepare ExprState for interpreted execution.
@@ -402,6 +453,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_CASE_TESTVAL,
 		&&CASE_EEOP_MAKE_READONLY,
 		&&CASE_EEOP_IOCOERCE,
+		&&CASE_EEOP_IOCOERCE_SAFE,
 		&&CASE_EEOP_DISTINCT,
 		&&CASE_EEOP_NOT_DISTINCT,
 		&&CASE_EEOP_NULLIF,
@@ -417,7 +469,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_FIELDSELECT,
 		&&CASE_EEOP_FIELDSTORE_DEFORM,
 		&&CASE_EEOP_FIELDSTORE_FORM,
-		&&CASE_EEOP_SBSREF_SUBSCRIPT,
+		&&CASE_EEOP_SBSREF_SUBSCRIPTS,
 		&&CASE_EEOP_SBSREF_OLD,
 		&&CASE_EEOP_SBSREF_ASSIGN,
 		&&CASE_EEOP_SBSREF_FETCH,
@@ -426,12 +478,18 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_DOMAIN_CHECK,
 		&&CASE_EEOP_CONVERT_ROWTYPE,
 		&&CASE_EEOP_SCALARARRAYOP,
+		&&CASE_EEOP_HASHED_SCALARARRAYOP,
 		&&CASE_EEOP_XMLEXPR,
+		&&CASE_EEOP_JSON_CONSTRUCTOR,
+		&&CASE_EEOP_IS_JSON,
+		&&CASE_EEOP_JSONEXPR_PATH,
+		&&CASE_EEOP_JSONEXPR_COERCION,
+		&&CASE_EEOP_JSONEXPR_COERCION_FINISH,
 		&&CASE_EEOP_AGGREF,
 		&&CASE_EEOP_GROUPING_FUNC,
 		&&CASE_EEOP_WINDOW_FUNC,
+		&&CASE_EEOP_MERGE_SUPPORT_FUNC,
 		&&CASE_EEOP_SUBPLAN,
-		&&CASE_EEOP_ALTERNATIVE_SUBPLAN,
 		&&CASE_EEOP_AGG_STRICT_DESERIALIZE,
 		&&CASE_EEOP_AGG_DESERIALIZE,
 		&&CASE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS,
@@ -443,12 +501,14 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF,
 		&&CASE_EEOP_AGG_PLAIN_TRANS_STRICT_BYREF,
 		&&CASE_EEOP_AGG_PLAIN_TRANS_BYREF,
+		&&CASE_EEOP_AGG_PRESORTED_DISTINCT_SINGLE,
+		&&CASE_EEOP_AGG_PRESORTED_DISTINCT_MULTI,
 		&&CASE_EEOP_AGG_ORDERED_TRANS_DATUM,
 		&&CASE_EEOP_AGG_ORDERED_TRANS_TUPLE,
 		&&CASE_EEOP_LAST
 	};
 
-	StaticAssertStmt(EEOP_LAST + 1 == lengthof(dispatch_table),
+	StaticAssertDecl(lengthof(dispatch_table) == EEOP_LAST + 1,
 					 "dispatch_table out of whack with ExprEvalOp");
 
 	if (unlikely(state == NULL))
@@ -581,6 +641,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			 * care of at compilation time.  But see EEOP_INNER_VAR comments.
 			 */
 			Assert(attnum >= 0 && attnum < innerslot->tts_nvalid);
+			Assert(resultnum >= 0 && resultnum < resultslot->tts_tupleDescriptor->natts);
 			resultslot->tts_values[resultnum] = innerslot->tts_values[attnum];
 			resultslot->tts_isnull[resultnum] = innerslot->tts_isnull[attnum];
 
@@ -597,6 +658,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			 * care of at compilation time.  But see EEOP_INNER_VAR comments.
 			 */
 			Assert(attnum >= 0 && attnum < outerslot->tts_nvalid);
+			Assert(resultnum >= 0 && resultnum < resultslot->tts_tupleDescriptor->natts);
 			resultslot->tts_values[resultnum] = outerslot->tts_values[attnum];
 			resultslot->tts_isnull[resultnum] = outerslot->tts_isnull[attnum];
 
@@ -613,6 +675,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			 * care of at compilation time.  But see EEOP_INNER_VAR comments.
 			 */
 			Assert(attnum >= 0 && attnum < scanslot->tts_nvalid);
+			Assert(resultnum >= 0 && resultnum < resultslot->tts_tupleDescriptor->natts);
 			resultslot->tts_values[resultnum] = scanslot->tts_values[attnum];
 			resultslot->tts_isnull[resultnum] = scanslot->tts_isnull[attnum];
 
@@ -623,6 +686,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		{
 			int			resultnum = op->d.assign_tmp.resultnum;
 
+			Assert(resultnum >= 0 && resultnum < resultslot->tts_tupleDescriptor->natts);
 			resultslot->tts_values[resultnum] = state->resvalue;
 			resultslot->tts_isnull[resultnum] = state->resnull;
 
@@ -633,6 +697,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		{
 			int			resultnum = op->d.assign_tmp.resultnum;
 
+			Assert(resultnum >= 0 && resultnum < resultslot->tts_tupleDescriptor->natts);
 			resultslot->tts_isnull[resultnum] = state->resnull;
 			if (!resultslot->tts_isnull[resultnum])
 				resultslot->tts_values[resultnum] =
@@ -1091,6 +1156,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			 * Evaluate a CoerceViaIO node.  This can be quite a hot path, so
 			 * inline as much work as possible.  The source value is in our
 			 * result variable.
+			 *
+			 * Also look at ExecEvalCoerceViaIOSafe() if you change anything
+			 * here.
 			 */
 			char	   *str;
 
@@ -1143,6 +1211,12 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 				}
 			}
 
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_IOCOERCE_SAFE)
+		{
+			ExecEvalCoerceViaIOSafe(state, op);
 			EEO_NEXT();
 		}
 
@@ -1397,12 +1471,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		EEO_CASE(EEOP_SBSREF_SUBSCRIPT)
+		EEO_CASE(EEOP_SBSREF_SUBSCRIPTS)
 		{
-			/* Process an array subscript */
-
-			/* too complex for an inline implementation */
-			if (ExecEvalSubscriptingRef(state, op))
+			/* Precheck SubscriptingRef subscript(s) */
+			if (op->d.sbsref_subscript.subscriptfunc(state, op, econtext))
 			{
 				EEO_NEXT();
 			}
@@ -1414,37 +1486,11 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		}
 
 		EEO_CASE(EEOP_SBSREF_OLD)
+			EEO_CASE(EEOP_SBSREF_ASSIGN)
+			EEO_CASE(EEOP_SBSREF_FETCH)
 		{
-			/*
-			 * Fetch the old value in an sbsref assignment, in case it's
-			 * referenced (via a CaseTestExpr) inside the assignment
-			 * expression.
-			 */
-
-			/* too complex for an inline implementation */
-			ExecEvalSubscriptingRefOld(state, op);
-
-			EEO_NEXT();
-		}
-
-		/*
-		 * Perform SubscriptingRef assignment
-		 */
-		EEO_CASE(EEOP_SBSREF_ASSIGN)
-		{
-			/* too complex for an inline implementation */
-			ExecEvalSubscriptingRefAssign(state, op);
-
-			EEO_NEXT();
-		}
-
-		/*
-		 * Fetch subset of an array.
-		 */
-		EEO_CASE(EEOP_SBSREF_FETCH)
-		{
-			/* too complex for an inline implementation */
-			ExecEvalSubscriptingRefFetch(state, op);
+			/* Perform a SubscriptingRef fetch or assignment */
+			op->d.sbsref.subscriptfunc(state, op, econtext);
 
 			EEO_NEXT();
 		}
@@ -1461,6 +1507,14 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		{
 			/* too complex for an inline implementation */
 			ExecEvalScalarArrayOp(state, op);
+
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_HASHED_SCALARARRAYOP)
+		{
+			/* too complex for an inline implementation */
+			ExecEvalHashedScalarArrayOp(state, op, econtext);
 
 			EEO_NEXT();
 		}
@@ -1489,18 +1543,55 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		EEO_CASE(EEOP_JSON_CONSTRUCTOR)
+		{
+			/* too complex for an inline implementation */
+			ExecEvalJsonConstructor(state, op, econtext);
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_IS_JSON)
+		{
+			/* too complex for an inline implementation */
+			ExecEvalJsonIsPredicate(state, op);
+
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_JSONEXPR_PATH)
+		{
+			/* too complex for an inline implementation */
+			EEO_JUMP(ExecEvalJsonExprPath(state, op, econtext));
+		}
+
+		EEO_CASE(EEOP_JSONEXPR_COERCION)
+		{
+			/* too complex for an inline implementation */
+			ExecEvalJsonCoercion(state, op, econtext);
+
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_JSONEXPR_COERCION_FINISH)
+		{
+			/* too complex for an inline implementation */
+			ExecEvalJsonCoercionFinish(state, op);
+
+			EEO_NEXT();
+		}
+
 		EEO_CASE(EEOP_AGGREF)
 		{
 			/*
 			 * Returns a Datum whose value is the precomputed aggregate value
 			 * found in the given expression context.
 			 */
-			AggrefExprState *aggref = op->d.aggref.astate;
+			int			aggno = op->d.aggref.aggno;
 
 			Assert(econtext->ecxt_aggvalues != NULL);
 
-			*op->resvalue = econtext->ecxt_aggvalues[aggref->aggno];
-			*op->resnull = econtext->ecxt_aggnulls[aggref->aggno];
+			*op->resvalue = econtext->ecxt_aggvalues[aggno];
+			*op->resnull = econtext->ecxt_aggnulls[aggno];
 
 			EEO_NEXT();
 		}
@@ -1528,18 +1619,18 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
-		EEO_CASE(EEOP_SUBPLAN)
+		EEO_CASE(EEOP_MERGE_SUPPORT_FUNC)
 		{
-			/* too complex for an inline implementation */
-			ExecEvalSubPlan(state, op, econtext);
+			/* too complex/uncommon for an inline implementation */
+			ExecEvalMergeSupportFunc(state, op, econtext);
 
 			EEO_NEXT();
 		}
 
-		EEO_CASE(EEOP_ALTERNATIVE_SUBPLAN)
+		EEO_CASE(EEOP_SUBPLAN)
 		{
 			/* too complex for an inline implementation */
-			ExecEvalAlternativeSubPlan(state, op, econtext);
+			ExecEvalSubPlan(state, op, econtext);
 
 			EEO_NEXT();
 		}
@@ -1613,7 +1704,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		{
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerGroup pergroup_allaggs =
-			aggstate->all_pergroups[op->d.agg_plain_pergroup_nullcheck.setoff];
+				aggstate->all_pergroups[op->d.agg_plain_pergroup_nullcheck.setoff];
 
 			if (pergroup_allaggs == NULL)
 				EEO_JUMP(op->d.agg_plain_pergroup_nullcheck.jumpnull);
@@ -1638,7 +1729,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =
-			&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
+				&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
 
 			Assert(pertrans->transtypeByVal);
 
@@ -1666,7 +1757,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =
-			&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
+				&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
 
 			Assert(pertrans->transtypeByVal);
 
@@ -1684,7 +1775,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =
-			&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
+				&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
 
 			Assert(pertrans->transtypeByVal);
 
@@ -1701,7 +1792,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =
-			&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
+				&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
 
 			Assert(!pertrans->transtypeByVal);
 
@@ -1722,7 +1813,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =
-			&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
+				&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
 
 			Assert(!pertrans->transtypeByVal);
 
@@ -1739,7 +1830,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			AggState   *aggstate = castNode(AggState, state->parent);
 			AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
 			AggStatePerGroup pergroup =
-			&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
+				&aggstate->all_pergroups[op->d.agg_trans.setoff][op->d.agg_trans.transno];
 
 			Assert(!pertrans->transtypeByVal);
 
@@ -1748,6 +1839,28 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 								   op->d.agg_trans.setno);
 
 			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_AGG_PRESORTED_DISTINCT_SINGLE)
+		{
+			AggStatePerTrans pertrans = op->d.agg_presorted_distinctcheck.pertrans;
+			AggState   *aggstate = castNode(AggState, state->parent);
+
+			if (ExecEvalPreOrderedDistinctSingle(aggstate, pertrans))
+				EEO_NEXT();
+			else
+				EEO_JUMP(op->d.agg_presorted_distinctcheck.jumpdistinct);
+		}
+
+		EEO_CASE(EEOP_AGG_PRESORTED_DISTINCT_MULTI)
+		{
+			AggState   *aggstate = castNode(AggState, state->parent);
+			AggStatePerTrans pertrans = op->d.agg_presorted_distinctcheck.pertrans;
+
+			if (ExecEvalPreOrderedDistinctMulti(aggstate, pertrans))
+				EEO_NEXT();
+			else
+				EEO_JUMP(op->d.agg_presorted_distinctcheck.jumpdistinct);
 		}
 
 		/* process single-column ordered aggregate datum */
@@ -1942,56 +2055,79 @@ CheckOpSlotCompatibility(ExprEvalStep *op, TupleTableSlot *slot)
  * get_cached_rowtype: utility function to lookup a rowtype tupdesc
  *
  * type_id, typmod: identity of the rowtype
- * cache_field: where to cache the TupleDesc pointer in expression state node
- *		(field must be initialized to NULL)
- * econtext: expression context we are executing in
+ * rowcache: space for caching identity info
+ *		(rowcache->cacheptr must be initialized to NULL)
+ * changed: if not NULL, *changed is set to true on any update
  *
- * NOTE: because the shutdown callback will be called during plan rescan,
- * must be prepared to re-do this during any node execution; cannot call
- * just once during expression initialization.
+ * The returned TupleDesc is not guaranteed pinned; caller must pin it
+ * to use it across any operation that might incur cache invalidation,
+ * including for example detoasting of input tuples.
+ * (The TupleDesc is always refcounted, so just use IncrTupleDescRefCount.)
+ *
+ * NOTE: because composite types can change contents, we must be prepared
+ * to re-do this during any node execution; cannot call just once during
+ * expression initialization.
  */
 static TupleDesc
 get_cached_rowtype(Oid type_id, int32 typmod,
-				   TupleDesc *cache_field, ExprContext *econtext)
+				   ExprEvalRowtypeCache *rowcache,
+				   bool *changed)
 {
-	TupleDesc	tupDesc = *cache_field;
-
-	/* Do lookup if no cached value or if requested type changed */
-	if (tupDesc == NULL ||
-		type_id != tupDesc->tdtypeid ||
-		typmod != tupDesc->tdtypmod)
+	if (type_id != RECORDOID)
 	{
-		tupDesc = lookup_rowtype_tupdesc(type_id, typmod);
+		/*
+		 * It's a named composite type, so use the regular typcache.  Do a
+		 * lookup first time through, or if the composite type changed.  Note:
+		 * "tupdesc_id == 0" may look redundant, but it protects against the
+		 * admittedly-theoretical possibility that type_id was RECORDOID the
+		 * last time through, so that the cacheptr isn't TypeCacheEntry *.
+		 */
+		TypeCacheEntry *typentry = (TypeCacheEntry *) rowcache->cacheptr;
 
-		if (*cache_field)
+		if (unlikely(typentry == NULL ||
+					 rowcache->tupdesc_id == 0 ||
+					 typentry->tupDesc_identifier != rowcache->tupdesc_id))
 		{
-			/* Release old tupdesc; but callback is already registered */
-			ReleaseTupleDesc(*cache_field);
+			typentry = lookup_type_cache(type_id, TYPECACHE_TUPDESC);
+			if (typentry->tupDesc == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("type %s is not composite",
+								format_type_be(type_id))));
+			rowcache->cacheptr = (void *) typentry;
+			rowcache->tupdesc_id = typentry->tupDesc_identifier;
+			if (changed)
+				*changed = true;
 		}
-		else
-		{
-			/* Need to register shutdown callback to release tupdesc */
-			RegisterExprContextCallback(econtext,
-										ShutdownTupleDescRef,
-										PointerGetDatum(cache_field));
-		}
-		*cache_field = tupDesc;
+		return typentry->tupDesc;
 	}
-	return tupDesc;
+	else
+	{
+		/*
+		 * A RECORD type, once registered, doesn't change for the life of the
+		 * backend.  So we don't need a typcache entry as such, which is good
+		 * because there isn't one.  It's possible that the caller is asking
+		 * about a different type than before, though.
+		 */
+		TupleDesc	tupDesc = (TupleDesc) rowcache->cacheptr;
+
+		if (unlikely(tupDesc == NULL ||
+					 rowcache->tupdesc_id != 0 ||
+					 type_id != tupDesc->tdtypeid ||
+					 typmod != tupDesc->tdtypmod))
+		{
+			tupDesc = lookup_rowtype_tupdesc(type_id, typmod);
+			/* Drop pin acquired by lookup_rowtype_tupdesc */
+			ReleaseTupleDesc(tupDesc);
+			rowcache->cacheptr = (void *) tupDesc;
+			rowcache->tupdesc_id = 0;	/* not a valid value for non-RECORD */
+			if (changed)
+				*changed = true;
+		}
+		return tupDesc;
+	}
 }
 
-/*
- * Callback function to release a tupdesc refcount at econtext shutdown
- */
-static void
-ShutdownTupleDescRef(Datum arg)
-{
-	TupleDesc  *cache_field = (TupleDesc *) DatumGetPointer(arg);
-
-	if (*cache_field)
-		ReleaseTupleDesc(*cache_field);
-	*cache_field = NULL;
-}
 
 /*
  * Fast-path functions, for very simple expressions
@@ -2052,8 +2188,10 @@ ExecJustAssignVarImpl(ExprState *state, TupleTableSlot *inslot, bool *isnull)
 	 *
 	 * Since we use slot_getattr(), we don't need to implement the FETCHSOME
 	 * step explicitly, and we also needn't Assert that the attnum is in range
-	 * --- slot_getattr() will take care of any problems.
+	 * --- slot_getattr() will take care of any problems.  Nonetheless, check
+	 * that resultnum is in range.
 	 */
+	Assert(resultnum >= 0 && resultnum < outslot->tts_tupleDescriptor->natts);
 	outslot->tts_values[resultnum] =
 		slot_getattr(inslot, attnum, &outslot->tts_isnull[resultnum]);
 	return 0;
@@ -2185,6 +2323,7 @@ ExecJustAssignVarVirtImpl(ExprState *state, TupleTableSlot *inslot, bool *isnull
 	Assert(TTS_IS_VIRTUAL(inslot));
 	Assert(TTS_FIXED(inslot));
 	Assert(attnum >= 0 && attnum < inslot->tts_nvalid);
+	Assert(resultnum >= 0 && resultnum < outslot->tts_tupleDescriptor->natts);
 
 	outslot->tts_values[resultnum] = inslot->tts_values[attnum];
 	outslot->tts_isnull[resultnum] = inslot->tts_isnull[attnum];
@@ -2417,6 +2556,71 @@ ExecEvalParamExtern(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 }
 
 /*
+ * Evaluate a CoerceViaIO node in soft-error mode.
+ *
+ * The source value is in op's result variable.
+ *
+ * Note: This implements EEOP_IOCOERCE_SAFE. If you change anything here,
+ * also look at the inline code for EEOP_IOCOERCE.
+ */
+void
+ExecEvalCoerceViaIOSafe(ExprState *state, ExprEvalStep *op)
+{
+	char	   *str;
+
+	/* call output function (similar to OutputFunctionCall) */
+	if (*op->resnull)
+	{
+		/* output functions are not called on nulls */
+		str = NULL;
+	}
+	else
+	{
+		FunctionCallInfo fcinfo_out;
+
+		fcinfo_out = op->d.iocoerce.fcinfo_data_out;
+		fcinfo_out->args[0].value = *op->resvalue;
+		fcinfo_out->args[0].isnull = false;
+
+		fcinfo_out->isnull = false;
+		str = DatumGetCString(FunctionCallInvoke(fcinfo_out));
+
+		/* OutputFunctionCall assumes result isn't null */
+		Assert(!fcinfo_out->isnull);
+	}
+
+	/* call input function (similar to InputFunctionCallSafe) */
+	if (!op->d.iocoerce.finfo_in->fn_strict || str != NULL)
+	{
+		FunctionCallInfo fcinfo_in;
+
+		fcinfo_in = op->d.iocoerce.fcinfo_data_in;
+		fcinfo_in->args[0].value = PointerGetDatum(str);
+		fcinfo_in->args[0].isnull = *op->resnull;
+		/* second and third arguments are already set up */
+
+		/* ErrorSaveContext must be present. */
+		Assert(IsA(fcinfo_in->context, ErrorSaveContext));
+
+		fcinfo_in->isnull = false;
+		*op->resvalue = FunctionCallInvoke(fcinfo_in);
+
+		if (SOFT_ERROR_OCCURRED(fcinfo_in->context))
+		{
+			*op->resnull = true;
+			*op->resvalue = (Datum) 0;
+			return;
+		}
+
+		/* Should get null result if and only if str is NULL */
+		if (str == NULL)
+			Assert(*op->resnull);
+		else
+			Assert(!*op->resnull);
+	}
+}
+
+/*
  * Evaluate a SQLValueFunction expression.
  */
 void
@@ -2583,8 +2787,7 @@ ExecEvalRowNullInt(ExprState *state, ExprEvalStep *op,
 
 	/* Lookup tupdesc if first time through or if type changes */
 	tupDesc = get_cached_rowtype(tupType, tupTypmod,
-								 &op->d.nulltest_row.argdesc,
-								 econtext);
+								 &op->d.nulltest_row.rowcache, NULL);
 
 	/*
 	 * heap_attisnull needs a HeapTuple not a bare HeapTupleHeader.
@@ -2660,7 +2863,7 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 	{
 		/* Must be nested array expressions */
 		int			nbytes = 0;
-		int			nitems = 0;
+		int			nitems;
 		int			outer_nelems = 0;
 		int			elem_ndims = 0;
 		int		   *elem_dims = NULL;
@@ -2755,9 +2958,14 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 			subbitmaps[outer_nelems] = ARR_NULLBITMAP(array);
 			subbytes[outer_nelems] = ARR_SIZE(array) - ARR_DATA_OFFSET(array);
 			nbytes += subbytes[outer_nelems];
+			/* check for overflow of total request */
+			if (!AllocSizeIsValid(nbytes))
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("array size exceeds the maximum allowed (%d)",
+								(int) MaxAllocSize)));
 			subnitems[outer_nelems] = ArrayGetNItems(this_ndims,
 													 ARR_DIMS(array));
-			nitems += subnitems[outer_nelems];
 			havenulls |= ARR_HASNULL(array);
 			outer_nelems++;
 		}
@@ -2790,6 +2998,10 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 			lbs[i] = elem_lbs[i - 1];
 		}
 
+		/* check for subscript overflow */
+		nitems = ArrayGetNItems(ndims, dims);
+		ArrayCheckBounds(ndims, dims, lbs);
+
 		if (havenulls)
 		{
 			dataoffset = ARR_OVERHEAD_WITHNULLS(ndims, nitems);
@@ -2801,7 +3013,7 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 			nbytes += ARR_OVERHEAD_NONULLS(ndims);
 		}
 
-		result = (ArrayType *) palloc(nbytes);
+		result = (ArrayType *) palloc0(nbytes);
 		SET_VARSIZE(result, nbytes);
 		result->ndim = ndims;
 		result->dataoffset = dataoffset;
@@ -3017,8 +3229,7 @@ ExecEvalFieldSelect(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 
 		/* Lookup tupdesc if first time through or if type changes */
 		tupDesc = get_cached_rowtype(tupType, tupTypmod,
-									 &op->d.fieldselect.argdesc,
-									 econtext);
+									 &op->d.fieldselect.rowcache, NULL);
 
 		/*
 		 * Find field's attr record.  Note we don't support system columns
@@ -3074,17 +3285,6 @@ ExecEvalFieldSelect(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 void
 ExecEvalFieldStoreDeForm(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 {
-	TupleDesc	tupDesc;
-
-	/* Lookup tupdesc if first time through or after rescan */
-	tupDesc = get_cached_rowtype(op->d.fieldstore.fstore->resulttype, -1,
-								 op->d.fieldstore.argdesc, econtext);
-
-	/* Check that current tupdesc doesn't have more fields than we allocated */
-	if (unlikely(tupDesc->natts > op->d.fieldstore.ncolumns))
-		elog(ERROR, "too many columns in composite type %u",
-			 op->d.fieldstore.fstore->resulttype);
-
 	if (*op->resnull)
 	{
 		/* Convert null input tuple into an all-nulls row */
@@ -3100,12 +3300,27 @@ ExecEvalFieldStoreDeForm(ExprState *state, ExprEvalStep *op, ExprContext *econte
 		Datum		tupDatum = *op->resvalue;
 		HeapTupleHeader tuphdr;
 		HeapTupleData tmptup;
+		TupleDesc	tupDesc;
 
 		tuphdr = DatumGetHeapTupleHeader(tupDatum);
 		tmptup.t_len = HeapTupleHeaderGetDatumLength(tuphdr);
 		ItemPointerSetInvalid(&(tmptup.t_self));
 		tmptup.t_tableOid = InvalidOid;
 		tmptup.t_data = tuphdr;
+
+		/*
+		 * Lookup tupdesc if first time through or if type changes.  Because
+		 * we don't pin the tupdesc, we must not do this lookup until after
+		 * doing DatumGetHeapTupleHeader: that could do database access while
+		 * detoasting the datum.
+		 */
+		tupDesc = get_cached_rowtype(op->d.fieldstore.fstore->resulttype, -1,
+									 op->d.fieldstore.rowcache, NULL);
+
+		/* Check that current tupdesc doesn't have more fields than allocated */
+		if (unlikely(tupDesc->natts > op->d.fieldstore.ncolumns))
+			elog(ERROR, "too many columns in composite type %u",
+				 op->d.fieldstore.fstore->resulttype);
 
 		heap_deform_tuple(&tmptup, tupDesc,
 						  op->d.fieldstore.values,
@@ -3120,209 +3335,19 @@ ExecEvalFieldStoreDeForm(ExprState *state, ExprEvalStep *op, ExprContext *econte
 void
 ExecEvalFieldStoreForm(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 {
+	TupleDesc	tupDesc;
 	HeapTuple	tuple;
 
-	/* argdesc should already be valid from the DeForm step */
-	tuple = heap_form_tuple(*op->d.fieldstore.argdesc,
+	/* Lookup tupdesc (should be valid already) */
+	tupDesc = get_cached_rowtype(op->d.fieldstore.fstore->resulttype, -1,
+								 op->d.fieldstore.rowcache, NULL);
+
+	tuple = heap_form_tuple(tupDesc,
 							op->d.fieldstore.values,
 							op->d.fieldstore.nulls);
 
 	*op->resvalue = HeapTupleGetDatum(tuple);
 	*op->resnull = false;
-}
-
-/*
- * Process a subscript in a SubscriptingRef expression.
- *
- * If subscript is NULL, throw error in assignment case, or in fetch case
- * set result to NULL and return false (instructing caller to skip the rest
- * of the SubscriptingRef sequence).
- *
- * Subscript expression result is in subscriptvalue/subscriptnull.
- * On success, integer subscript value has been saved in upperindex[] or
- * lowerindex[] for use later.
- */
-bool
-ExecEvalSubscriptingRef(ExprState *state, ExprEvalStep *op)
-{
-	SubscriptingRefState *sbsrefstate = op->d.sbsref_subscript.state;
-	int		   *indexes;
-	int			off;
-
-	/* If any index expr yields NULL, result is NULL or error */
-	if (sbsrefstate->subscriptnull)
-	{
-		if (sbsrefstate->isassignment)
-			ereport(ERROR,
-					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-					 errmsg("array subscript in assignment must not be null")));
-		*op->resnull = true;
-		return false;
-	}
-
-	/* Convert datum to int, save in appropriate place */
-	if (op->d.sbsref_subscript.isupper)
-		indexes = sbsrefstate->upperindex;
-	else
-		indexes = sbsrefstate->lowerindex;
-	off = op->d.sbsref_subscript.off;
-
-	indexes[off] = DatumGetInt32(sbsrefstate->subscriptvalue);
-
-	return true;
-}
-
-/*
- * Evaluate SubscriptingRef fetch.
- *
- * Source container is in step's result variable.
- */
-void
-ExecEvalSubscriptingRefFetch(ExprState *state, ExprEvalStep *op)
-{
-	SubscriptingRefState *sbsrefstate = op->d.sbsref.state;
-
-	/* Should not get here if source container (or any subscript) is null */
-	Assert(!(*op->resnull));
-
-	if (sbsrefstate->numlower == 0)
-	{
-		/* Scalar case */
-		*op->resvalue = array_get_element(*op->resvalue,
-										  sbsrefstate->numupper,
-										  sbsrefstate->upperindex,
-										  sbsrefstate->refattrlength,
-										  sbsrefstate->refelemlength,
-										  sbsrefstate->refelembyval,
-										  sbsrefstate->refelemalign,
-										  op->resnull);
-	}
-	else
-	{
-		/* Slice case */
-		*op->resvalue = array_get_slice(*op->resvalue,
-										sbsrefstate->numupper,
-										sbsrefstate->upperindex,
-										sbsrefstate->lowerindex,
-										sbsrefstate->upperprovided,
-										sbsrefstate->lowerprovided,
-										sbsrefstate->refattrlength,
-										sbsrefstate->refelemlength,
-										sbsrefstate->refelembyval,
-										sbsrefstate->refelemalign);
-	}
-}
-
-/*
- * Compute old container element/slice value for a SubscriptingRef assignment
- * expression. Will only be generated if the new-value subexpression
- * contains SubscriptingRef or FieldStore. The value is stored into the
- * SubscriptingRefState's prevvalue/prevnull fields.
- */
-void
-ExecEvalSubscriptingRefOld(ExprState *state, ExprEvalStep *op)
-{
-	SubscriptingRefState *sbsrefstate = op->d.sbsref.state;
-
-	if (*op->resnull)
-	{
-		/* whole array is null, so any element or slice is too */
-		sbsrefstate->prevvalue = (Datum) 0;
-		sbsrefstate->prevnull = true;
-	}
-	else if (sbsrefstate->numlower == 0)
-	{
-		/* Scalar case */
-		sbsrefstate->prevvalue = array_get_element(*op->resvalue,
-												   sbsrefstate->numupper,
-												   sbsrefstate->upperindex,
-												   sbsrefstate->refattrlength,
-												   sbsrefstate->refelemlength,
-												   sbsrefstate->refelembyval,
-												   sbsrefstate->refelemalign,
-												   &sbsrefstate->prevnull);
-	}
-	else
-	{
-		/* Slice case */
-		/* this is currently unreachable */
-		sbsrefstate->prevvalue = array_get_slice(*op->resvalue,
-												 sbsrefstate->numupper,
-												 sbsrefstate->upperindex,
-												 sbsrefstate->lowerindex,
-												 sbsrefstate->upperprovided,
-												 sbsrefstate->lowerprovided,
-												 sbsrefstate->refattrlength,
-												 sbsrefstate->refelemlength,
-												 sbsrefstate->refelembyval,
-												 sbsrefstate->refelemalign);
-		sbsrefstate->prevnull = false;
-	}
-}
-
-/*
- * Evaluate SubscriptingRef assignment.
- *
- * Input container (possibly null) is in result area, replacement value is in
- * SubscriptingRefState's replacevalue/replacenull.
- */
-void
-ExecEvalSubscriptingRefAssign(ExprState *state, ExprEvalStep *op)
-{
-	SubscriptingRefState *sbsrefstate = op->d.sbsref_subscript.state;
-
-	/*
-	 * For an assignment to a fixed-length container type, both the original
-	 * container and the value to be assigned into it must be non-NULL, else
-	 * we punt and return the original container.
-	 */
-	if (sbsrefstate->refattrlength > 0)
-	{
-		if (*op->resnull || sbsrefstate->replacenull)
-			return;
-	}
-
-	/*
-	 * For assignment to varlena arrays, we handle a NULL original array by
-	 * substituting an empty (zero-dimensional) array; insertion of the new
-	 * element will result in a singleton array value.  It does not matter
-	 * whether the new element is NULL.
-	 */
-	if (*op->resnull)
-	{
-		*op->resvalue = PointerGetDatum(construct_empty_array(sbsrefstate->refelemtype));
-		*op->resnull = false;
-	}
-
-	if (sbsrefstate->numlower == 0)
-	{
-		/* Scalar case */
-		*op->resvalue = array_set_element(*op->resvalue,
-										  sbsrefstate->numupper,
-										  sbsrefstate->upperindex,
-										  sbsrefstate->replacevalue,
-										  sbsrefstate->replacenull,
-										  sbsrefstate->refattrlength,
-										  sbsrefstate->refelemlength,
-										  sbsrefstate->refelembyval,
-										  sbsrefstate->refelemalign);
-	}
-	else
-	{
-		/* Slice case */
-		*op->resvalue = array_set_slice(*op->resvalue,
-										sbsrefstate->numupper,
-										sbsrefstate->upperindex,
-										sbsrefstate->lowerindex,
-										sbsrefstate->upperprovided,
-										sbsrefstate->lowerprovided,
-										sbsrefstate->replacevalue,
-										sbsrefstate->replacenull,
-										sbsrefstate->refattrlength,
-										sbsrefstate->refelemlength,
-										sbsrefstate->refelembyval,
-										sbsrefstate->refelemalign);
-	}
 }
 
 /*
@@ -3334,13 +3359,13 @@ ExecEvalSubscriptingRefAssign(ExprState *state, ExprEvalStep *op)
 void
 ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 {
-	ConvertRowtypeExpr *convert = op->d.convert_rowtype.convert;
 	HeapTuple	result;
 	Datum		tupDatum;
 	HeapTupleHeader tuple;
 	HeapTupleData tmptup;
 	TupleDesc	indesc,
 				outdesc;
+	bool		changed = false;
 
 	/* NULL in -> NULL out */
 	if (*op->resnull)
@@ -3349,24 +3374,19 @@ ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext
 	tupDatum = *op->resvalue;
 	tuple = DatumGetHeapTupleHeader(tupDatum);
 
-	/* Lookup tupdescs if first time through or after rescan */
-	if (op->d.convert_rowtype.indesc == NULL)
-	{
-		get_cached_rowtype(exprType((Node *) convert->arg), -1,
-						   &op->d.convert_rowtype.indesc,
-						   econtext);
-		op->d.convert_rowtype.initialized = false;
-	}
-	if (op->d.convert_rowtype.outdesc == NULL)
-	{
-		get_cached_rowtype(convert->resulttype, -1,
-						   &op->d.convert_rowtype.outdesc,
-						   econtext);
-		op->d.convert_rowtype.initialized = false;
-	}
-
-	indesc = op->d.convert_rowtype.indesc;
-	outdesc = op->d.convert_rowtype.outdesc;
+	/*
+	 * Lookup tupdescs if first time through or if type changes.  We'd better
+	 * pin them since type conversion functions could do catalog lookups and
+	 * hence cause cache invalidation.
+	 */
+	indesc = get_cached_rowtype(op->d.convert_rowtype.inputtype, -1,
+								op->d.convert_rowtype.incache,
+								&changed);
+	IncrTupleDescRefCount(indesc);
+	outdesc = get_cached_rowtype(op->d.convert_rowtype.outputtype, -1,
+								 op->d.convert_rowtype.outcache,
+								 &changed);
+	IncrTupleDescRefCount(outdesc);
 
 	/*
 	 * We used to be able to assert that incoming tuples are marked with
@@ -3377,8 +3397,8 @@ ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext
 	Assert(HeapTupleHeaderGetTypeId(tuple) == indesc->tdtypeid ||
 		   HeapTupleHeaderGetTypeId(tuple) == RECORDOID);
 
-	/* if first time through, initialize conversion map */
-	if (!op->d.convert_rowtype.initialized)
+	/* if first time through, or after change, initialize conversion map */
+	if (changed)
 	{
 		MemoryContext old_cxt;
 
@@ -3387,7 +3407,6 @@ ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext
 
 		/* prepare map from old to new attribute numbers */
 		op->d.convert_rowtype.map = convert_tuples_by_name(indesc, outdesc);
-		op->d.convert_rowtype.initialized = true;
 
 		MemoryContextSwitchTo(old_cxt);
 	}
@@ -3417,6 +3436,9 @@ ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext
 		 */
 		*op->resvalue = heap_copy_tuple_as_datum(&tmptup, outdesc);
 	}
+
+	DecrTupleDescRefCount(indesc);
+	DecrTupleDescRefCount(outdesc);
 }
 
 /*
@@ -3577,13 +3599,248 @@ ExecEvalScalarArrayOp(ExprState *state, ExprEvalStep *op)
 }
 
 /*
+ * Hash function for scalar array hash op elements.
+ *
+ * We use the element type's default hash opclass, and the column collation
+ * if the type is collation-sensitive.
+ */
+static uint32
+saop_element_hash(struct saophash_hash *tb, Datum key)
+{
+	ScalarArrayOpExprHashTable *elements_tab = (ScalarArrayOpExprHashTable *) tb->private_data;
+	FunctionCallInfo fcinfo = &elements_tab->hash_fcinfo_data;
+	Datum		hash;
+
+	fcinfo->args[0].value = key;
+	fcinfo->args[0].isnull = false;
+
+	hash = elements_tab->hash_finfo.fn_addr(fcinfo);
+
+	return DatumGetUInt32(hash);
+}
+
+/*
+ * Matching function for scalar array hash op elements, to be used in hashtable
+ * lookups.
+ */
+static bool
+saop_hash_element_match(struct saophash_hash *tb, Datum key1, Datum key2)
+{
+	Datum		result;
+
+	ScalarArrayOpExprHashTable *elements_tab = (ScalarArrayOpExprHashTable *) tb->private_data;
+	FunctionCallInfo fcinfo = elements_tab->op->d.hashedscalararrayop.fcinfo_data;
+
+	fcinfo->args[0].value = key1;
+	fcinfo->args[0].isnull = false;
+	fcinfo->args[1].value = key2;
+	fcinfo->args[1].isnull = false;
+
+	result = elements_tab->op->d.hashedscalararrayop.finfo->fn_addr(fcinfo);
+
+	return DatumGetBool(result);
+}
+
+/*
+ * Evaluate "scalar op ANY (const array)".
+ *
+ * Similar to ExecEvalScalarArrayOp, but optimized for faster repeat lookups
+ * by building a hashtable on the first lookup.  This hashtable will be reused
+ * by subsequent lookups.  Unlike ExecEvalScalarArrayOp, this version only
+ * supports OR semantics.
+ *
+ * Source array is in our result area, scalar arg is already evaluated into
+ * fcinfo->args[0].
+ *
+ * The operator always yields boolean.
+ */
+void
+ExecEvalHashedScalarArrayOp(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
+{
+	ScalarArrayOpExprHashTable *elements_tab = op->d.hashedscalararrayop.elements_tab;
+	FunctionCallInfo fcinfo = op->d.hashedscalararrayop.fcinfo_data;
+	bool		inclause = op->d.hashedscalararrayop.inclause;
+	bool		strictfunc = op->d.hashedscalararrayop.finfo->fn_strict;
+	Datum		scalar = fcinfo->args[0].value;
+	bool		scalar_isnull = fcinfo->args[0].isnull;
+	Datum		result;
+	bool		resultnull;
+	bool		hashfound;
+
+	/* We don't setup a hashed scalar array op if the array const is null. */
+	Assert(!*op->resnull);
+
+	/*
+	 * If the scalar is NULL, and the function is strict, return NULL; no
+	 * point in executing the search.
+	 */
+	if (fcinfo->args[0].isnull && strictfunc)
+	{
+		*op->resnull = true;
+		return;
+	}
+
+	/* Build the hash table on first evaluation */
+	if (elements_tab == NULL)
+	{
+		ScalarArrayOpExpr *saop;
+		int16		typlen;
+		bool		typbyval;
+		char		typalign;
+		int			nitems;
+		bool		has_nulls = false;
+		char	   *s;
+		bits8	   *bitmap;
+		int			bitmask;
+		MemoryContext oldcontext;
+		ArrayType  *arr;
+
+		saop = op->d.hashedscalararrayop.saop;
+
+		arr = DatumGetArrayTypeP(*op->resvalue);
+		nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+
+		get_typlenbyvalalign(ARR_ELEMTYPE(arr),
+							 &typlen,
+							 &typbyval,
+							 &typalign);
+
+		oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
+
+		elements_tab = (ScalarArrayOpExprHashTable *)
+			palloc0(offsetof(ScalarArrayOpExprHashTable, hash_fcinfo_data) +
+					SizeForFunctionCallInfo(1));
+		op->d.hashedscalararrayop.elements_tab = elements_tab;
+		elements_tab->op = op;
+
+		fmgr_info(saop->hashfuncid, &elements_tab->hash_finfo);
+		fmgr_info_set_expr((Node *) saop, &elements_tab->hash_finfo);
+
+		InitFunctionCallInfoData(elements_tab->hash_fcinfo_data,
+								 &elements_tab->hash_finfo,
+								 1,
+								 saop->inputcollid,
+								 NULL,
+								 NULL);
+
+		/*
+		 * Create the hash table sizing it according to the number of elements
+		 * in the array.  This does assume that the array has no duplicates.
+		 * If the array happens to contain many duplicate values then it'll
+		 * just mean that we sized the table a bit on the large side.
+		 */
+		elements_tab->hashtab = saophash_create(CurrentMemoryContext, nitems,
+												elements_tab);
+
+		MemoryContextSwitchTo(oldcontext);
+
+		s = (char *) ARR_DATA_PTR(arr);
+		bitmap = ARR_NULLBITMAP(arr);
+		bitmask = 1;
+		for (int i = 0; i < nitems; i++)
+		{
+			/* Get array element, checking for NULL. */
+			if (bitmap && (*bitmap & bitmask) == 0)
+			{
+				has_nulls = true;
+			}
+			else
+			{
+				Datum		element;
+
+				element = fetch_att(s, typbyval, typlen);
+				s = att_addlength_pointer(s, typlen, s);
+				s = (char *) att_align_nominal(s, typalign);
+
+				saophash_insert(elements_tab->hashtab, element, &hashfound);
+			}
+
+			/* Advance bitmap pointer if any. */
+			if (bitmap)
+			{
+				bitmask <<= 1;
+				if (bitmask == 0x100)
+				{
+					bitmap++;
+					bitmask = 1;
+				}
+			}
+		}
+
+		/*
+		 * Remember if we had any nulls so that we know if we need to execute
+		 * non-strict functions with a null lhs value if no match is found.
+		 */
+		op->d.hashedscalararrayop.has_nulls = has_nulls;
+	}
+
+	/* Check the hash to see if we have a match. */
+	hashfound = NULL != saophash_lookup(elements_tab->hashtab, scalar);
+
+	/* the result depends on if the clause is an IN or NOT IN clause */
+	if (inclause)
+		result = BoolGetDatum(hashfound);	/* IN */
+	else
+		result = BoolGetDatum(!hashfound);	/* NOT IN */
+
+	resultnull = false;
+
+	/*
+	 * If we didn't find a match in the array, we still might need to handle
+	 * the possibility of null values.  We didn't put any NULLs into the
+	 * hashtable, but instead marked if we found any when building the table
+	 * in has_nulls.
+	 */
+	if (!hashfound && op->d.hashedscalararrayop.has_nulls)
+	{
+		if (strictfunc)
+		{
+
+			/*
+			 * We have nulls in the array so a non-null lhs and no match must
+			 * yield NULL.
+			 */
+			result = (Datum) 0;
+			resultnull = true;
+		}
+		else
+		{
+			/*
+			 * Execute function will null rhs just once.
+			 *
+			 * The hash lookup path will have scribbled on the lhs argument so
+			 * we need to set it up also (even though we entered this function
+			 * with it already set).
+			 */
+			fcinfo->args[0].value = scalar;
+			fcinfo->args[0].isnull = scalar_isnull;
+			fcinfo->args[1].value = (Datum) 0;
+			fcinfo->args[1].isnull = true;
+
+			result = op->d.hashedscalararrayop.finfo->fn_addr(fcinfo);
+			resultnull = fcinfo->isnull;
+
+			/*
+			 * Reverse the result for NOT IN clauses since the above function
+			 * is the equality function and we need not-equals.
+			 */
+			if (!inclause)
+				result = !result;
+		}
+	}
+
+	*op->resvalue = result;
+	*op->resnull = resultnull;
+}
+
+/*
  * Evaluate a NOT NULL domain constraint.
  */
 void
 ExecEvalConstraintNotNull(ExprState *state, ExprEvalStep *op)
 {
 	if (*op->resnull)
-		ereport(ERROR,
+		errsave((Node *) op->d.domaincheck.escontext,
 				(errcode(ERRCODE_NOT_NULL_VIOLATION),
 				 errmsg("domain %s does not allow null values",
 						format_type_be(op->d.domaincheck.resulttype)),
@@ -3598,7 +3855,7 @@ ExecEvalConstraintCheck(ExprState *state, ExprEvalStep *op)
 {
 	if (!*op->d.domaincheck.checknull &&
 		!DatumGetBool(*op->d.domaincheck.checkvalue))
-		ereport(ERROR,
+		errsave((Node *) op->d.domaincheck.escontext,
 				(errcode(ERRCODE_CHECK_VIOLATION),
 				 errmsg("value for domain %s violates check constraint \"%s\"",
 						format_type_be(op->d.domaincheck.resulttype),
@@ -3793,8 +4050,10 @@ ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op)
 					return;
 				value = argvalue[0];
 
-				*op->resvalue = PointerGetDatum(xmltotext_with_xmloption(DatumGetXmlP(value),
-																		 xexpr->xmloption));
+				*op->resvalue =
+					PointerGetDatum(xmltotext_with_options(DatumGetXmlP(value),
+														   xexpr->xmloption,
+														   xexpr->indent));
 				*op->resnull = false;
 			}
 			break;
@@ -3820,6 +4079,483 @@ ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op)
 		default:
 			elog(ERROR, "unrecognized XML operation");
 			break;
+	}
+}
+
+/*
+ * Evaluate a JSON constructor expression.
+ */
+void
+ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
+						ExprContext *econtext)
+{
+	Datum		res;
+	JsonConstructorExprState *jcstate = op->d.json_constructor.jcstate;
+	JsonConstructorExpr *ctor = jcstate->constructor;
+	bool		is_jsonb = ctor->returning->format->format_type == JS_FORMAT_JSONB;
+	bool		isnull = false;
+
+	if (ctor->type == JSCTOR_JSON_ARRAY)
+		res = (is_jsonb ?
+			   jsonb_build_array_worker :
+			   json_build_array_worker) (jcstate->nargs,
+										 jcstate->arg_values,
+										 jcstate->arg_nulls,
+										 jcstate->arg_types,
+										 jcstate->constructor->absent_on_null);
+	else if (ctor->type == JSCTOR_JSON_OBJECT)
+		res = (is_jsonb ?
+			   jsonb_build_object_worker :
+			   json_build_object_worker) (jcstate->nargs,
+										  jcstate->arg_values,
+										  jcstate->arg_nulls,
+										  jcstate->arg_types,
+										  jcstate->constructor->absent_on_null,
+										  jcstate->constructor->unique);
+	else if (ctor->type == JSCTOR_JSON_SCALAR)
+	{
+		if (jcstate->arg_nulls[0])
+		{
+			res = (Datum) 0;
+			isnull = true;
+		}
+		else
+		{
+			Datum		value = jcstate->arg_values[0];
+			Oid			outfuncid = jcstate->arg_type_cache[0].outfuncid;
+			JsonTypeCategory category = (JsonTypeCategory)
+				jcstate->arg_type_cache[0].category;
+
+			if (is_jsonb)
+				res = datum_to_jsonb(value, category, outfuncid);
+			else
+				res = datum_to_json(value, category, outfuncid);
+		}
+	}
+	else if (ctor->type == JSCTOR_JSON_PARSE)
+	{
+		if (jcstate->arg_nulls[0])
+		{
+			res = (Datum) 0;
+			isnull = true;
+		}
+		else
+		{
+			Datum		value = jcstate->arg_values[0];
+			text	   *js = DatumGetTextP(value);
+
+			if (is_jsonb)
+				res = jsonb_from_text(js, true);
+			else
+			{
+				(void) json_validate(js, true, true);
+				res = value;
+			}
+		}
+	}
+	else
+		elog(ERROR, "invalid JsonConstructorExpr type %d", ctor->type);
+
+	*op->resvalue = res;
+	*op->resnull = isnull;
+}
+
+/*
+ * Evaluate a IS JSON predicate.
+ */
+void
+ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op)
+{
+	JsonIsPredicate *pred = op->d.is_json.pred;
+	Datum		js = *op->resvalue;
+	Oid			exprtype;
+	bool		res;
+
+	if (*op->resnull)
+	{
+		*op->resvalue = BoolGetDatum(false);
+		return;
+	}
+
+	exprtype = exprType(pred->expr);
+
+	if (exprtype == TEXTOID || exprtype == JSONOID)
+	{
+		text	   *json = DatumGetTextP(js);
+
+		if (pred->item_type == JS_TYPE_ANY)
+			res = true;
+		else
+		{
+			switch (json_get_first_token(json, false))
+			{
+				case JSON_TOKEN_OBJECT_START:
+					res = pred->item_type == JS_TYPE_OBJECT;
+					break;
+				case JSON_TOKEN_ARRAY_START:
+					res = pred->item_type == JS_TYPE_ARRAY;
+					break;
+				case JSON_TOKEN_STRING:
+				case JSON_TOKEN_NUMBER:
+				case JSON_TOKEN_TRUE:
+				case JSON_TOKEN_FALSE:
+				case JSON_TOKEN_NULL:
+					res = pred->item_type == JS_TYPE_SCALAR;
+					break;
+				default:
+					res = false;
+					break;
+			}
+		}
+
+		/*
+		 * Do full parsing pass only for uniqueness check or for JSON text
+		 * validation.
+		 */
+		if (res && (pred->unique_keys || exprtype == TEXTOID))
+			res = json_validate(json, pred->unique_keys, false);
+	}
+	else if (exprtype == JSONBOID)
+	{
+		if (pred->item_type == JS_TYPE_ANY)
+			res = true;
+		else
+		{
+			Jsonb	   *jb = DatumGetJsonbP(js);
+
+			switch (pred->item_type)
+			{
+				case JS_TYPE_OBJECT:
+					res = JB_ROOT_IS_OBJECT(jb);
+					break;
+				case JS_TYPE_ARRAY:
+					res = JB_ROOT_IS_ARRAY(jb) && !JB_ROOT_IS_SCALAR(jb);
+					break;
+				case JS_TYPE_SCALAR:
+					res = JB_ROOT_IS_ARRAY(jb) && JB_ROOT_IS_SCALAR(jb);
+					break;
+				default:
+					res = false;
+					break;
+			}
+		}
+
+		/* Key uniqueness check is redundant for jsonb */
+	}
+	else
+		res = false;
+
+	*op->resvalue = BoolGetDatum(res);
+}
+
+/*
+ * Evaluate a jsonpath against a document, both of which must have been
+ * evaluated and their values saved in op->d.jsonexpr.jsestate.
+ *
+ * If an error occurs during JsonPath* evaluation or when coercing its result
+ * to the RETURNING type, JsonExprState.error is set to true, provided the
+ * ON ERROR behavior is not ERROR.  Similarly, if JsonPath{Query|Value}() found
+ * no matching items, JsonExprState.empty is set to true, provided the ON EMPTY
+ * behavior is not ERROR.  That is to signal to the subsequent steps that check
+ * those flags to return the ON ERROR / ON EMPTY expression.
+ *
+ * Return value is the step address to be performed next.  It will be one of
+ * jump_error, jump_empty, jump_eval_coercion, or jump_end, all given in
+ * op->d.jsonexpr.jsestate.
+ */
+int
+ExecEvalJsonExprPath(ExprState *state, ExprEvalStep *op,
+					 ExprContext *econtext)
+{
+	JsonExprState *jsestate = op->d.jsonexpr.jsestate;
+	JsonExpr   *jsexpr = jsestate->jsexpr;
+	Datum		item;
+	JsonPath   *path;
+	bool		throw_error = jsexpr->on_error->btype == JSON_BEHAVIOR_ERROR;
+	bool		error = false,
+				empty = false;
+	int			jump_eval_coercion = jsestate->jump_eval_coercion;
+	char	   *val_string = NULL;
+
+	item = jsestate->formatted_expr.value;
+	path = DatumGetJsonPathP(jsestate->pathspec.value);
+
+	/* Set error/empty to false. */
+	memset(&jsestate->error, 0, sizeof(NullableDatum));
+	memset(&jsestate->empty, 0, sizeof(NullableDatum));
+
+	/*
+	 * Also reset ErrorSaveContext contents for the next row.  Since we don't
+	 * set details_wanted, we don't need to also reset error_data, which would
+	 * be NULL anyway.
+	 */
+	Assert(!jsestate->escontext.details_wanted &&
+		   jsestate->escontext.error_data == NULL);
+	jsestate->escontext.error_occurred = false;
+
+	switch (jsexpr->op)
+	{
+		case JSON_EXISTS_OP:
+			{
+				bool		exists = JsonPathExists(item, path,
+													!throw_error ? &error : NULL,
+													jsestate->args);
+
+				if (!error)
+				{
+					*op->resvalue = BoolGetDatum(exists);
+					*op->resnull = false;
+				}
+			}
+			break;
+
+		case JSON_QUERY_OP:
+			*op->resvalue = JsonPathQuery(item, path, jsexpr->wrapper, &empty,
+										  !throw_error ? &error : NULL,
+										  jsestate->args);
+
+			*op->resnull = (DatumGetPointer(*op->resvalue) == NULL);
+
+			/* Handle OMIT QUOTES. */
+			if (!*op->resnull && jsexpr->omit_quotes)
+			{
+				val_string = JsonbUnquote(DatumGetJsonbP(*op->resvalue));
+
+				/*
+				 * Pass the string as a text value to the cast expression if
+				 * one present.  If not, use the input function call below to
+				 * do the coercion.
+				 */
+				if (jump_eval_coercion >= 0)
+					*op->resvalue =
+						DirectFunctionCall1(textin,
+											PointerGetDatum(val_string));
+			}
+			break;
+
+		case JSON_VALUE_OP:
+			{
+				JsonbValue *jbv = JsonPathValue(item, path, &empty,
+												!throw_error ? &error : NULL,
+												jsestate->args);
+
+				if (jbv == NULL)
+				{
+					/* Will be coerced with coercion_expr, if any. */
+					*op->resvalue = (Datum) 0;
+					*op->resnull = true;
+				}
+				else if (!error && !empty)
+				{
+					if (jsexpr->returning->typid == JSONOID ||
+						jsexpr->returning->typid == JSONBOID)
+					{
+						val_string = DatumGetCString(DirectFunctionCall1(jsonb_out,
+																		 JsonbPGetDatum(JsonbValueToJsonb(jbv))));
+					}
+					else
+					{
+						val_string = ExecGetJsonValueItemString(jbv, op->resnull);
+
+						/*
+						 * Pass the string as a text value to the cast
+						 * expression if one present.  If not, use the input
+						 * function call below to do the coercion.
+						 */
+						*op->resvalue = PointerGetDatum(val_string);
+						if (jump_eval_coercion >= 0)
+							*op->resvalue = DirectFunctionCall1(textin, *op->resvalue);
+					}
+				}
+				break;
+			}
+
+		default:
+			elog(ERROR, "unrecognized SQL/JSON expression op %d",
+				 (int) jsexpr->op);
+			return false;
+	}
+
+	/*
+	 * Coerce the result value to the RETURNING type by calling its input
+	 * function.
+	 */
+	if (!*op->resnull && jsexpr->use_io_coercion)
+	{
+		FunctionCallInfo fcinfo;
+
+		Assert(jump_eval_coercion == -1);
+		fcinfo = jsestate->input_fcinfo;
+		Assert(fcinfo != NULL);
+		Assert(val_string != NULL);
+		fcinfo->args[0].value = PointerGetDatum(val_string);
+		fcinfo->args[0].isnull = *op->resnull;
+
+		/*
+		 * Second and third arguments are already set up in
+		 * ExecInitJsonExpr().
+		 */
+
+		fcinfo->isnull = false;
+		*op->resvalue = FunctionCallInvoke(fcinfo);
+		if (SOFT_ERROR_OCCURRED(&jsestate->escontext))
+			error = true;
+	}
+
+	/* Handle ON EMPTY. */
+	if (empty)
+	{
+		if (jsexpr->on_empty)
+		{
+			if (jsexpr->on_empty->btype == JSON_BEHAVIOR_ERROR)
+				ereport(ERROR,
+						errcode(ERRCODE_NO_SQL_JSON_ITEM),
+						errmsg("no SQL/JSON item"));
+			else
+				jsestate->empty.value = BoolGetDatum(true);
+
+			Assert(jsestate->jump_empty >= 0);
+			return jsestate->jump_empty;
+		}
+		else if (jsexpr->on_error->btype == JSON_BEHAVIOR_ERROR)
+			ereport(ERROR,
+					errcode(ERRCODE_NO_SQL_JSON_ITEM),
+					errmsg("no SQL/JSON item"));
+		else
+			jsestate->error.value = BoolGetDatum(true);
+
+		*op->resvalue = (Datum) 0;
+		*op->resnull = true;
+
+		Assert(!throw_error && jsestate->jump_error >= 0);
+		return jsestate->jump_error;
+	}
+
+	/*
+	 * ON ERROR. Wouldn't get here if the behavior is ERROR, because they
+	 * would have already been thrown.
+	 */
+	if (error)
+	{
+		Assert(!throw_error && jsestate->jump_error >= 0);
+		*op->resvalue = (Datum) 0;
+		*op->resnull = true;
+		jsestate->error.value = BoolGetDatum(true);
+		return jsestate->jump_error;
+	}
+
+	return jump_eval_coercion >= 0 ? jump_eval_coercion : jsestate->jump_end;
+}
+
+/*
+ * Convert the given JsonbValue to its C string representation
+ *
+ * *resnull is set if the JsonbValue is a jbvNull.
+ */
+static char *
+ExecGetJsonValueItemString(JsonbValue *item, bool *resnull)
+{
+	*resnull = false;
+
+	/* get coercion state reference and datum of the corresponding SQL type */
+	switch (item->type)
+	{
+		case jbvNull:
+			*resnull = true;
+			return NULL;
+
+		case jbvString:
+			{
+				char	   *str = palloc(item->val.string.len + 1);
+
+				memcpy(str, item->val.string.val, item->val.string.len);
+				str[item->val.string.len] = '\0';
+				return str;
+			}
+
+		case jbvNumeric:
+			return DatumGetCString(DirectFunctionCall1(numeric_out,
+													   NumericGetDatum(item->val.numeric)));
+
+		case jbvBool:
+			return DatumGetCString(DirectFunctionCall1(boolout,
+													   BoolGetDatum(item->val.boolean)));
+
+		case jbvDatetime:
+			switch (item->val.datetime.typid)
+			{
+				case DATEOID:
+					return DatumGetCString(DirectFunctionCall1(date_out,
+															   item->val.datetime.value));
+				case TIMEOID:
+					return DatumGetCString(DirectFunctionCall1(time_out,
+															   item->val.datetime.value));
+				case TIMETZOID:
+					return DatumGetCString(DirectFunctionCall1(timetz_out,
+															   item->val.datetime.value));
+				case TIMESTAMPOID:
+					return DatumGetCString(DirectFunctionCall1(timestamp_out,
+															   item->val.datetime.value));
+				case TIMESTAMPTZOID:
+					return DatumGetCString(DirectFunctionCall1(timestamptz_out,
+															   item->val.datetime.value));
+				default:
+					elog(ERROR, "unexpected jsonb datetime type oid %u",
+						 item->val.datetime.typid);
+			}
+			break;
+
+		case jbvArray:
+		case jbvObject:
+		case jbvBinary:
+			return DatumGetCString(DirectFunctionCall1(jsonb_out,
+													   JsonbPGetDatum(JsonbValueToJsonb(item))));
+
+		default:
+			elog(ERROR, "unexpected jsonb value type %d", item->type);
+	}
+
+	Assert(false);
+	*resnull = true;
+	return NULL;
+}
+
+/*
+ * Coerce a jsonb value produced by ExecEvalJsonExprPath() or an ON ERROR /
+ * ON EMPTY behavior expression to the target type.
+ *
+ * Any soft errors that occur here will be checked by
+ * EEOP_JSONEXPR_COERCION_FINISH that will run after this.
+ */
+void
+ExecEvalJsonCoercion(ExprState *state, ExprEvalStep *op,
+					 ExprContext *econtext)
+{
+	ErrorSaveContext *escontext = op->d.jsonexpr_coercion.escontext;
+
+	*op->resvalue = json_populate_type(*op->resvalue, JSONBOID,
+									   op->d.jsonexpr_coercion.targettype,
+									   op->d.jsonexpr_coercion.targettypmod,
+									   &op->d.jsonexpr_coercion.json_populate_type_cache,
+									   econtext->ecxt_per_query_memory,
+									   op->resnull, (Node *) escontext);
+}
+
+/*
+ * Checks if an error occurred either when evaluating JsonExpr.coercion_expr or
+ * in ExecEvalJsonCoercion().  If so, this sets JsonExprState.error to trigger
+ * the ON ERROR handling steps.
+ */
+void
+ExecEvalJsonCoercionFinish(ExprState *state, ExprEvalStep *op)
+{
+	JsonExprState *jsestate = op->d.jsonexpr.jsestate;
+
+	if (SOFT_ERROR_OCCURRED(&jsestate->escontext))
+	{
+		*op->resvalue = (Datum) 0;
+		*op->resnull = true;
+		jsestate->error.value = BoolGetDatum(true);
 	}
 }
 
@@ -3855,6 +4591,45 @@ ExecEvalGroupingFunc(ExprState *state, ExprEvalStep *op)
 }
 
 /*
+ * ExecEvalMergeSupportFunc
+ *
+ * Returns information about the current MERGE action for its RETURNING list.
+ */
+void
+ExecEvalMergeSupportFunc(ExprState *state, ExprEvalStep *op,
+						 ExprContext *econtext)
+{
+	ModifyTableState *mtstate = castNode(ModifyTableState, state->parent);
+	MergeActionState *relaction = mtstate->mt_merge_action;
+
+	if (!relaction)
+		elog(ERROR, "no merge action in progress");
+
+	/* Return the MERGE action ("INSERT", "UPDATE", or "DELETE") */
+	switch (relaction->mas_action->commandType)
+	{
+		case CMD_INSERT:
+			*op->resvalue = PointerGetDatum(cstring_to_text_with_len("INSERT", 6));
+			*op->resnull = false;
+			break;
+		case CMD_UPDATE:
+			*op->resvalue = PointerGetDatum(cstring_to_text_with_len("UPDATE", 6));
+			*op->resnull = false;
+			break;
+		case CMD_DELETE:
+			*op->resvalue = PointerGetDatum(cstring_to_text_with_len("DELETE", 6));
+			*op->resnull = false;
+			break;
+		case CMD_NOTHING:
+			elog(ERROR, "unexpected merge action: DO NOTHING");
+			break;
+		default:
+			elog(ERROR, "unrecognized commandType: %d",
+				 (int) relaction->mas_action->commandType);
+	}
+}
+
+/*
  * Hand off evaluation of a subplan to nodeSubplan.c
  */
 void
@@ -3866,20 +4641,6 @@ ExecEvalSubPlan(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 	check_stack_depth();
 
 	*op->resvalue = ExecSubPlan(sstate, econtext, op->resnull);
-}
-
-/*
- * Hand off evaluation of an alternative subplan to nodeSubplan.c
- */
-void
-ExecEvalAlternativeSubPlan(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
-{
-	AlternativeSubPlanState *asstate = op->d.alternative_subplan.asstate;
-
-	/* could potentially be nested, so make sure there's enough stack */
-	check_stack_depth();
-
-	*op->resvalue = ExecAlternativeSubPlan(asstate, econtext, op->resnull);
 }
 
 /*
@@ -4000,9 +4761,8 @@ ExecEvalWholeRowVar(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 
 			/*
 			 * Use the variable's declared rowtype as the descriptor for the
-			 * output values, modulo possibly assigning new column names
-			 * below. In particular, we *must* absorb any attisdropped
-			 * markings.
+			 * output values.  In particular, we *must* absorb any
+			 * attisdropped markings.
 			 */
 			oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
 			output_tupdesc = CreateTupleDescCopy(var_tupdesc);
@@ -4020,39 +4780,38 @@ ExecEvalWholeRowVar(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 			oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
 			output_tupdesc = CreateTupleDescCopy(slot->tts_tupleDescriptor);
 			MemoryContextSwitchTo(oldcontext);
-		}
 
-		/*
-		 * Construct a tuple descriptor for the composite values we'll
-		 * produce, and make sure its record type is "blessed".  The main
-		 * reason to do this is to be sure that operations such as
-		 * row_to_json() will see the desired column names when they look up
-		 * the descriptor from the type information embedded in the composite
-		 * values.
-		 *
-		 * We already got the correct physical datatype info above, but now we
-		 * should try to find the source RTE and adopt its column aliases, in
-		 * case they are different from the original rowtype's names.  For
-		 * example, in "SELECT foo(t) FROM tab t(x,y)", the first two columns
-		 * in the composite output should be named "x" and "y" regardless of
-		 * tab's column names.
-		 *
-		 * If we can't locate the RTE, assume the column names we've got are
-		 * OK.  (As of this writing, the only cases where we can't locate the
-		 * RTE are in execution of trigger WHEN clauses, and then the Var will
-		 * have the trigger's relation's rowtype, so its names are fine.)
-		 * Also, if the creator of the RTE didn't bother to fill in an eref
-		 * field, assume our column names are OK.  (This happens in COPY, and
-		 * perhaps other places.)
-		 */
-		if (econtext->ecxt_estate &&
-			variable->varno <= econtext->ecxt_estate->es_range_table_size)
-		{
-			RangeTblEntry *rte = exec_rt_fetch(variable->varno,
-											   econtext->ecxt_estate);
+			/*
+			 * It's possible that the input slot is a relation scan slot and
+			 * so is marked with that relation's rowtype.  But we're supposed
+			 * to be returning RECORD, so reset to that.
+			 */
+			output_tupdesc->tdtypeid = RECORDOID;
+			output_tupdesc->tdtypmod = -1;
 
-			if (rte->eref)
-				ExecTypeSetColNames(output_tupdesc, rte->eref->colnames);
+			/*
+			 * We already got the correct physical datatype info above, but
+			 * now we should try to find the source RTE and adopt its column
+			 * aliases, since it's unlikely that the input slot has the
+			 * desired names.
+			 *
+			 * If we can't locate the RTE, assume the column names we've got
+			 * are OK.  (As of this writing, the only cases where we can't
+			 * locate the RTE are in execution of trigger WHEN clauses, and
+			 * then the Var will have the trigger's relation's rowtype, so its
+			 * names are fine.)  Also, if the creator of the RTE didn't bother
+			 * to fill in an eref field, assume our column names are OK. (This
+			 * happens in COPY, and perhaps other places.)
+			 */
+			if (econtext->ecxt_estate &&
+				variable->varno <= econtext->ecxt_estate->es_range_table_size)
+			{
+				RangeTblEntry *rte = exec_rt_fetch(variable->varno,
+												   econtext->ecxt_estate);
+
+				if (rte->eref)
+					ExecTypeSetColNames(output_tupdesc, rte->eref->colnames);
+			}
 		}
 
 		/* Bless the tupdesc if needed, and save it in the execution state */
@@ -4160,15 +4919,40 @@ ExecAggInitGroup(AggState *aggstate, AggStatePerTrans pertrans, AggStatePerGroup
 }
 
 /*
- * Ensure that the current transition value is a child of the aggcontext,
- * rather than the per-tuple context.
+ * Ensure that the new transition value is stored in the aggcontext,
+ * rather than the per-tuple context.  This should be invoked only when
+ * we know (a) the transition data type is pass-by-reference, and (b)
+ * the newValue is distinct from the oldValue.
  *
  * NB: This can change the current memory context.
+ *
+ * We copy the presented newValue into the aggcontext, except when the datum
+ * points to a R/W expanded object that is already a child of the aggcontext,
+ * in which case we need not copy.  We then delete the oldValue, if not null.
+ *
+ * If the presented datum points to a R/W expanded object that is a child of
+ * some other context, ideally we would just reparent it under the aggcontext.
+ * Unfortunately, that doesn't work easily, and it wouldn't help anyway for
+ * aggregate-aware transfns.  We expect that a transfn that deals in expanded
+ * objects and is aware of the memory management conventions for aggregate
+ * transition values will (1) on first call, return a R/W expanded object that
+ * is already in the right context, allowing us to do nothing here, and (2) on
+ * subsequent calls, modify and return that same object, so that control
+ * doesn't even reach here.  However, if we have a generic transfn that
+ * returns a new R/W expanded object (probably in the per-tuple context),
+ * reparenting that result would cause problems.  We'd pass that R/W object to
+ * the next invocation of the transfn, and then it would be at liberty to
+ * change or delete that object, and if it deletes it then our own attempt to
+ * delete the now-old transvalue afterwards would be a double free.  We avoid
+ * this problem by forcing the stored transvalue to always be a flat
+ * non-expanded object unless the transfn is visibly doing aggregate-aware
+ * memory management.  This is somewhat inefficient, but the best answer to
+ * that is to write a smarter transfn.
  */
 Datum
-ExecAggTransReparent(AggState *aggstate, AggStatePerTrans pertrans,
-					 Datum newValue, bool newValueIsNull,
-					 Datum oldValue, bool oldValueIsNull)
+ExecAggCopyTransValue(AggState *aggstate, AggStatePerTrans pertrans,
+					  Datum newValue, bool newValueIsNull,
+					  Datum oldValue, bool oldValueIsNull)
 {
 	Assert(newValue != oldValue);
 
@@ -4206,6 +4990,99 @@ ExecAggTransReparent(AggState *aggstate, AggStatePerTrans pertrans,
 	}
 
 	return newValue;
+}
+
+/*
+ * ExecEvalPreOrderedDistinctSingle
+ *		Returns true when the aggregate transition value Datum is distinct
+ *		from the previous input Datum and returns false when the input Datum
+ *		matches the previous input Datum.
+ */
+bool
+ExecEvalPreOrderedDistinctSingle(AggState *aggstate, AggStatePerTrans pertrans)
+{
+	Datum		value = pertrans->transfn_fcinfo->args[1].value;
+	bool		isnull = pertrans->transfn_fcinfo->args[1].isnull;
+
+	if (!pertrans->haslast ||
+		pertrans->lastisnull != isnull ||
+		(!isnull && !DatumGetBool(FunctionCall2Coll(&pertrans->equalfnOne,
+													pertrans->aggCollation,
+													pertrans->lastdatum, value))))
+	{
+		if (pertrans->haslast && !pertrans->inputtypeByVal &&
+			!pertrans->lastisnull)
+			pfree(DatumGetPointer(pertrans->lastdatum));
+
+		pertrans->haslast = true;
+		if (!isnull)
+		{
+			MemoryContext oldContext;
+
+			oldContext = MemoryContextSwitchTo(aggstate->curaggcontext->ecxt_per_tuple_memory);
+
+			pertrans->lastdatum = datumCopy(value, pertrans->inputtypeByVal,
+											pertrans->inputtypeLen);
+
+			MemoryContextSwitchTo(oldContext);
+		}
+		else
+			pertrans->lastdatum = (Datum) 0;
+		pertrans->lastisnull = isnull;
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * ExecEvalPreOrderedDistinctMulti
+ *		Returns true when the aggregate input is distinct from the previous
+ *		input and returns false when the input matches the previous input, or
+ *		when there was no previous input.
+ */
+bool
+ExecEvalPreOrderedDistinctMulti(AggState *aggstate, AggStatePerTrans pertrans)
+{
+	ExprContext *tmpcontext = aggstate->tmpcontext;
+	bool		isdistinct = false; /* for now */
+	TupleTableSlot *save_outer;
+	TupleTableSlot *save_inner;
+
+	for (int i = 0; i < pertrans->numTransInputs; i++)
+	{
+		pertrans->sortslot->tts_values[i] = pertrans->transfn_fcinfo->args[i + 1].value;
+		pertrans->sortslot->tts_isnull[i] = pertrans->transfn_fcinfo->args[i + 1].isnull;
+	}
+
+	ExecClearTuple(pertrans->sortslot);
+	pertrans->sortslot->tts_nvalid = pertrans->numInputs;
+	ExecStoreVirtualTuple(pertrans->sortslot);
+
+	/* save the previous slots before we overwrite them */
+	save_outer = tmpcontext->ecxt_outertuple;
+	save_inner = tmpcontext->ecxt_innertuple;
+
+	tmpcontext->ecxt_outertuple = pertrans->sortslot;
+	tmpcontext->ecxt_innertuple = pertrans->uniqslot;
+
+	if (!pertrans->haslast ||
+		!ExecQual(pertrans->equalfnMulti, tmpcontext))
+	{
+		if (pertrans->haslast)
+			ExecClearTuple(pertrans->uniqslot);
+
+		pertrans->haslast = true;
+		ExecCopySlot(pertrans->uniqslot, pertrans->sortslot);
+
+		isdistinct = true;
+	}
+
+	/* restore the original slots */
+	tmpcontext->ecxt_outertuple = save_outer;
+	tmpcontext->ecxt_innertuple = save_inner;
+
+	return isdistinct;
 }
 
 /*
@@ -4299,12 +5176,10 @@ ExecAggPlainTransByRef(AggState *aggstate, AggStatePerTrans pertrans,
 	/*
 	 * For pass-by-ref datatype, must copy the new value into aggcontext and
 	 * free the prior transValue.  But if transfn returned a pointer to its
-	 * first input, we don't need to do anything.  Also, if transfn returned a
-	 * pointer to a R/W expanded object that is already a child of the
-	 * aggcontext, assume we can adopt that value without copying it.
+	 * first input, we don't need to do anything.
 	 *
 	 * It's safe to compare newVal with pergroup->transValue without regard
-	 * for either being NULL, because ExecAggTransReparent() takes care to set
+	 * for either being NULL, because ExecAggCopyTransValue takes care to set
 	 * transValue to 0 when NULL. Otherwise we could end up accidentally not
 	 * reparenting, when the transValue has the same numerical value as
 	 * newValue, despite being NULL.  This is a somewhat hot path, making it
@@ -4313,10 +5188,10 @@ ExecAggPlainTransByRef(AggState *aggstate, AggStatePerTrans pertrans,
 	 * argument.
 	 */
 	if (DatumGetPointer(newVal) != DatumGetPointer(pergroup->transValue))
-		newVal = ExecAggTransReparent(aggstate, pertrans,
-									  newVal, fcinfo->isnull,
-									  pergroup->transValue,
-									  pergroup->transValueIsNull);
+		newVal = ExecAggCopyTransValue(aggstate, pertrans,
+									   newVal, fcinfo->isnull,
+									   pergroup->transValue,
+									   pergroup->transValueIsNull);
 
 	pergroup->transValue = newVal;
 	pergroup->transValueIsNull = fcinfo->isnull;

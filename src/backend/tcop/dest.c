@@ -4,7 +4,7 @@
  *	  support for communication destinations
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -39,7 +39,6 @@
 #include "executor/tstoreReceiver.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
-#include "utils/portal.h"
 
 
 /* ----------------
@@ -166,8 +165,7 @@ void
 EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_output)
 {
 	char		completionTag[COMPLETION_TAG_BUFSIZE];
-	CommandTag	tag;
-	const char *tagname;
+	Size		len;
 
 	switch (dest)
 	{
@@ -175,28 +173,9 @@ EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_o
 		case DestRemoteExecute:
 		case DestRemoteSimple:
 
-			/*
-			 * We assume the tagname is plain ASCII and therefore requires no
-			 * encoding conversion.
-			 *
-			 * We no longer display LastOid, but to preserve the wire
-			 * protocol, we write InvalidOid where the LastOid used to be
-			 * written.
-			 *
-			 * All cases where LastOid was written also write nprocessed
-			 * count, so just Assert that rather than having an extra test.
-			 */
-			tag = qc->commandTag;
-			tagname = GetCommandTagName(tag);
-
-			if (command_tag_display_rowcount(tag) && !force_undecorated_output)
-				snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
-						 tag == CMDTAG_INSERT ?
-						 "%s 0 " UINT64_FORMAT : "%s " UINT64_FORMAT,
-						 tagname, qc->nprocessed);
-			else
-				snprintf(completionTag, COMPLETION_TAG_BUFSIZE, "%s", tagname);
-			pq_putmessage('C', completionTag, strlen(completionTag) + 1);
+			len = BuildQueryCompletionString(completionTag, qc,
+											 force_undecorated_output);
+			pq_putmessage(PqMsg_CommandComplete, completionTag, len + 1);
 
 		case DestNone:
 		case DestDebug:
@@ -212,15 +191,22 @@ EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_o
 }
 
 /* ----------------
+ *		EndReplicationCommand - stripped down version of EndCommand
+ *
+ *		For use by replication commands.
+ * ----------------
+ */
+void
+EndReplicationCommand(const char *commandTag)
+{
+	pq_putmessage(PqMsg_CommandComplete, commandTag, strlen(commandTag) + 1);
+}
+
+/* ----------------
  *		NullCommand - tell dest that an empty query string was recognized
  *
- *		In FE/BE protocol version 1.0, this hack is necessary to support
- *		libpq's crufty way of determining whether a multiple-command
- *		query string is done.  In protocol 2.0 it's probably not really
- *		necessary to distinguish empty queries anymore, but we still do it
- *		for backwards compatibility with 1.0.  In protocol 3.0 it has some
- *		use again, since it ensures that there will be a recognizable end
- *		to the response to an Execute message.
+ *		This ensures that there will be a recognizable end to the response
+ *		to an Execute message in the extended query protocol.
  * ----------------
  */
 void
@@ -232,14 +218,8 @@ NullCommand(CommandDest dest)
 		case DestRemoteExecute:
 		case DestRemoteSimple:
 
-			/*
-			 * tell the fe that we saw an empty query string.  In protocols
-			 * before 3.0 this has a useless empty-string message body.
-			 */
-			if (PG_PROTOCOL_MAJOR(FrontendProtocol) >= 3)
-				pq_putemptymessage('I');
-			else
-				pq_putmessage('I', "", 1);
+			/* Tell the FE that we saw an empty query string */
+			pq_putemptymessage(PqMsg_EmptyQueryResponse);
 			break;
 
 		case DestNone:
@@ -274,16 +254,13 @@ ReadyForQuery(CommandDest dest)
 		case DestRemote:
 		case DestRemoteExecute:
 		case DestRemoteSimple:
-			if (PG_PROTOCOL_MAJOR(FrontendProtocol) >= 3)
 			{
 				StringInfoData buf;
 
-				pq_beginmessage(&buf, 'Z');
+				pq_beginmessage(&buf, PqMsg_ReadyForQuery);
 				pq_sendbyte(&buf, TransactionBlockStatusCode());
 				pq_endmessage(&buf);
 			}
-			else
-				pq_putemptymessage('Z');
 			/* Flush output at end of cycle in any case. */
 			pq_flush();
 			break;

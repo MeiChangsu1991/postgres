@@ -4,7 +4,7 @@
  *		Support routines for manipulating partition information cached in
  *		relcache
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,7 +19,6 @@
 #include "access/nbtree.h"
 #include "access/relation.h"
 #include "catalog/partition.h"
-#include "catalog/pg_inherits.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_partitioned_table.h"
 #include "miscadmin.h"
@@ -27,9 +26,7 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "partitioning/partbounds.h"
-#include "rewrite/rewriteHandler.h"
 #include "utils/builtins.h"
-#include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/partcache.h"
@@ -115,6 +112,12 @@ RelationBuildPartitionKey(Relation relation)
 	key->strategy = form->partstrat;
 	key->partnatts = form->partnatts;
 
+	/* Validate partition strategy code */
+	if (key->strategy != PARTITION_STRATEGY_LIST &&
+		key->strategy != PARTITION_STRATEGY_RANGE &&
+		key->strategy != PARTITION_STRATEGY_HASH)
+		elog(ERROR, "invalid partition strategy \"%c\"", key->strategy);
+
 	/*
 	 * We can rely on the first variable-length attribute being mapped to the
 	 * relevant field of the catalog's C struct, because all previous
@@ -124,15 +127,13 @@ RelationBuildPartitionKey(Relation relation)
 
 	/* But use the hard way to retrieve further variable-length attributes */
 	/* Operator class */
-	datum = SysCacheGetAttr(PARTRELID, tuple,
-							Anum_pg_partitioned_table_partclass, &isnull);
-	Assert(!isnull);
+	datum = SysCacheGetAttrNotNull(PARTRELID, tuple,
+								   Anum_pg_partitioned_table_partclass);
 	opclass = (oidvector *) DatumGetPointer(datum);
 
 	/* Collation */
-	datum = SysCacheGetAttr(PARTRELID, tuple,
-							Anum_pg_partitioned_table_partcollation, &isnull);
-	Assert(!isnull);
+	datum = SysCacheGetAttrNotNull(PARTRELID, tuple,
+								   Anum_pg_partitioned_table_partcollation);
 	collation = (oidvector *) DatumGetPointer(datum);
 
 	/* Expressions */
@@ -341,6 +342,7 @@ generate_partition_qual(Relation rel)
 	bool		isnull;
 	List	   *my_qual = NIL,
 			   *result = NIL;
+	Oid			parentrelid;
 	Relation	parent;
 
 	/* Guard against stack overflow due to overly deep partition tree */
@@ -350,12 +352,18 @@ generate_partition_qual(Relation rel)
 	if (rel->rd_partcheckvalid)
 		return copyObject(rel->rd_partcheck);
 
-	/* Grab at least an AccessShareLock on the parent table */
-	parent = relation_open(get_partition_parent(RelationGetRelid(rel)),
-						   AccessShareLock);
+	/*
+	 * Grab at least an AccessShareLock on the parent table.  Must do this
+	 * even if the partition has been partially detached, because transactions
+	 * concurrent with the detach might still be trying to use a partition
+	 * descriptor that includes it.
+	 */
+	parentrelid = get_partition_parent(RelationGetRelid(rel), true);
+	parent = relation_open(parentrelid, AccessShareLock);
 
 	/* Get pg_class.relpartbound */
-	tuple = SearchSysCache1(RELOID, RelationGetRelid(rel));
+	tuple = SearchSysCache1(RELOID,
+							ObjectIdGetDatum(RelationGetRelid(rel)));
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for relation %u",
 			 RelationGetRelid(rel));
@@ -370,7 +378,7 @@ generate_partition_qual(Relation rel)
 		bound = castNode(PartitionBoundSpec,
 						 stringToNode(TextDatumGetCString(boundDatum)));
 
-		my_qual = get_qual_from_partbound(rel, parent, bound);
+		my_qual = get_qual_from_partbound(parent, bound);
 	}
 
 	ReleaseSysCache(tuple);

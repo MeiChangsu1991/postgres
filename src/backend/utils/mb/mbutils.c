@@ -23,7 +23,7 @@
  * the result is validly encoded according to the destination encoding.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,9 +37,9 @@
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "mb/pg_wchar.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/memutils.h"
-#include "utils/syscache.h"
+#include "varatt.h"
 
 /*
  * We maintain a simple linked list caching the fmgr lookup info for the
@@ -406,12 +406,13 @@ pg_do_encoding_conversion(unsigned char *src, int len,
 		MemoryContextAllocHuge(CurrentMemoryContext,
 							   (Size) len * MAX_CONVERSION_GROWTH + 1);
 
-	OidFunctionCall5(proc,
-					 Int32GetDatum(src_encoding),
-					 Int32GetDatum(dest_encoding),
-					 CStringGetDatum(src),
-					 CStringGetDatum(result),
-					 Int32GetDatum(len));
+	(void) OidFunctionCall6(proc,
+							Int32GetDatum(src_encoding),
+							Int32GetDatum(dest_encoding),
+							CStringGetDatum((char *) src),
+							CStringGetDatum((char *) result),
+							Int32GetDatum(len),
+							BoolGetDatum(false));
 
 	/*
 	 * If the result is large, it's worth repalloc'ing to release any extra
@@ -433,6 +434,62 @@ pg_do_encoding_conversion(unsigned char *src, int len,
 	}
 
 	return result;
+}
+
+/*
+ * Convert src string to another encoding.
+ *
+ * This function has a different API than the other conversion functions.
+ * The caller should've looked up the conversion function using
+ * FindDefaultConversionProc().  Unlike the other functions, the converted
+ * result is not palloc'd.  It is written to the caller-supplied buffer
+ * instead.
+ *
+ * src_encoding   - encoding to convert from
+ * dest_encoding  - encoding to convert to
+ * src, srclen    - input buffer and its length in bytes
+ * dest, destlen  - destination buffer and its size in bytes
+ *
+ * The output is null-terminated.
+ *
+ * If destlen < srclen * MAX_CONVERSION_INPUT_LENGTH + 1, the converted output
+ * wouldn't necessarily fit in the output buffer, and the function will not
+ * convert the whole input.
+ *
+ * TODO: The conversion function interface is not great.  Firstly, it
+ * would be nice to pass through the destination buffer size to the
+ * conversion function, so that if you pass a shorter destination buffer, it
+ * could still continue to fill up the whole buffer.  Currently, we have to
+ * assume worst case expansion and stop the conversion short, even if there
+ * is in fact space left in the destination buffer.  Secondly, it would be
+ * nice to return the number of bytes written to the caller, to avoid a call
+ * to strlen().
+ */
+int
+pg_do_encoding_conversion_buf(Oid proc,
+							  int src_encoding,
+							  int dest_encoding,
+							  unsigned char *src, int srclen,
+							  unsigned char *dest, int destlen,
+							  bool noError)
+{
+	Datum		result;
+
+	/*
+	 * If the destination buffer is not large enough to hold the result in the
+	 * worst case, limit the input size passed to the conversion function.
+	 */
+	if ((Size) srclen >= ((destlen - 1) / (Size) MAX_CONVERSION_GROWTH))
+		srclen = ((destlen - 1) / (Size) MAX_CONVERSION_GROWTH);
+
+	result = OidFunctionCall6(proc,
+							  Int32GetDatum(src_encoding),
+							  Int32GetDatum(dest_encoding),
+							  CStringGetDatum((char *) src),
+							  CStringGetDatum((char *) dest),
+							  Int32GetDatum(srclen),
+							  BoolGetDatum(noError));
+	return DatumGetInt32(result);
 }
 
 /*
@@ -519,7 +576,7 @@ pg_convert(PG_FUNCTION_ARGS)
 	/* make sure that source string is valid */
 	len = VARSIZE_ANY_EXHDR(string);
 	src_str = VARDATA_ANY(string);
-	pg_verify_mbstr_len(src_encoding, src_str, len, false);
+	(void) pg_verify_mbstr(src_encoding, src_str, len, false);
 
 	/* perform conversion */
 	dest_str = (char *) pg_do_encoding_conversion((unsigned char *) unconstify(char *, src_str),
@@ -527,19 +584,19 @@ pg_convert(PG_FUNCTION_ARGS)
 												  src_encoding,
 												  dest_encoding);
 
-	/* update len if conversion actually happened */
-	if (dest_str != src_str)
-		len = strlen(dest_str);
+
+	/* return source string if no conversion happened */
+	if (dest_str == src_str)
+		PG_RETURN_BYTEA_P(string);
 
 	/*
 	 * build bytea data type structure.
 	 */
+	len = strlen(dest_str);
 	retval = (bytea *) palloc(len + VARHDRSZ);
 	SET_VARSIZE(retval, len + VARHDRSZ);
 	memcpy(VARDATA(retval), dest_str, len);
-
-	if (dest_str != src_str)
-		pfree(dest_str);
+	pfree(dest_str);
 
 	/* free memory if allocated by the toaster */
 	PG_FREE_IF_COPY(string, 0);
@@ -762,12 +819,13 @@ perform_default_encoding_conversion(const char *src, int len,
 		MemoryContextAllocHuge(CurrentMemoryContext,
 							   (Size) len * MAX_CONVERSION_GROWTH + 1);
 
-	FunctionCall5(flinfo,
+	FunctionCall6(flinfo,
 				  Int32GetDatum(src_encoding),
 				  Int32GetDatum(dest_encoding),
 				  CStringGetDatum(src),
 				  CStringGetDatum(result),
-				  Int32GetDatum(len));
+				  Int32GetDatum(len),
+				  BoolGetDatum(false));
 
 	/*
 	 * Release extra space if there might be a lot --- see comments in
@@ -849,12 +907,70 @@ pg_unicode_to_server(pg_wchar c, unsigned char *s)
 	c_as_utf8[c_as_utf8_len] = '\0';
 
 	/* Convert, or throw error if we can't */
-	FunctionCall5(Utf8ToServerConvProc,
+	FunctionCall6(Utf8ToServerConvProc,
 				  Int32GetDatum(PG_UTF8),
 				  Int32GetDatum(server_encoding),
-				  CStringGetDatum(c_as_utf8),
-				  CStringGetDatum(s),
-				  Int32GetDatum(c_as_utf8_len));
+				  CStringGetDatum((char *) c_as_utf8),
+				  CStringGetDatum((char *) s),
+				  Int32GetDatum(c_as_utf8_len),
+				  BoolGetDatum(false));
+}
+
+/*
+ * Convert a single Unicode code point into a string in the server encoding.
+ *
+ * Same as pg_unicode_to_server(), except that we don't throw errors,
+ * but simply return false on conversion failure.
+ */
+bool
+pg_unicode_to_server_noerror(pg_wchar c, unsigned char *s)
+{
+	unsigned char c_as_utf8[MAX_MULTIBYTE_CHAR_LEN + 1];
+	int			c_as_utf8_len;
+	int			converted_len;
+	int			server_encoding;
+
+	/* Fail if invalid Unicode code point */
+	if (!is_valid_unicode_codepoint(c))
+		return false;
+
+	/* Otherwise, if it's in ASCII range, conversion is trivial */
+	if (c <= 0x7F)
+	{
+		s[0] = (unsigned char) c;
+		s[1] = '\0';
+		return true;
+	}
+
+	/* If the server encoding is UTF-8, we just need to reformat the code */
+	server_encoding = GetDatabaseEncoding();
+	if (server_encoding == PG_UTF8)
+	{
+		unicode_to_utf8(c, s);
+		s[pg_utf_mblen(s)] = '\0';
+		return true;
+	}
+
+	/* For all other cases, we must have a conversion function available */
+	if (Utf8ToServerConvProc == NULL)
+		return false;
+
+	/* Construct UTF-8 source string */
+	unicode_to_utf8(c, c_as_utf8);
+	c_as_utf8_len = pg_utf_mblen(c_as_utf8);
+	c_as_utf8[c_as_utf8_len] = '\0';
+
+	/* Convert, but without throwing error if we can't */
+	converted_len = DatumGetInt32(FunctionCall6(Utf8ToServerConvProc,
+												Int32GetDatum(PG_UTF8),
+												Int32GetDatum(server_encoding),
+												CStringGetDatum((char *) c_as_utf8),
+												CStringGetDatum((char *) s),
+												Int32GetDatum(c_as_utf8_len),
+												BoolGetDatum(true)));
+
+	/* Conversion was successful iff it consumed the whole input */
+	return (converted_len == c_as_utf8_len);
 }
 
 
@@ -1071,24 +1187,18 @@ static bool
 raw_pg_bind_textdomain_codeset(const char *domainname, int encoding)
 {
 	bool		elog_ok = (CurrentMemoryContext != NULL);
-	int			i;
 
-	for (i = 0; pg_enc2gettext_tbl[i].name != NULL; i++)
-	{
-		if (pg_enc2gettext_tbl[i].encoding == encoding)
-		{
-			if (bind_textdomain_codeset(domainname,
-										pg_enc2gettext_tbl[i].name) != NULL)
-				return true;
+	if (!PG_VALID_ENCODING(encoding) || pg_enc2gettext_tbl[encoding] == NULL)
+		return false;
 
-			if (elog_ok)
-				elog(LOG, "bind_textdomain_codeset failed");
-			else
-				write_stderr("bind_textdomain_codeset failed");
+	if (bind_textdomain_codeset(domainname,
+								pg_enc2gettext_tbl[encoding]) != NULL)
+		return true;
 
-			break;
-		}
-	}
+	if (elog_ok)
+		elog(LOG, "bind_textdomain_codeset failed");
+	else
+		write_stderr("bind_textdomain_codeset failed");
 
 	return false;
 }
@@ -1215,10 +1325,10 @@ static bool
 pg_generic_charinc(unsigned char *charptr, int len)
 {
 	unsigned char *lastbyte = charptr + len - 1;
-	mbverifier	mbverify;
+	mbchar_verifier mbverify;
 
 	/* We can just invoke the character verifier directly. */
-	mbverify = pg_wchar_table[GetDatabaseEncoding()].mbverify;
+	mbverify = pg_wchar_table[GetDatabaseEncoding()].mbverifychar;
 
 	while (*lastbyte < (unsigned char) 255)
 	{
@@ -1445,8 +1555,7 @@ pg_database_encoding_max_length(void)
 bool
 pg_verifymbstr(const char *mbstr, int len, bool noError)
 {
-	return
-		pg_verify_mbstr_len(GetDatabaseEncoding(), mbstr, len, noError) >= 0;
+	return pg_verify_mbstr(GetDatabaseEncoding(), mbstr, len, noError);
 }
 
 /*
@@ -1456,7 +1565,18 @@ pg_verifymbstr(const char *mbstr, int len, bool noError)
 bool
 pg_verify_mbstr(int encoding, const char *mbstr, int len, bool noError)
 {
-	return pg_verify_mbstr_len(encoding, mbstr, len, noError) >= 0;
+	int			oklen;
+
+	Assert(PG_VALID_ENCODING(encoding));
+
+	oklen = pg_wchar_table[encoding].mbverifystr((const unsigned char *) mbstr, len);
+	if (oklen != len)
+	{
+		if (noError)
+			return false;
+		report_invalid_encoding(encoding, mbstr + oklen, len - oklen);
+	}
+	return true;
 }
 
 /*
@@ -1469,11 +1589,14 @@ pg_verify_mbstr(int encoding, const char *mbstr, int len, bool noError)
  * If OK, return length of string in the encoding.
  * If a problem is found, return -1 when noError is
  * true; when noError is false, ereport() a descriptive message.
+ *
+ * Note: We cannot use the faster encoding-specific mbverifystr() function
+ * here, because we need to count the number of characters in the string.
  */
 int
 pg_verify_mbstr_len(int encoding, const char *mbstr, int len, bool noError)
 {
-	mbverifier	mbverify;
+	mbchar_verifier mbverifychar;
 	int			mb_len;
 
 	Assert(PG_VALID_ENCODING(encoding));
@@ -1493,7 +1616,7 @@ pg_verify_mbstr_len(int encoding, const char *mbstr, int len, bool noError)
 	}
 
 	/* fetch function pointer just once */
-	mbverify = pg_wchar_table[encoding].mbverify;
+	mbverifychar = pg_wchar_table[encoding].mbverifychar;
 
 	mb_len = 0;
 
@@ -1516,7 +1639,7 @@ pg_verify_mbstr_len(int encoding, const char *mbstr, int len, bool noError)
 			report_invalid_encoding(encoding, mbstr, len);
 		}
 
-		l = (*mbverify) ((const unsigned char *) mbstr, len);
+		l = (*mbverifychar) ((const unsigned char *) mbstr, len);
 
 		if (l < 0)
 		{

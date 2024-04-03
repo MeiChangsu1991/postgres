@@ -3,7 +3,7 @@
  * dummy_index_am.c
  *		Index AM template main file.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -23,8 +23,6 @@
 
 PG_MODULE_MAGIC;
 
-void		_PG_init(void);
-
 /* parse table for fillRelOptions */
 relopt_parse_elt di_relopt_tab[6];
 
@@ -34,7 +32,7 @@ relopt_kind di_relopt_kind;
 typedef enum DummyAmEnum
 {
 	DUMMY_AM_ENUM_ONE,
-	DUMMY_AM_ENUM_TWO
+	DUMMY_AM_ENUM_TWO,
 }			DummyAmEnum;
 
 /* Dummy index options */
@@ -153,7 +151,7 @@ dibuild(Relation heap, Relation index, IndexInfo *indexInfo)
 }
 
 /*
- * Build an empty index for the initialiation fork.
+ * Build an empty index for the initialization fork.
  */
 static void
 dibuildempty(Relation index)
@@ -168,6 +166,7 @@ static bool
 diinsert(Relation index, Datum *values, bool *isnull,
 		 ItemPointer ht_ctid, Relation heapRel,
 		 IndexUniqueCheck checkUnique,
+		 bool indexUnchanged,
 		 IndexInfo *indexInfo)
 {
 	/* nothing to do */
@@ -295,8 +294,10 @@ dihandler(PG_FUNCTION_ARGS)
 	amroutine->amclusterable = false;
 	amroutine->ampredlocks = false;
 	amroutine->amcanparallel = false;
+	amroutine->amcanbuildparallel = false;
 	amroutine->amcaninclude = false;
 	amroutine->amusemaintenanceworkmem = false;
+	amroutine->amsummarizing = false;
 	amroutine->amparallelvacuumoptions = VACUUM_OPTION_NO_PARALLEL;
 	amroutine->amkeytype = InvalidOid;
 

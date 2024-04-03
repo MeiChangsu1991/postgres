@@ -3,7 +3,7 @@
  * print.c
  *	  various print routines (used mostly for debugging)
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -38,7 +38,7 @@ print(const void *obj)
 	char	   *s;
 	char	   *f;
 
-	s = nodeToString(obj);
+	s = nodeToStringWithLocations(obj);
 	f = format_node_dump(s);
 	pfree(s);
 	printf("%s\n", f);
@@ -56,7 +56,7 @@ pprint(const void *obj)
 	char	   *s;
 	char	   *f;
 
-	s = nodeToString(obj);
+	s = nodeToStringWithLocations(obj);
 	f = pretty_format_node_dump(s);
 	pfree(s);
 	printf("%s\n", f);
@@ -74,7 +74,7 @@ elog_node_display(int lev, const char *title, const void *obj, bool pretty)
 	char	   *s;
 	char	   *f;
 
-	s = nodeToString(obj);
+	s = nodeToStringWithLocations(obj);
 	if (pretty)
 		f = pretty_format_node_dump(s);
 	else
@@ -394,7 +394,6 @@ print_expr(const Node *expr, const List *rtable)
 		}
 		else
 		{
-			/* we print prefix and postfix ops the same... */
 			printf("%s ", ((opname != NULL) ? opname : "(invalid operator)"));
 			print_expr(get_leftop((const Expr *) e), rtable);
 		}

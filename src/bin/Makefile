@@ -2,7 +2,7 @@
 #
 # Makefile for src/bin (client programs)
 #
-# Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/bin/Makefile
@@ -15,9 +15,11 @@ include $(top_builddir)/src/Makefile.global
 
 SUBDIRS = \
 	initdb \
+	pg_amcheck \
 	pg_archivecleanup \
 	pg_basebackup \
 	pg_checksums \
+	pg_combinebackup \
 	pg_config \
 	pg_controldata \
 	pg_ctl \
@@ -29,6 +31,7 @@ SUBDIRS = \
 	pg_upgrade \
 	pg_verifybackup \
 	pg_waldump \
+	pg_walsummary \
 	pgbench \
 	psql \
 	scripts

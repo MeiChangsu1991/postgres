@@ -629,6 +629,22 @@ explain (verbose, costs off)
 select * from testrngfunc();
 select * from testrngfunc();
 
+create or replace function testrngfunc() returns setof rngfunc_type as $$
+  select 1, 2 union select 3, 4 order by 1;
+$$ language sql immutable;
+
+explain (verbose, costs off)
+select testrngfunc();
+select testrngfunc();
+explain (verbose, costs off)
+select * from testrngfunc();
+select * from testrngfunc();
+
+-- Check a couple of error cases while we're here
+select * from testrngfunc() as t(f1 int8,f2 int8);  -- fail, composite result
+select * from pg_get_keywords() as t(f1 int8,f2 int8);  -- fail, OUT params
+select * from sin(3) as t(f1 int8,f2 int8);  -- fail, scalar result type
+
 drop type rngfunc_type cascade;
 
 --
@@ -666,12 +682,45 @@ SELECT * FROM ROWS FROM(get_users(), generate_series(10,11)) WITH ORDINALITY;
 select * from usersview;
 alter table users add column junk text;
 select * from usersview;
+
+alter table users drop column moredrop;  -- fail, view has reference
+
+-- We used to have a bug that would allow the above to succeed, posing
+-- hazards for later execution of the view.  Check that the internal
+-- defenses for those hazards haven't bit-rotted, in case some other
+-- bug with similar symptoms emerges.
 begin;
+
+-- destroy the dependency entry that prevents the DROP:
+delete from pg_depend where
+  objid = (select oid from pg_rewrite
+           where ev_class = 'usersview'::regclass and rulename = '_RETURN')
+  and refobjsubid = 5
+returning pg_describe_object(classid, objid, objsubid) as obj,
+          pg_describe_object(refclassid, refobjid, refobjsubid) as ref,
+          deptype;
+
 alter table users drop column moredrop;
 select * from usersview;  -- expect clean failure
 rollback;
+
+alter table users alter column seq type numeric;  -- fail, view has reference
+
+-- likewise, check we don't crash if the dependency goes wrong
+begin;
+
+-- destroy the dependency entry that prevents the ALTER:
+delete from pg_depend where
+  objid = (select oid from pg_rewrite
+           where ev_class = 'usersview'::regclass and rulename = '_RETURN')
+  and refobjsubid = 2
+returning pg_describe_object(classid, objid, objsubid) as obj,
+          pg_describe_object(refclassid, refobjid, refobjsubid) as ref,
+          deptype;
+
 alter table users alter column seq type numeric;
 select * from usersview;  -- expect clean failure
+rollback;
 
 drop view usersview;
 drop function get_first_user();
@@ -751,3 +800,27 @@ select *, row_to_json(u) from unnest(array[null::rngfunc2, (1,'foo')::rngfunc2, 
 select *, row_to_json(u) from unnest(array[]::rngfunc2[]) u;
 
 drop type rngfunc2;
+
+-- check handling of functions pulled up into function RTEs (bug #17227)
+
+explain (verbose, costs off)
+select * from
+  (select jsonb_path_query_array(module->'lectures', '$[*]') as lecture
+   from unnest(array['{"lectures": [{"id": "1"}]}'::jsonb])
+        as unnested_modules(module)) as ss,
+  jsonb_to_recordset(ss.lecture) as j (id text);
+
+select * from
+  (select jsonb_path_query_array(module->'lectures', '$[*]') as lecture
+   from unnest(array['{"lectures": [{"id": "1"}]}'::jsonb])
+        as unnested_modules(module)) as ss,
+  jsonb_to_recordset(ss.lecture) as j (id text);
+
+-- check detection of mismatching record types with a const-folded expression
+
+with a(b) as (values (row(1,2,3)))
+select * from a, coalesce(b) as c(d int, e int);  -- fail
+with a(b) as (values (row(1,2,3)))
+select * from a, coalesce(b) as c(d int, e int, f int, g int);  -- fail
+with a(b) as (values (row(1,2,3)))
+select * from a, coalesce(b) as c(d int, e int, f float);  -- fail

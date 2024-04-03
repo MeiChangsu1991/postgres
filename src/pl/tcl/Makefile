@@ -15,7 +15,7 @@ override CPPFLAGS := -I. -I$(srcdir) $(TCL_INCLUDE_SPEC) $(CPPFLAGS)
 
 # On Windows, we don't link directly with the Tcl library; see below
 ifneq ($(PORTNAME), win32)
-SHLIB_LINK = $(TCL_LIB_SPEC) $(TCL_LIBS) -lc
+SHLIB_LINK = $(TCL_LIB_SPEC) $(TCL_LIBS)
 endif
 
 PGFILEDESC = "PL/Tcl - procedural language"
@@ -46,7 +46,7 @@ lib$(tclwithver).a: $(tclwithver).def
 	dlltool --dllname $(tclwithver).dll --def $(tclwithver).def --output-lib lib$(tclwithver).a
 
 $(tclwithver).def: $(TCLDLL)
-	pexports $^ > $@
+	gendef - $^ > $@
 
 endif # win32
 
@@ -62,8 +62,6 @@ pltcl.o: pltclerrcodes.h
 # generate pltclerrcodes.h from src/backend/utils/errcodes.txt
 pltclerrcodes.h: $(top_srcdir)/src/backend/utils/errcodes.txt generate-pltclerrcodes.pl
 	$(PERL) $(srcdir)/generate-pltclerrcodes.pl $< > $@
-
-distprep: pltclerrcodes.h
 
 install: all install-lib install-data
 
@@ -91,13 +89,10 @@ installcheck: submake
 submake:
 	$(MAKE) -C $(top_builddir)/src/test/regress pg_regress$(X)
 
-# pltclerrcodes.h is in the distribution tarball, so don't clean it here.
 clean distclean: clean-lib
 	rm -f $(OBJS)
 	rm -rf $(pg_regress_clean_files)
 ifeq ($(PORTNAME), win32)
 	rm -f $(tclwithver).def
 endif
-
-maintainer-clean: distclean
 	rm -f pltclerrcodes.h

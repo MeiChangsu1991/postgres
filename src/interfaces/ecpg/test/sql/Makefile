@@ -23,9 +23,11 @@ TESTS = array array.c \
         parser parser.c \
         quote quote.c \
         show show.c \
+        sqljson sqljson.c \
         insupd insupd.c \
         twophase twophase.c \
         insupd insupd.c \
+		declare declare.c \
 		bytea bytea.c \
 		prepareas prepareas.c
 

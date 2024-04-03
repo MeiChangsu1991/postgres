@@ -7,7 +7,7 @@
  * common code for calling set-returning functions according to the
  * ReturnSetInfo API.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,7 +20,7 @@
 
 #include "access/htup_details.h"
 #include "catalog/objectaccess.h"
-#include "executor/execdebug.h"
+#include "catalog/pg_proc.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
@@ -259,7 +259,7 @@ ExecMakeTableFunctionResult(SetExprState *setexpr,
 			if (first_time)
 			{
 				MemoryContext oldcontext =
-				MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
+					MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
 
 				tupstore = tuplestore_begin_heap(randomAccess, false, work_mem);
 				rsinfo.setResult = tupstore;
@@ -289,7 +289,7 @@ ExecMakeTableFunctionResult(SetExprState *setexpr,
 					if (tupdesc == NULL)
 					{
 						MemoryContext oldcontext =
-						MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
+							MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
 
 						/*
 						 * This is the first non-NULL result from the
@@ -353,11 +353,21 @@ ExecMakeTableFunctionResult(SetExprState *setexpr,
 			 */
 			if (rsinfo.isDone != ExprMultipleResult)
 				break;
+
+			/*
+			 * Check that set-returning functions were properly declared.
+			 * (Note: for historical reasons, we don't complain if a non-SRF
+			 * returns ExprEndResult; that's treated as returning NULL.)
+			 */
+			if (!returnsSet)
+				ereport(ERROR,
+						(errcode(ERRCODE_E_R_I_E_SRF_PROTOCOL_VIOLATED),
+						 errmsg("table-function protocol for value-per-call mode was not followed")));
 		}
 		else if (rsinfo.returnMode == SFRM_Materialize)
 		{
 			/* check we're on the same page as the function author */
-			if (!first_time || rsinfo.isDone != ExprSingleResult)
+			if (!first_time || rsinfo.isDone != ExprSingleResult || !returnsSet)
 				ereport(ERROR,
 						(errcode(ERRCODE_E_R_I_E_SRF_PROTOCOL_VIOLATED),
 						 errmsg("table-function protocol for materialize mode was not followed")));
@@ -384,7 +394,7 @@ no_function_result:
 	if (rsinfo.setResult == NULL)
 	{
 		MemoryContext oldcontext =
-		MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
+			MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
 
 		tupstore = tuplestore_begin_heap(randomAccess, false, work_mem);
 		rsinfo.setResult = tupstore;
@@ -691,7 +701,7 @@ init_sexpr(Oid foid, Oid input_collation, Expr *node,
 	size_t		numargs = list_length(sexpr->args);
 
 	/* Check permission to call function */
-	aclresult = pg_proc_aclcheck(foid, GetUserId(), ACL_EXECUTE);
+	aclresult = object_aclcheck(ProcedureRelationId, foid, GetUserId(), ACL_EXECUTE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(foid));
 	InvokeFunctionExecuteHook(foid);

@@ -3,7 +3,7 @@
  * lockcmds.c
  *	  LOCK command support code
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,7 +21,6 @@
 #include "commands/lockcmds.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
-#include "parser/parse_clause.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
@@ -29,10 +28,11 @@
 #include "utils/syscache.h"
 
 static void LockTableRecurse(Oid reloid, LOCKMODE lockmode, bool nowait);
-static AclResult LockTableAclCheck(Oid relid, LOCKMODE lockmode, Oid userid);
+static AclResult LockTableAclCheck(Oid reloid, LOCKMODE lockmode, Oid userid);
 static void RangeVarCallbackForLockTable(const RangeVar *rv, Oid relid,
 										 Oid oldrelid, void *arg);
-static void LockViewRecurse(Oid reloid, LOCKMODE lockmode, bool nowait, List *ancestor_views);
+static void LockViewRecurse(Oid reloid, LOCKMODE lockmode, bool nowait,
+							List *ancestor_views);
 
 /*
  * LOCK TABLE
@@ -88,8 +88,9 @@ RangeVarCallbackForLockTable(const RangeVar *rv, Oid relid, Oid oldrelid,
 		relkind != RELKIND_VIEW)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a table or view",
-						rv->relname)));
+				 errmsg("cannot lock relation \"%s\"",
+						rv->relname),
+				 errdetail_relkind_not_supported(relkind)));
 
 	/*
 	 * Make note if a temporary relation has been accessed in this
@@ -167,7 +168,7 @@ typedef struct
 {
 	LOCKMODE	lockmode;		/* lock mode to use */
 	bool		nowait;			/* no wait mode */
-	Oid			viewowner;		/* view owner for checking the privilege */
+	Oid			check_as_user;	/* user for checking the privilege */
 	Oid			viewoid;		/* OID of the view to be locked */
 	List	   *ancestor_views; /* OIDs of ancestor views */
 } LockViewRecurse_context;
@@ -192,29 +193,24 @@ LockViewRecurse_walker(Node *node, LockViewRecurse_context *context)
 			char		relkind = rte->relkind;
 			char	   *relname = get_rel_name(relid);
 
-			/*
-			 * The OLD and NEW placeholder entries in the view's rtable are
-			 * skipped.
-			 */
-			if (relid == context->viewoid &&
-				(strcmp(rte->eref->aliasname, "old") == 0 ||
-				 strcmp(rte->eref->aliasname, "new") == 0))
-				continue;
-
 			/* Currently, we only allow plain tables or views to be locked. */
 			if (relkind != RELKIND_RELATION && relkind != RELKIND_PARTITIONED_TABLE &&
 				relkind != RELKIND_VIEW)
 				continue;
 
-			/* Check infinite recursion in the view definition. */
+			/*
+			 * We might be dealing with a self-referential view.  If so, we
+			 * can just stop recursing, since we already locked it.
+			 */
 			if (list_member_oid(context->ancestor_views, relid))
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("infinite recursion detected in rules for relation \"%s\"",
-								get_rel_name(relid))));
+				continue;
 
-			/* Check permissions with the view owner's privilege. */
-			aclresult = LockTableAclCheck(relid, context->lockmode, context->viewowner);
+			/*
+			 * Check permissions as the specified user.  This will either be
+			 * the view owner or the current user.
+			 */
+			aclresult = LockTableAclCheck(relid, context->lockmode,
+										  context->check_as_user);
 			if (aclresult != ACLCHECK_OK)
 				aclcheck_error(aclresult, get_relkind_objtype(relkind), relname);
 
@@ -228,7 +224,8 @@ LockViewRecurse_walker(Node *node, LockViewRecurse_context *context)
 								relname)));
 
 			if (relkind == RELKIND_VIEW)
-				LockViewRecurse(relid, context->lockmode, context->nowait, context->ancestor_views);
+				LockViewRecurse(relid, context->lockmode, context->nowait,
+								context->ancestor_views);
 			else if (rte->inh)
 				LockTableRecurse(relid, context->lockmode, context->nowait);
 		}
@@ -245,25 +242,33 @@ LockViewRecurse_walker(Node *node, LockViewRecurse_context *context)
 }
 
 static void
-LockViewRecurse(Oid reloid, LOCKMODE lockmode, bool nowait, List *ancestor_views)
+LockViewRecurse(Oid reloid, LOCKMODE lockmode, bool nowait,
+				List *ancestor_views)
 {
 	LockViewRecurse_context context;
-
 	Relation	view;
 	Query	   *viewquery;
 
+	/* caller has already locked the view */
 	view = table_open(reloid, NoLock);
 	viewquery = get_view_query(view);
 
+	/*
+	 * If the view has the security_invoker property set, check permissions as
+	 * the current user.  Otherwise, check permissions as the view owner.
+	 */
 	context.lockmode = lockmode;
 	context.nowait = nowait;
-	context.viewowner = view->rd_rel->relowner;
+	if (RelationHasSecurityInvoker(view))
+		context.check_as_user = GetUserId();
+	else
+		context.check_as_user = view->rd_rel->relowner;
 	context.viewoid = reloid;
 	context.ancestor_views = lappend_oid(ancestor_views, reloid);
 
 	LockViewRecurse_walker((Node *) viewquery, &context);
 
-	(void) list_delete_last(context.ancestor_views);
+	context.ancestor_views = list_delete_last(context.ancestor_views);
 
 	table_close(view, NoLock);
 }
@@ -277,13 +282,16 @@ LockTableAclCheck(Oid reloid, LOCKMODE lockmode, Oid userid)
 	AclResult	aclresult;
 	AclMode		aclmask;
 
-	/* Verify adequate privilege */
-	if (lockmode == AccessShareLock)
-		aclmask = ACL_SELECT;
-	else if (lockmode == RowExclusiveLock)
-		aclmask = ACL_INSERT | ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE;
-	else
-		aclmask = ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE;
+	/* any of these privileges permit any lock mode */
+	aclmask = ACL_MAINTAIN | ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE;
+
+	/* SELECT privileges also permit ACCESS SHARE and below */
+	if (lockmode <= AccessShareLock)
+		aclmask |= ACL_SELECT;
+
+	/* INSERT privileges also permit ROW EXCLUSIVE and below */
+	if (lockmode <= RowExclusiveLock)
+		aclmask |= ACL_INSERT;
 
 	aclresult = pg_class_aclcheck(reloid, userid, aclmask);
 

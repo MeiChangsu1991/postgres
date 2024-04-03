@@ -24,6 +24,9 @@ OBJS = \
 	constraint.o \
 	conversioncmds.o \
 	copy.o \
+	copyfrom.o \
+	copyfromparse.o \
+	copyto.o \
 	createas.o \
 	dbcommands.o \
 	define.o \
@@ -56,7 +59,9 @@ OBJS = \
 	typecmds.o \
 	user.o \
 	vacuum.o \
+	vacuumparallel.o \
 	variable.o \
-	view.o
+	view.o \
+	waitlsn.o
 
 include $(top_srcdir)/src/backend/common.mk

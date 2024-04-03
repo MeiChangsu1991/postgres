@@ -3,7 +3,7 @@
  * slotfuncs.c
  *	   Support functions for replication slots
  *
- * Copyright (c) 2012-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/slotfuncs.c
@@ -14,25 +14,19 @@
 
 #include "access/htup_details.h"
 #include "access/xlog_internal.h"
+#include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/slot.h"
+#include "replication/slotsync.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/pg_lsn.h"
 #include "utils/resowner.h"
-
-static void
-check_permissions(void)
-{
-	if (!superuser() && !has_rolreplication(GetUserId()))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser or replication role to use replication slots")));
-}
 
 /*
  * Helper function for creating a new physical replication slot with
@@ -50,7 +44,8 @@ create_physical_replication_slot(char *name, bool immediately_reserve,
 
 	/* acquire replication slot, this will check for conflicting names */
 	ReplicationSlotCreate(name, false,
-						  temporary ? RS_TEMPORARY : RS_PERSISTENT);
+						  temporary ? RS_TEMPORARY : RS_PERSISTENT, false,
+						  false, false);
 
 	if (immediately_reserve)
 	{
@@ -85,7 +80,7 @@ pg_create_physical_replication_slot(PG_FUNCTION_ARGS)
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
-	check_permissions();
+	CheckSlotPermissions();
 
 	CheckSlotRequirements();
 
@@ -124,7 +119,9 @@ pg_create_physical_replication_slot(PG_FUNCTION_ARGS)
  */
 static void
 create_logical_replication_slot(char *name, char *plugin,
-								bool temporary, XLogRecPtr restart_lsn,
+								bool temporary, bool two_phase,
+								bool failover,
+								XLogRecPtr restart_lsn,
 								bool find_startpoint)
 {
 	LogicalDecodingContext *ctx = NULL;
@@ -140,7 +137,8 @@ create_logical_replication_slot(char *name, char *plugin,
 	 * error as well.
 	 */
 	ReplicationSlotCreate(name, true,
-						  temporary ? RS_TEMPORARY : RS_EPHEMERAL);
+						  temporary ? RS_TEMPORARY : RS_EPHEMERAL, two_phase,
+						  failover, false);
 
 	/*
 	 * Create logical decoding context to find start point or, if we don't
@@ -177,6 +175,8 @@ pg_create_logical_replication_slot(PG_FUNCTION_ARGS)
 	Name		name = PG_GETARG_NAME(0);
 	Name		plugin = PG_GETARG_NAME(1);
 	bool		temporary = PG_GETARG_BOOL(2);
+	bool		two_phase = PG_GETARG_BOOL(3);
+	bool		failover = PG_GETARG_BOOL(4);
 	Datum		result;
 	TupleDesc	tupdesc;
 	HeapTuple	tuple;
@@ -186,13 +186,15 @@ pg_create_logical_replication_slot(PG_FUNCTION_ARGS)
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
-	check_permissions();
+	CheckSlotPermissions();
 
 	CheckLogicalDecodingRequirements();
 
 	create_logical_replication_slot(NameStr(*name),
 									NameStr(*plugin),
 									temporary,
+									two_phase,
+									failover,
 									InvalidXLogRecPtr,
 									true);
 
@@ -221,7 +223,7 @@ pg_drop_replication_slot(PG_FUNCTION_ARGS)
 {
 	Name		name = PG_GETARG_NAME(0);
 
-	check_permissions();
+	CheckSlotPermissions();
 
 	CheckSlotRequirements();
 
@@ -231,33 +233,16 @@ pg_drop_replication_slot(PG_FUNCTION_ARGS)
 }
 
 /*
- * pg_get_replication_slots - SQL SRF showing active replication slots.
+ * pg_get_replication_slots - SQL SRF showing all replication slots
+ * that currently exist on the database cluster.
  */
 Datum
 pg_get_replication_slots(PG_FUNCTION_ARGS)
 {
-#define PG_GET_REPLICATION_SLOTS_COLS 13
+#define PG_GET_REPLICATION_SLOTS_COLS 19
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	TupleDesc	tupdesc;
-	Tuplestorestate *tupstore;
-	MemoryContext per_query_ctx;
-	MemoryContext oldcontext;
 	XLogRecPtr	currlsn;
 	int			slotno;
-
-	/* check to see if caller supports us returning a tuplestore */
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
-
-	/* Build a tuple descriptor for our result type */
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-		elog(ERROR, "return type must be a row type");
 
 	/*
 	 * We don't require any special permission to see this function's data
@@ -265,15 +250,7 @@ pg_get_replication_slots(PG_FUNCTION_ARGS)
 	 * name, which shouldn't contain anything particularly sensitive.
 	 */
 
-	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-
-	tupstore = tuplestore_begin_heap(true, false, work_mem);
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = tupstore;
-	rsinfo->setDesc = tupdesc;
-
-	MemoryContextSwitchTo(oldcontext);
+	InitMaterializedSRF(fcinfo, 0);
 
 	currlsn = GetXLogWriteRecPtr();
 
@@ -286,6 +263,7 @@ pg_get_replication_slots(PG_FUNCTION_ARGS)
 		bool		nulls[PG_GET_REPLICATION_SLOTS_COLS];
 		WALAvailability walstate;
 		int			i;
+		ReplicationSlotInvalidationCause cause;
 
 		if (!slot->in_use)
 			continue;
@@ -345,12 +323,10 @@ pg_get_replication_slots(PG_FUNCTION_ARGS)
 			nulls[i++] = true;
 
 		/*
-		 * If invalidated_at is valid and restart_lsn is invalid, we know for
-		 * certain that the slot has been invalidated.  Otherwise, test
-		 * availability from restart_lsn.
+		 * If the slot has not been invalidated, test availability from
+		 * restart_lsn.
 		 */
-		if (XLogRecPtrIsInvalid(slot_contents.data.restart_lsn) &&
-			!XLogRecPtrIsInvalid(slot_contents.data.invalidated_at))
+		if (slot_contents.data.invalidated != RS_INVAL_NONE)
 			walstate = WALAVAIL_REMOVED;
 		else
 			walstate = GetWALAvailability(slot_contents.data.restart_lsn);
@@ -412,15 +388,15 @@ pg_get_replication_slots(PG_FUNCTION_ARGS)
 			nulls[i++] = true;
 		else
 		{
-			XLogSegNo   targetSeg;
-			uint64   slotKeepSegs;
-			uint64   keepSegs;
-			XLogSegNo   failSeg;
-			XLogRecPtr  failLSN;
+			XLogSegNo	targetSeg;
+			uint64		slotKeepSegs;
+			uint64		keepSegs;
+			XLogSegNo	failSeg;
+			XLogRecPtr	failLSN;
 
 			XLByteToSeg(slot_contents.data.restart_lsn, targetSeg, wal_segment_size);
 
-			/* determine how many segments slots can be kept by slots */
+			/* determine how many segments can be kept by slots */
 			slotKeepSegs = XLogMBVarToSegs(max_slot_wal_keep_size_mb, wal_segment_size);
 			/* ditto for wal_keep_size */
 			keepSegs = XLogMBVarToSegs(wal_keep_size_mb, wal_segment_size);
@@ -432,14 +408,46 @@ pg_get_replication_slots(PG_FUNCTION_ARGS)
 			values[i++] = Int64GetDatum(failLSN - currlsn);
 		}
 
+		values[i++] = BoolGetDatum(slot_contents.data.two_phase);
+
+		if (slot_contents.inactive_since > 0)
+			values[i++] = TimestampTzGetDatum(slot_contents.inactive_since);
+		else
+			nulls[i++] = true;
+
+		cause = slot_contents.data.invalidated;
+
+		if (SlotIsPhysical(&slot_contents))
+			nulls[i++] = true;
+		else
+		{
+			/*
+			 * rows_removed and wal_level_insufficient are the only two
+			 * reasons for the logical slot's conflict with recovery.
+			 */
+			if (cause == RS_INVAL_HORIZON ||
+				cause == RS_INVAL_WAL_LEVEL)
+				values[i++] = BoolGetDatum(true);
+			else
+				values[i++] = BoolGetDatum(false);
+		}
+
+		if (cause == RS_INVAL_NONE)
+			nulls[i++] = true;
+		else
+			values[i++] = CStringGetTextDatum(SlotInvalidationCauses[cause]);
+
+		values[i++] = BoolGetDatum(slot_contents.data.failover);
+
+		values[i++] = BoolGetDatum(slot_contents.data.synced);
+
 		Assert(i == PG_GET_REPLICATION_SLOTS_COLS);
 
-		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 values, nulls);
 	}
 
 	LWLockRelease(ReplicationSlotControlLock);
-
-	tuplestore_donestoring(tupstore);
 
 	return (Datum) 0;
 }
@@ -472,6 +480,12 @@ pg_physical_replication_slot_advance(XLogRecPtr moveto)
 		 * crash, but this makes the data consistent after a clean shutdown.
 		 */
 		ReplicationSlotMarkDirty();
+
+		/*
+		 * Wake up logical walsenders holding logical failover slots after
+		 * updating the restart_lsn of the physical slot.
+		 */
+		PhysicalWakeupLogicalWalSnd();
 	}
 
 	return retlsn;
@@ -513,18 +527,21 @@ pg_logical_replication_slot_advance(XLogRecPtr moveto)
 									NULL, NULL, NULL);
 
 		/*
+		 * Wait for specified streaming replication standby servers (if any)
+		 * to confirm receipt of WAL up to moveto lsn.
+		 */
+		WaitForStandbyConfirmation(moveto);
+
+		/*
 		 * Start reading at the slot's restart_lsn, which we know to point to
 		 * a valid record.
 		 */
 		XLogBeginRead(ctx->reader, MyReplicationSlot->data.restart_lsn);
 
-		/* Initialize our return value in case we don't do anything */
-		retlsn = MyReplicationSlot->data.confirmed_flush;
-
 		/* invalidate non-timetravel entries */
 		InvalidateSystemCaches();
 
-		/* Decode at least one record, until we run out of records */
+		/* Decode records until we reach the requested target */
 		while (ctx->reader->EndRecPtr < moveto)
 		{
 			char	   *errm = NULL;
@@ -536,7 +553,8 @@ pg_logical_replication_slot_advance(XLogRecPtr moveto)
 			 */
 			record = XLogReadRecord(ctx->reader, &errm);
 			if (errm)
-				elog(ERROR, "%s", errm);
+				elog(ERROR, "could not find record while advancing replication slot: %s",
+					 errm);
 
 			/*
 			 * Process the record.  Storage-level changes are ignored in
@@ -545,10 +563,6 @@ pg_logical_replication_slot_advance(XLogRecPtr moveto)
 			 */
 			if (record)
 				LogicalDecodingProcessRecord(ctx, ctx->reader);
-
-			/* Stop once the requested target has been reached */
-			if (moveto <= ctx->reader->EndRecPtr)
-				break;
 
 			CHECK_FOR_INTERRUPTS();
 		}
@@ -617,7 +631,7 @@ pg_replication_slot_advance(PG_FUNCTION_ARGS)
 
 	Assert(!MyReplicationSlot);
 
-	check_permissions();
+	CheckSlotPermissions();
 
 	if (XLogRecPtrIsInvalid(moveto))
 		ereport(ERROR,
@@ -632,12 +646,12 @@ pg_replication_slot_advance(PG_FUNCTION_ARGS)
 	 * target position accordingly.
 	 */
 	if (!RecoveryInProgress())
-		moveto = Min(moveto, GetFlushRecPtr());
+		moveto = Min(moveto, GetFlushRecPtr(NULL));
 	else
-		moveto = Min(moveto, GetXLogReplayRecPtr(&ThisTimeLineID));
+		moveto = Min(moveto, GetXLogReplayRecPtr(NULL));
 
 	/* Acquire the slot so we "own" it */
-	(void) ReplicationSlotAcquire(NameStr(*slotname), SAB_Error);
+	ReplicationSlotAcquire(NameStr(*slotname), true);
 
 	/* A slot whose restart_lsn has never been reserved cannot be advanced */
 	if (XLogRecPtrIsInvalid(MyReplicationSlot->data.restart_lsn))
@@ -645,7 +659,7 @@ pg_replication_slot_advance(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("replication slot \"%s\" cannot be advanced",
 						NameStr(*slotname)),
-				 errdetail("This slot has never previously reserved WAL, or has been invalidated.")));
+				 errdetail("This slot has never previously reserved WAL, or it has been invalidated.")));
 
 	/*
 	 * Check if the slot is not moving backwards.  Physical slots rely simply
@@ -662,8 +676,7 @@ pg_replication_slot_advance(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot advance replication slot to %X/%X, minimum is %X/%X",
-						(uint32) (moveto >> 32), (uint32) moveto,
-						(uint32) (minlsn >> 32), (uint32) minlsn)));
+						LSN_FORMAT_ARGS(moveto), LSN_FORMAT_ARGS(minlsn))));
 
 	/* Do the actual slot update, depending on the slot type */
 	if (OidIsValid(MyReplicationSlot->data.database))
@@ -717,7 +730,7 @@ copy_replication_slot(FunctionCallInfo fcinfo, bool logical_slot)
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
-	check_permissions();
+	CheckSlotPermissions();
 
 	if (logical_slot)
 		CheckLogicalDecodingRequirements();
@@ -796,10 +809,20 @@ copy_replication_slot(FunctionCallInfo fcinfo, bool logical_slot)
 		 * We must not try to read WAL, since we haven't reserved it yet --
 		 * hence pass find_startpoint false.  confirmed_flush will be set
 		 * below, by copying from the source slot.
+		 *
+		 * To avoid potential issues with the slot synchronization where the
+		 * restart_lsn of a replication slot can go backward, we set the
+		 * failover option to false here.  This situation occurs when a slot
+		 * on the primary server is dropped and immediately replaced with a
+		 * new slot of the same name, created by copying from another existing
+		 * slot.  However, the slot synchronization will only observe the
+		 * restart_lsn of the same slot going backward.
 		 */
 		create_logical_replication_slot(NameStr(*dst_name),
 										plugin,
 										temporary,
+										false,
+										false,
 										src_restart_lsn,
 										false);
 	}
@@ -945,4 +968,52 @@ Datum
 pg_copy_physical_replication_slot_b(PG_FUNCTION_ARGS)
 {
 	return copy_replication_slot(fcinfo, false);
+}
+
+/*
+ * Synchronize failover enabled replication slots to a standby server
+ * from the primary server.
+ */
+Datum
+pg_sync_replication_slots(PG_FUNCTION_ARGS)
+{
+	WalReceiverConn *wrconn;
+	char	   *err;
+	StringInfoData app_name;
+
+	CheckSlotPermissions();
+
+	if (!RecoveryInProgress())
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("replication slots can only be synchronized to a standby server"));
+
+	ValidateSlotSyncParams(ERROR);
+
+	/* Load the libpq-specific functions */
+	load_file("libpqwalreceiver", false);
+
+	(void) CheckAndGetDbnameFromConninfo();
+
+	initStringInfo(&app_name);
+	if (cluster_name[0])
+		appendStringInfo(&app_name, "%s_slotsync", cluster_name);
+	else
+		appendStringInfoString(&app_name, "slotsync");
+
+	/* Connect to the primary server. */
+	wrconn = walrcv_connect(PrimaryConnInfo, false, false, false,
+							app_name.data, &err);
+	pfree(app_name.data);
+
+	if (!wrconn)
+		ereport(ERROR,
+				errcode(ERRCODE_CONNECTION_FAILURE),
+				errmsg("could not connect to the primary server: %s", err));
+
+	SyncReplicationSlots(wrconn);
+
+	walrcv_disconnect(wrconn);
+
+	PG_RETURN_VOID();
 }

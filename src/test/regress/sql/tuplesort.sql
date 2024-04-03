@@ -2,7 +2,7 @@
 SET max_parallel_maintenance_workers = 0;
 SET max_parallel_workers = 0;
 
--- A table with with contents that, when sorted, triggers abbreviated
+-- A table with contents that, when sorted, triggers abbreviated
 -- key aborts. One easy way to achieve that is to use uuids that all
 -- have the same prefix, as abbreviated keys for uuids just use the
 -- first sizeof(Datum) bytes.
@@ -169,7 +169,7 @@ FETCH BACKWARD FROM c;
 FETCH BACKWARD FROM c;
 FETCH NEXT FROM c;
 
--- scroll beyond end end
+-- scroll beyond end
 FETCH LAST FROM c;
 FETCH BACKWARD FROM c;
 FETCH NEXT FROM c;
@@ -200,7 +200,7 @@ FETCH BACKWARD FROM c;
 FETCH BACKWARD FROM c;
 FETCH NEXT FROM c;
 
--- scroll beyond end end
+-- scroll beyond end
 FETCH LAST FROM c;
 FETCH BACKWARD FROM c;
 FETCH NEXT FROM c;

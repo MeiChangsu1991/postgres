@@ -1,5 +1,64 @@
 --
 -- BTREE_INDEX
+--
+
+-- directory paths are passed to us in environment variables
+\getenv abs_srcdir PG_ABS_SRCDIR
+
+CREATE TABLE bt_i4_heap (
+	seqno 		int4,
+	random 		int4
+);
+
+CREATE TABLE bt_name_heap (
+	seqno 		name,
+	random 		int4
+);
+
+CREATE TABLE bt_txt_heap (
+	seqno 		text,
+	random 		int4
+);
+
+CREATE TABLE bt_f8_heap (
+	seqno 		float8,
+	random 		int4
+);
+
+\set filename :abs_srcdir '/data/desc.data'
+COPY bt_i4_heap FROM :'filename';
+
+\set filename :abs_srcdir '/data/hash.data'
+COPY bt_name_heap FROM :'filename';
+
+\set filename :abs_srcdir '/data/desc.data'
+COPY bt_txt_heap FROM :'filename';
+
+\set filename :abs_srcdir '/data/hash.data'
+COPY bt_f8_heap FROM :'filename';
+
+ANALYZE bt_i4_heap;
+ANALYZE bt_name_heap;
+ANALYZE bt_txt_heap;
+ANALYZE bt_f8_heap;
+
+--
+-- BTREE ascending/descending cases
+--
+-- we load int4/text from pure descending data (each key is a new
+-- low key) and name/f8 from pure ascending data (each key is a new
+-- high key).  we had a bug where new low keys would sometimes be
+-- "lost".
+--
+CREATE INDEX bt_i4_index ON bt_i4_heap USING btree (seqno int4_ops);
+
+CREATE INDEX bt_name_index ON bt_name_heap USING btree (seqno name_ops);
+
+CREATE INDEX bt_txt_index ON bt_txt_heap USING btree (seqno text_ops);
+
+CREATE INDEX bt_f8_index ON bt_f8_heap USING btree (seqno float8_ops);
+
+--
 -- test retrieval of min/max keys for each index
 --
 
@@ -50,6 +109,31 @@ SELECT b.*
 SELECT b.*
    FROM bt_f8_heap b
    WHERE b.seqno = '4500'::float8;
+
+--
+-- Add coverage for optimization of backwards scan index descents
+--
+-- Here we expect _bt_search to descend straight to a leaf page containing a
+-- non-pivot tuple with the value '47', which comes last (after 11 similar
+-- non-pivot tuples).  Query execution should only need to visit a single
+-- leaf page here.
+--
+-- Test case relies on tenk1_hundred index having a leaf page whose high key
+-- is '(48, -inf)'.  We use a low cardinality index to make our test case less
+-- sensitive to implementation details that may change in the future.
+set enable_seqscan to false;
+set enable_indexscan to true;
+set enable_bitmapscan to false;
+explain (costs off)
+select hundred, twenty from tenk1 where hundred < 48 order by hundred desc limit 1;
+select hundred, twenty from tenk1 where hundred < 48 order by hundred desc limit 1;
+
+-- This variant of the query need only return a single tuple located to the immediate
+-- right of the '(48, -inf)' high key.  It also only needs to scan one single
+-- leaf page (the right sibling of the page scanned by the last test case):
+explain (costs off)
+select hundred, twenty from tenk1 where hundred <= 48 order by hundred desc limit 1;
+select hundred, twenty from tenk1 where hundred <= 48 order by hundred desc limit 1;
 
 --
 -- Check correct optimization of LIKE (special index operator support)
@@ -151,25 +235,6 @@ insert into btree_tall_tbl select g, repeat('x', 250)
 from generate_series(1, 130) g;
 
 --
--- Test vacuum_cleanup_index_scale_factor
---
-
--- Simple create
-create table btree_test(a int);
-create index btree_idx1 on btree_test(a) with (vacuum_cleanup_index_scale_factor = 40.0);
-select reloptions from pg_class WHERE oid = 'btree_idx1'::regclass;
-
--- Fail while setting improper values
-create index btree_idx_err on btree_test(a) with (vacuum_cleanup_index_scale_factor = -10.0);
-create index btree_idx_err on btree_test(a) with (vacuum_cleanup_index_scale_factor = 100.0);
-create index btree_idx_err on btree_test(a) with (vacuum_cleanup_index_scale_factor = 'string');
-create index btree_idx_err on btree_test(a) with (vacuum_cleanup_index_scale_factor = true);
-
--- Simple ALTER INDEX
-alter index btree_idx1 set (vacuum_cleanup_index_scale_factor = 70.0);
-select reloptions from pg_class WHERE oid = 'btree_idx1'::regclass;
-
---
 -- Test for multilevel page deletion
 --
 CREATE TABLE delete_test_table (a bigint, b bigint, c bigint, d bigint);
@@ -191,3 +256,14 @@ INSERT INTO delete_test_table SELECT i, 1, 2, 3 FROM generate_series(1,1000) i;
 
 -- Test unsupported btree opclass parameters
 create index on btree_tall_tbl (id int4_ops(foo=1));
+
+-- Test case of ALTER INDEX with abuse of column names for indexes.
+-- This grammar is not officially supported, but the parser allows it.
+CREATE INDEX btree_tall_idx2 ON btree_tall_tbl (id);
+ALTER INDEX btree_tall_idx2 ALTER COLUMN id SET (n_distinct=100);
+DROP INDEX btree_tall_idx2;
+-- Partitioned index
+CREATE TABLE btree_part (id int4) PARTITION BY RANGE (id);
+CREATE INDEX btree_part_idx ON btree_part(id);
+ALTER INDEX btree_part_idx ALTER COLUMN id SET (n_distinct=100);
+DROP TABLE btree_part;

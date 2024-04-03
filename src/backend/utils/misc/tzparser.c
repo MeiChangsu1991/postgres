@@ -11,7 +11,7 @@
  * PG_TRY if necessary.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -26,6 +26,7 @@
 
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "utils/datetime.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/tzparser.h"
@@ -66,8 +67,8 @@ validateTzEntry(tzEntry *tzentry)
 	/*
 	 * Sanity-check the offset: shouldn't exceed 14 hours
 	 */
-	if (tzentry->offset > 14 * 60 * 60 ||
-		tzentry->offset < -14 * 60 * 60)
+	if (tzentry->offset > 14 * SECS_PER_HOUR ||
+		tzentry->offset < -14 * SECS_PER_HOUR)
 	{
 		GUC_check_errmsg("time zone offset %d is out of range in time zone file \"%s\", line %d",
 						 tzentry->offset,
@@ -155,7 +156,7 @@ splitTzLine(const char *filename, int lineno, char *line, tzEntry *tzentry)
 		 * zones that probably will never be used in the current session.
 		 */
 		tzentry->zone = pstrdup(offset);
-		tzentry->offset = 0;
+		tzentry->offset = 0 * SECS_PER_HOUR;
 		tzentry->is_dst = false;
 		remain = strtok(NULL, WHITESPACE);
 	}
@@ -364,7 +365,8 @@ ParseTzFile(const char *filename, int depth,
 			{
 				GUC_check_errmsg("could not read time zone file \"%s\": %m",
 								 filename);
-				return -1;
+				n = -1;
+				break;
 			}
 			/* else we're at EOF after all */
 			break;
@@ -374,7 +376,8 @@ ParseTzFile(const char *filename, int depth,
 			/* the line is too long for tzbuf */
 			GUC_check_errmsg("line is too long in time zone file \"%s\", line %d",
 							 filename, lineno);
-			return -1;
+			n = -1;
+			break;
 		}
 
 		/* skip over whitespace */
@@ -397,12 +400,13 @@ ParseTzFile(const char *filename, int depth,
 			{
 				GUC_check_errmsg("@INCLUDE without file name in time zone file \"%s\", line %d",
 								 filename, lineno);
-				return -1;
+				n = -1;
+				break;
 			}
 			n = ParseTzFile(includeFile, depth + 1,
 							base, arraysize, n);
 			if (n < 0)
-				return -1;
+				break;
 			continue;
 		}
 
@@ -413,12 +417,18 @@ ParseTzFile(const char *filename, int depth,
 		}
 
 		if (!splitTzLine(filename, lineno, line, &tzentry))
-			return -1;
+		{
+			n = -1;
+			break;
+		}
 		if (!validateTzEntry(&tzentry))
-			return -1;
+		{
+			n = -1;
+			break;
+		}
 		n = addToArray(base, arraysize, n, &tzentry, override);
 		if (n < 0)
-			return -1;
+			break;
 	}
 
 	FreeFile(tzFile);
@@ -430,7 +440,7 @@ ParseTzFile(const char *filename, int depth,
  * load_tzoffsets --- read and parse the specified timezone offset file
  *
  * On success, return a filled-in TimeZoneAbbrevTable, which must have been
- * malloc'd not palloc'd.  On failure, return NULL, using GUC_check_errmsg
+ * guc_malloc'd not palloc'd.  On failure, return NULL, using GUC_check_errmsg
  * and friends to give details of the problem.
  */
 TimeZoneAbbrevTable *

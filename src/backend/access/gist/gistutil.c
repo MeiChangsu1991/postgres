@@ -4,7 +4,7 @@
  *	  utilities routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,11 +18,12 @@
 #include "access/gist_private.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
-#include "catalog/pg_opclass.h"
+#include "common/pg_prng.h"
 #include "storage/indexfsm.h"
-#include "storage/lmgr.h"
 #include "utils/float.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
@@ -32,7 +33,6 @@
 void
 gistfillbuffer(Page page, IndexTuple *itup, int len, OffsetNumber off)
 {
-	OffsetNumber l = InvalidOffsetNumber;
 	int			i;
 
 	if (off == InvalidOffsetNumber)
@@ -42,6 +42,7 @@ gistfillbuffer(Page page, IndexTuple *itup, int len, OffsetNumber off)
 	for (i = 0; i < len; i++)
 	{
 		Size		sz = IndexTupleSize(itup[i]);
+		OffsetNumber l;
 
 		l = PageAddItem(page, (Item) itup[i], sz, off, false, false);
 		if (l == InvalidOffsetNumber)
@@ -112,7 +113,7 @@ gistextractpage(Page page, int *len /* out */ )
 IndexTuple *
 gistjoinvector(IndexTuple *itvec, int *len, IndexTuple *additvec, int addlen)
 {
-	itvec = (IndexTuple *) repalloc((void *) itvec, sizeof(IndexTuple) * ((*len) + addlen));
+	itvec = (IndexTuple *) repalloc(itvec, sizeof(IndexTuple) * ((*len) + addlen));
 	memmove(&itvec[*len], additvec, sizeof(IndexTuple) * addlen);
 	*len += addlen;
 	return itvec;
@@ -279,7 +280,7 @@ gistMakeUnionKey(GISTSTATE *giststate, int attno,
 bool
 gistKeyIsEQ(GISTSTATE *giststate, int attno, Datum a, Datum b)
 {
-	bool		result;
+	bool		result = false; /* silence compiler warning */
 
 	FunctionCall3Coll(&giststate->equalFn[attno],
 					  giststate->supportCollation[attno],
@@ -507,7 +508,7 @@ gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
 			if (keep_current_best == -1)
 			{
 				/* we didn't make the random choice yet for this old best */
-				keep_current_best = (random() <= (MAX_RANDOM_VALUE / 2)) ? 1 : 0;
+				keep_current_best = pg_prng_bool(&pg_global_prng_state) ? 1 : 0;
 			}
 			if (keep_current_best == 0)
 			{
@@ -529,7 +530,7 @@ gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
 			if (keep_current_best == -1)
 			{
 				/* we didn't make the random choice yet for this old best */
-				keep_current_best = (random() <= (MAX_RANDOM_VALUE / 2)) ? 1 : 0;
+				keep_current_best = pg_prng_bool(&pg_global_prng_state) ? 1 : 0;
 			}
 			if (keep_current_best == 1)
 				break;
@@ -572,11 +573,30 @@ gistdentryinit(GISTSTATE *giststate, int nkey, GISTENTRY *e,
 
 IndexTuple
 gistFormTuple(GISTSTATE *giststate, Relation r,
-			  Datum attdata[], bool isnull[], bool isleaf)
+			  const Datum *attdata, const bool *isnull, bool isleaf)
 {
 	Datum		compatt[INDEX_MAX_KEYS];
-	int			i;
 	IndexTuple	res;
+
+	gistCompressValues(giststate, r, attdata, isnull, isleaf, compatt);
+
+	res = index_form_tuple(isleaf ? giststate->leafTupdesc :
+						   giststate->nonLeafTupdesc,
+						   compatt, isnull);
+
+	/*
+	 * The offset number on tuples on internal pages is unused. For historical
+	 * reasons, it is set to 0xffff.
+	 */
+	ItemPointerSetOffsetNumber(&(res->t_tid), 0xffff);
+	return res;
+}
+
+void
+gistCompressValues(GISTSTATE *giststate, Relation r,
+				   const Datum *attdata, const bool *isnull, bool isleaf, Datum *compatt)
+{
+	int			i;
 
 	/*
 	 * Call the compress method on each attribute.
@@ -617,17 +637,6 @@ gistFormTuple(GISTSTATE *giststate, Relation r,
 				compatt[i] = attdata[i];
 		}
 	}
-
-	res = index_form_tuple(isleaf ? giststate->leafTupdesc :
-						   giststate->nonLeafTupdesc,
-						   compatt, isnull);
-
-	/*
-	 * The offset number on tuples on internal pages is unused. For historical
-	 * reasons, it is set to 0xffff.
-	 */
-	ItemPointerSetOffsetNumber(&(res->t_tid), 0xffff);
-	return res;
 }
 
 /*
@@ -745,22 +754,28 @@ gistpenalty(GISTSTATE *giststate, int attno,
  * Initialize a new index page
  */
 void
-GISTInitBuffer(Buffer b, uint32 f)
+gistinitpage(Page page, uint32 f)
 {
 	GISTPageOpaque opaque;
-	Page		page;
-	Size		pageSize;
 
-	pageSize = BufferGetPageSize(b);
-	page = BufferGetPage(b);
-	PageInit(page, pageSize, sizeof(GISTPageOpaqueData));
+	PageInit(page, BLCKSZ, sizeof(GISTPageOpaqueData));
 
 	opaque = GistPageGetOpaque(page);
-	/* page was already zeroed by PageInit, so this is not needed: */
-	/* memset(&(opaque->nsn), 0, sizeof(GistNSN)); */
 	opaque->rightlink = InvalidBlockNumber;
 	opaque->flags = f;
 	opaque->gist_page_id = GIST_PAGE_ID;
+}
+
+/*
+ * Initialize a new index buffer
+ */
+void
+GISTInitBuffer(Buffer b, uint32 f)
+{
+	Page		page;
+
+	page = BufferGetPage(b);
+	gistinitpage(page, f);
 }
 
 /*
@@ -806,10 +821,9 @@ gistcheckpage(Relation rel, Buffer buf)
  * Caller is responsible for initializing the page by calling GISTInitBuffer
  */
 Buffer
-gistNewBuffer(Relation r)
+gistNewBuffer(Relation r, Relation heaprel)
 {
 	Buffer		buffer;
-	bool		needLock;
 
 	/* First, try to get a page from FSM */
 	for (;;)
@@ -850,7 +864,7 @@ gistNewBuffer(Relation r)
 				 * page's deleteXid.
 				 */
 				if (XLogStandbyInfoActive() && RelationNeedsWAL(r))
-					gistXLogPageReuse(r, blkno, GistPageGetDeleteXid(page));
+					gistXLogPageReuse(r, heaprel, blkno, GistPageGetDeleteXid(page));
 
 				return buffer;
 			}
@@ -863,16 +877,8 @@ gistNewBuffer(Relation r)
 	}
 
 	/* Must extend the file */
-	needLock = !RELATION_IS_LOCAL(r);
-
-	if (needLock)
-		LockRelationForExtension(r, ExclusiveLock);
-
-	buffer = ReadBuffer(r, P_NEW);
-	LockBuffer(buffer, GIST_EXCLUSIVE);
-
-	if (needLock)
-		UnlockRelationForExtension(r, ExclusiveLock);
+	buffer = ExtendBufferedRel(BMR_REL(r), MAIN_FORKNUM, NULL,
+							   EB_LOCK_FIRST);
 
 	return buffer;
 }
@@ -891,15 +897,13 @@ gistPageRecyclable(Page page)
 		 * As long as that can happen, we must keep the deleted page around as
 		 * a tombstone.
 		 *
-		 * Compare the deletion XID with RecentGlobalXmin. If deleteXid <
-		 * RecentGlobalXmin, then no scan that's still in progress could have
+		 * For that check if the deletion XID could still be visible to
+		 * anyone. If not, then no scan that's still in progress could have
 		 * seen its downlink, and we can recycle it.
 		 */
 		FullTransactionId deletexid_full = GistPageGetDeleteXid(page);
-		FullTransactionId recentxmin_full = GetFullRecentGlobalXmin();
 
-		if (FullTransactionIdPrecedes(deletexid_full, recentxmin_full))
-			return true;
+		return GlobalVisCheckRemovableFullXid(NULL, deletexid_full);
 	}
 	return false;
 }
@@ -1021,7 +1025,7 @@ gistGetFakeLSN(Relation rel)
 
 		return counter++;
 	}
-	else if (rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT)
+	else if (RelationIsPermanent(rel))
 	{
 		/*
 		 * WAL-logging on this relation will start after commit, so its LSNs
@@ -1051,4 +1055,46 @@ gistGetFakeLSN(Relation rel)
 		Assert(rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED);
 		return GetFakeLSNForUnloggedRel();
 	}
+}
+
+/*
+ * Returns the same number that was received.
+ *
+ * This is for GiST opclasses that use the RT*StrategyNumber constants.
+ */
+Datum
+gist_stratnum_identity(PG_FUNCTION_ARGS)
+{
+	StrategyNumber strat = PG_GETARG_UINT16(0);
+
+	PG_RETURN_UINT16(strat);
+}
+
+/*
+ * Returns the opclass's private stratnum used for the given strategy.
+ *
+ * Calls the opclass's GIST_STRATNUM_PROC support function, if any,
+ * and returns the result.
+ * Returns InvalidStrategy if the function is not defined.
+ */
+StrategyNumber
+GistTranslateStratnum(Oid opclass, StrategyNumber strat)
+{
+	Oid			opfamily;
+	Oid			opcintype;
+	Oid			funcid;
+	Datum		result;
+
+	/* Look up the opclass family and input datatype. */
+	if (!get_opclass_opfamily_and_input_type(opclass, &opfamily, &opcintype))
+		return InvalidStrategy;
+
+	/* Check whether the function is provided. */
+	funcid = get_opfamily_proc(opfamily, opcintype, opcintype, GIST_STRATNUM_PROC);
+	if (!OidIsValid(funcid))
+		return InvalidStrategy;
+
+	/* Ask the translation function */
+	result = OidFunctionCall1Coll(funcid, InvalidOid, UInt16GetDatum(strat));
+	return DatumGetUInt16(result);
 }

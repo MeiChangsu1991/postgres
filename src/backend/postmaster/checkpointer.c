@@ -10,9 +10,6 @@
  * fill WAL segments; the checkpointer itself doesn't watch for the
  * condition.)
  *
- * The checkpointer is started by the postmaster as soon as the startup
- * subprocess finishes, or as soon as recovery begins if we are doing archive
- * recovery.  It remains alive until the postmaster commands it to terminate.
  * Normal termination is by SIGUSR2, which instructs the checkpointer to
  * execute a shutdown checkpoint and then exit(0).  (All backends must be
  * stopped before SIGUSR2 is issued!)  Emergency termination is by SIGQUIT;
@@ -26,7 +23,7 @@
  * restart needs to be forced.)
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -41,9 +38,11 @@
 
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
+#include "access/xlogrecovery.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/auxprocess.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
 #include "replication/syncrep.h"
@@ -93,17 +92,11 @@
  * requesting backends since the last checkpoint start.  The flags are
  * chosen so that OR'ing is the correct way to combine multiple requests.
  *
- * num_backend_writes is used to count the number of buffer writes performed
- * by user backend processes.  This counter should be wide enough that it
- * can't overflow during a single processing cycle.  num_backend_fsync
- * counts the subset of those writes that also had to do their own fsync,
- * because the checkpointer failed to absorb their request.
- *
  * The requests array holds fsync requests sent by backends and not yet
  * absorbed by the checkpointer.
  *
- * Unlike the checkpoint fields, num_backend_writes, num_backend_fsync, and
- * the requests fields are protected by CheckpointerCommLock.
+ * Unlike the checkpoint fields, requests related fields are protected by
+ * CheckpointerCommLock.
  *----------
  */
 typedef struct
@@ -127,9 +120,6 @@ typedef struct
 	ConditionVariable start_cv; /* signaled when ckpt_started advances */
 	ConditionVariable done_cv;	/* signaled when ckpt_done advances */
 
-	uint32		num_backend_writes; /* counts user backend buffer writes */
-	uint32		num_backend_fsync;	/* counts user backend fsync calls */
-
 	int			num_requests;	/* current # of requests */
 	int			max_requests;	/* allocated array size */
 	CheckpointerRequest requests[FLEXIBLE_ARRAY_MEMBER];
@@ -145,7 +135,7 @@ static CheckpointerShmemStruct *CheckpointerShmem;
  */
 int			CheckPointTimeout = 300;
 int			CheckPointWarning = 30;
-double		CheckPointCompletionTarget = 0.5;
+double		CheckPointCompletionTarget = 0.9;
 
 /*
  * Private state
@@ -180,10 +170,15 @@ static void ReqCheckpointHandler(SIGNAL_ARGS);
  * basic execution environment, but not enabled signals yet.
  */
 void
-CheckpointerMain(void)
+CheckpointerMain(char *startup_data, size_t startup_data_len)
 {
 	sigjmp_buf	local_sigjmp_buf;
 	MemoryContext checkpointer_context;
+
+	Assert(startup_data_len == 0);
+
+	MyBackendType = B_CHECKPOINTER;
+	AuxiliaryProcessMainCommon();
 
 	CheckpointerShmem->checkpointer_pid = MyProcPid;
 
@@ -198,7 +193,7 @@ CheckpointerMain(void)
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGINT, ReqCheckpointHandler); /* request checkpoint */
 	pqsignal(SIGTERM, SIG_IGN); /* ignore SIGTERM */
-	pqsignal(SIGQUIT, SignalHandlerForCrashExit);
+	/* SIGQUIT handler was already set up by InitPostmasterChild */
 	pqsignal(SIGALRM, SIG_IGN);
 	pqsignal(SIGPIPE, SIG_IGN);
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
@@ -209,13 +204,20 @@ CheckpointerMain(void)
 	 */
 	pqsignal(SIGCHLD, SIG_DFL);
 
-	/* We allow SIGQUIT (quickdie) at all times */
-	sigdelset(&BlockSig, SIGQUIT);
-
 	/*
 	 * Initialize so that first time-driven event happens at the correct time.
 	 */
 	last_checkpoint_time = last_xlog_switch_time = (pg_time_t) time(NULL);
+
+	/*
+	 * Write out stats after shutdown. This needs to be called by exactly one
+	 * process during a normal shutdown, and since checkpointer is shut down
+	 * very late...
+	 *
+	 * Walsenders are shut down after the checkpointer, but currently don't
+	 * report stats. If that changes, we need a more complicated solution.
+	 */
+	before_shmem_exit(pgstat_before_server_shutdown, 0);
 
 	/*
 	 * Create a memory context that we will do all our work in.  We do this so
@@ -231,7 +233,20 @@ CheckpointerMain(void)
 	/*
 	 * If an exception is encountered, processing resumes here.
 	 *
-	 * See notes in postgres.c about the design of this coding.
+	 * You might wonder why this isn't coded as an infinite loop around a
+	 * PG_TRY construct.  The reason is that this is the bottom of the
+	 * exception stack, and so with PG_TRY there would be no exception handler
+	 * in force at all during the CATCH part.  By leaving the outermost setjmp
+	 * always active, we have at least some chance of recovering from an error
+	 * during error recovery.  (If we get into an infinite loop thereby, it
+	 * will soon be stopped by overflow of elog.c's internal state stack.)
+	 *
+	 * Note that we use sigsetjmp(..., 1), so that the prevailing signal mask
+	 * (to wit, BlockSig) will be restored when longjmp'ing to here.  Thus,
+	 * signals other than SIGQUIT will be blocked until we complete error
+	 * recovery.  It might seem that this policy makes the HOLD_INTERRUPTS()
+	 * call redundant, but it is not since InterruptPending might be set
+	 * already.
 	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 	{
@@ -253,7 +268,6 @@ CheckpointerMain(void)
 		LWLockReleaseAll();
 		ConditionVariableCancelSleep();
 		pgstat_report_wait_end();
-		AbortBufferIO();
 		UnlockBuffers();
 		ReleaseAuxProcessResources(false);
 		AtEOXact_Buffers(false);
@@ -282,7 +296,7 @@ CheckpointerMain(void)
 		FlushErrorState();
 
 		/* Flush any leaked data in the top-level context */
-		MemoryContextResetAndDeleteChildren(checkpointer_context);
+		MemoryContextReset(checkpointer_context);
 
 		/* Now we can allow interrupts again */
 		RESUME_INTERRUPTS();
@@ -293,13 +307,6 @@ CheckpointerMain(void)
 		 * fast as we can.
 		 */
 		pg_usleep(1000000L);
-
-		/*
-		 * Close all open files after any error.  This is helpful on Windows,
-		 * where holding deleted files open causes various strange errors.
-		 * It's not clear we need it elsewhere, but shouldn't hurt.
-		 */
-		smgrcloseall();
 	}
 
 	/* We can now handle ereport(ERROR) */
@@ -308,7 +315,7 @@ CheckpointerMain(void)
 	/*
 	 * Unblock signals (they were blocked when the postmaster forked us)
 	 */
-	PG_SETMASK(&UnBlockSig);
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 
 	/*
 	 * Ensure all shared memory values are set correctly for the config. Doing
@@ -332,6 +339,8 @@ CheckpointerMain(void)
 		pg_time_t	now;
 		int			elapsed_secs;
 		int			cur_timeout;
+		bool		chkpt_or_rstpt_requested = false;
+		bool		chkpt_or_rstpt_timed = false;
 
 		/* Clear any already-pending wakeups */
 		ResetLatch(MyLatch);
@@ -350,7 +359,7 @@ CheckpointerMain(void)
 		if (((volatile CheckpointerShmemStruct *) CheckpointerShmem)->ckpt_flags)
 		{
 			do_checkpoint = true;
-			BgWriterStats.m_requested_checkpoints++;
+			chkpt_or_rstpt_requested = true;
 		}
 
 		/*
@@ -364,7 +373,7 @@ CheckpointerMain(void)
 		if (elapsed_secs >= CheckPointTimeout)
 		{
 			if (!do_checkpoint)
-				BgWriterStats.m_timed_checkpoints++;
+				chkpt_or_rstpt_timed = true;
 			do_checkpoint = true;
 			flags |= CHECKPOINT_CAUSE_TIME;
 		}
@@ -377,11 +386,7 @@ CheckpointerMain(void)
 			bool		ckpt_performed = false;
 			bool		do_restartpoint;
 
-			/*
-			 * Check if we should perform a checkpoint or a restartpoint. As a
-			 * side-effect, RecoveryInProgress() initializes TimeLineID if
-			 * it's not set yet.
-			 */
+			/* Check if we should perform a checkpoint or a restartpoint. */
 			do_restartpoint = RecoveryInProgress();
 
 			/*
@@ -404,6 +409,24 @@ CheckpointerMain(void)
 			if (flags & CHECKPOINT_END_OF_RECOVERY)
 				do_restartpoint = false;
 
+			if (chkpt_or_rstpt_timed)
+			{
+				chkpt_or_rstpt_timed = false;
+				if (do_restartpoint)
+					PendingCheckpointerStats.restartpoints_timed++;
+				else
+					PendingCheckpointerStats.num_timed++;
+			}
+
+			if (chkpt_or_rstpt_requested)
+			{
+				chkpt_or_rstpt_requested = false;
+				if (do_restartpoint)
+					PendingCheckpointerStats.restartpoints_requested++;
+				else
+					PendingCheckpointerStats.num_requested++;
+			}
+
 			/*
 			 * We will warn if (a) too soon since last checkpoint (whatever
 			 * caused it) and (b) somebody set the CHECKPOINT_CAUSE_XLOG flag
@@ -419,7 +442,7 @@ CheckpointerMain(void)
 									   "checkpoints are occurring too frequently (%d seconds apart)",
 									   elapsed_secs,
 									   elapsed_secs),
-						 errhint("Consider increasing the configuration parameter \"max_wal_size\".")));
+						 errhint("Consider increasing the configuration parameter max_wal_size.")));
 
 			/*
 			 * Initialize checkpointer-private variables used during
@@ -445,10 +468,12 @@ CheckpointerMain(void)
 				ckpt_performed = CreateRestartPoint(flags);
 
 			/*
-			 * After any checkpoint, close all smgr files.  This is so we
-			 * won't hang onto smgr references to deleted files indefinitely.
+			 * After any checkpoint, free all smgr objects.  Otherwise we
+			 * would never do so for dropped relations, as the checkpointer
+			 * does not process shared invalidation messages or call
+			 * AtEOXact_SMgr().
 			 */
-			smgrcloseall();
+			smgrdestroyall();
 
 			/*
 			 * Indicate checkpoint completion to any waiting backends.
@@ -467,6 +492,9 @@ CheckpointerMain(void)
 				 * checkpoints happen at a predictable spacing.
 				 */
 				last_checkpoint_time = now;
+
+				if (do_restartpoint)
+					PendingCheckpointerStats.restartpoints_performed++;
 			}
 			else
 			{
@@ -480,19 +508,17 @@ CheckpointerMain(void)
 			}
 
 			ckpt_active = false;
+
+			/* We may have received an interrupt during the checkpoint. */
+			HandleCheckpointerInterrupts();
 		}
 
 		/* Check for archive_timeout and switch xlog files if necessary. */
 		CheckArchiveTimeout();
 
-		/*
-		 * Send off activity statistics to the stats collector.  (The reason
-		 * why we re-use bgwriter-related code for this is that the bgwriter
-		 * and checkpointer used to be just one process.  It's probably not
-		 * worth the trouble to split the stats support into two independent
-		 * stats message types.)
-		 */
-		pgstat_send_bgwriter();
+		/* Report pending statistics to the cumulative stats system */
+		pgstat_report_checkpointer();
+		pgstat_report_wal(true);
 
 		/*
 		 * If any checkpoint flags have been set, redo the loop to handle the
@@ -559,11 +585,26 @@ HandleCheckpointerInterrupts(void)
 		 * back to the sigsetjmp block above
 		 */
 		ExitOnAnyError = true;
-		/* Close down the database */
+
+		/*
+		 * Close down the database.
+		 *
+		 * Since ShutdownXLOG() creates restartpoint or checkpoint, and
+		 * updates the statistics, increment the checkpoint request and flush
+		 * out pending statistic.
+		 */
+		PendingCheckpointerStats.num_requested++;
 		ShutdownXLOG(0, 0);
+		pgstat_report_checkpointer();
+		pgstat_report_wal(true);
+
 		/* Normal exit from the checkpointer is here */
 		proc_exit(0);			/* done */
 	}
+
+	/* Perform logging of memory contexts of this process */
+	if (LogMemoryContextPending)
+		ProcessLogMemoryContextInterrupt();
 }
 
 /*
@@ -697,10 +738,8 @@ CheckpointWriteDelay(int flags, double progress)
 
 		CheckArchiveTimeout();
 
-		/*
-		 * Report interim activity statistics to the stats collector.
-		 */
-		pgstat_send_bgwriter();
+		/* Report interim statistics to the cumulative stats system */
+		pgstat_report_checkpointer();
 
 		/*
 		 * This sleep used to be connected to bgwriter_delay, typically 200ms.
@@ -708,7 +747,10 @@ CheckpointWriteDelay(int flags, double progress)
 		 * Checkpointer and bgwriter are no longer related so take the Big
 		 * Sleep.
 		 */
-		pg_usleep(100000L);
+		WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
+				  100,
+				  WAIT_EVENT_CHECKPOINT_WRITE_DELAY);
+		ResetLatch(MyLatch);
 	}
 	else if (--absorb_counter <= 0)
 	{
@@ -816,15 +858,11 @@ IsCheckpointOnSchedule(double progress)
 static void
 ReqCheckpointHandler(SIGNAL_ARGS)
 {
-	int			save_errno = errno;
-
 	/*
 	 * The signaling process should have set ckpt_flags nonzero, so all we
 	 * need do is ensure that our main loop gets kicked out of any wait.
 	 */
 	SetLatch(MyLatch);
-
-	errno = save_errno;
 }
 
 
@@ -917,11 +955,8 @@ RequestCheckpoint(int flags)
 		 */
 		CreateCheckPoint(flags | CHECKPOINT_IMMEDIATE);
 
-		/*
-		 * After any checkpoint, close all smgr files.  This is so we won't
-		 * hang onto smgr references to deleted files indefinitely.
-		 */
-		smgrcloseall();
+		/* Free all smgr objects, as CheckpointerMain() normally would. */
+		smgrdestroyall();
 
 		return;
 	}
@@ -1068,10 +1103,6 @@ ForwardSyncRequest(const FileTag *ftag, SyncRequestType type)
 
 	LWLockAcquire(CheckpointerCommLock, LW_EXCLUSIVE);
 
-	/* Count all backend writes regardless of if they fit in the queue */
-	if (!AmBackgroundWriterProcess())
-		CheckpointerShmem->num_backend_writes++;
-
 	/*
 	 * If the checkpointer isn't running or the request queue is full, the
 	 * backend will have to perform its own fsync request.  But before forcing
@@ -1081,12 +1112,6 @@ ForwardSyncRequest(const FileTag *ftag, SyncRequestType type)
 		(CheckpointerShmem->num_requests >= CheckpointerShmem->max_requests &&
 		 !CompactCheckpointerRequestQueue()))
 	{
-		/*
-		 * Count the subset of writes where backends have to do their own
-		 * fsync
-		 */
-		if (!AmBackgroundWriterProcess())
-			CheckpointerShmem->num_backend_fsync++;
 		LWLockRelease(CheckpointerCommLock);
 		return false;
 	}
@@ -1148,7 +1173,6 @@ CompactCheckpointerRequestQueue(void)
 	skip_slot = palloc0(sizeof(bool) * CheckpointerShmem->num_requests);
 
 	/* Initialize temporary hash table */
-	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(CheckpointerRequest);
 	ctl.entrysize = sizeof(struct CheckpointerSlotMapping);
 	ctl.hcxt = CurrentMemoryContext;
@@ -1180,7 +1204,7 @@ CompactCheckpointerRequestQueue(void)
 		 * We use the request struct directly as a hashtable key.  This
 		 * assumes that any padding bytes in the structs are consistently the
 		 * same, which should be okay because we zeroed them in
-		 * CheckpointerShmemInit.  Note also that RelFileNode had better
+		 * CheckpointerShmemInit.  Note also that RelFileLocator had better
 		 * contain no pad bytes.
 		 */
 		request = &CheckpointerShmem->requests[n];
@@ -1214,8 +1238,8 @@ CompactCheckpointerRequestQueue(void)
 		CheckpointerShmem->requests[preserve_count++] = CheckpointerShmem->requests[n];
 	}
 	ereport(DEBUG1,
-			(errmsg("compacted fsync request queue from %d entries to %d entries",
-					CheckpointerShmem->num_requests, preserve_count)));
+			(errmsg_internal("compacted fsync request queue from %d entries to %d entries",
+							 CheckpointerShmem->num_requests, preserve_count)));
 	CheckpointerShmem->num_requests = preserve_count;
 
 	/* Cleanup. */
@@ -1243,13 +1267,6 @@ AbsorbSyncRequests(void)
 		return;
 
 	LWLockAcquire(CheckpointerCommLock, LW_EXCLUSIVE);
-
-	/* Transfer stats counts into pending pgstats message */
-	BgWriterStats.m_buf_written_backend += CheckpointerShmem->num_backend_writes;
-	BgWriterStats.m_buf_fsync_backend += CheckpointerShmem->num_backend_fsync;
-
-	CheckpointerShmem->num_backend_writes = 0;
-	CheckpointerShmem->num_backend_fsync = 0;
 
 	/*
 	 * We try to avoid holding the lock for a long time by copying the request

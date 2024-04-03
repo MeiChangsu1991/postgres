@@ -3,7 +3,7 @@
  * nbtutils.c
  *	  Utility code for Postgres btree implementation.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,7 +20,6 @@
 #include "access/nbtree.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
-#include "catalog/catalog.h"
 #include "commands/progress.h"
 #include "lib/qunique.h"
 #include "miscadmin.h"
@@ -61,14 +60,6 @@ static int	_bt_keep_natts(Relation rel, IndexTuple lastleft,
  * _bt_mkscankey
  *		Build an insertion scan key that contains comparison data from itup
  *		as well as comparator routines appropriate to the key datatypes.
- *
- *		When itup is a non-pivot tuple, the returned insertion scan key is
- *		suitable for finding a place for it to go on the leaf level.  Pivot
- *		tuples can be used to re-find leaf page with matching high key, but
- *		then caller needs to set scan key's pivotsearch field to true.  This
- *		allows caller to search for a leaf page with a matching high key,
- *		which is usually to the left of the first leaf page a non-pivot match
- *		might appear on.
  *
  *		The result is intended for use with _bt_compare() and _bt_truncate().
  *		Callers that don't need to fill out the insertion scankey arguments
@@ -120,8 +111,8 @@ _bt_mkscankey(Relation rel, IndexTuple itup)
 		key->allequalimage = false;
 	}
 	key->anynullkeys = false;	/* initial assumption */
-	key->nextkey = false;
-	key->pivotsearch = false;
+	key->nextkey = false;		/* usual case, required by btinsert */
+	key->backward = false;		/* usual case, required by btinsert */
 	key->keysz = Min(indnkeyatts, tupnatts);
 	key->scantid = key->heapkeyspace && itup ?
 		BTreeTupleGetHeapTID(itup) : NULL;
@@ -164,6 +155,13 @@ _bt_mkscankey(Relation rel, IndexTuple itup)
 		if (null)
 			key->anynullkeys = true;
 	}
+
+	/*
+	 * In NULLS NOT DISTINCT mode, we pretend that there are no null keys, so
+	 * that full uniqueness check is done.
+	 */
+	if (rel->rd_index->indnullsnotdistinct)
+		key->anynullkeys = false;
 
 	return key;
 }
@@ -481,8 +479,8 @@ _bt_sort_array_elements(IndexScanDesc scan, ScanKey skey,
 	fmgr_info(cmp_proc, &cxt.flinfo);
 	cxt.collation = skey->sk_collation;
 	cxt.reverse = reverse;
-	qsort_arg((void *) elems, nelems, sizeof(Datum),
-			  _bt_compare_array_elements, (void *) &cxt);
+	qsort_arg(elems, nelems, sizeof(Datum),
+			  _bt_compare_array_elements, &cxt);
 
 	/* Now scan the sorted elements and remove duplicates */
 	return qunique_arg(elems, nelems, sizeof(Datum),
@@ -532,6 +530,8 @@ _bt_start_array_keys(IndexScanDesc scan, ScanDirection dir)
 			curArrayKey->cur_elem = 0;
 		skey->sk_argument = curArrayKey->elem_values[curArrayKey->cur_elem];
 	}
+
+	so->arraysStarted = true;
 }
 
 /*
@@ -591,6 +591,14 @@ _bt_advance_array_keys(IndexScanDesc scan, ScanDirection dir)
 	if (scan->parallel_scan != NULL)
 		_bt_parallel_advance_array_keys(scan);
 
+	/*
+	 * When no new array keys were found, the scan is "past the end" of the
+	 * array keys.  _bt_start_array_keys can still "restart" the array keys if
+	 * a rescan is required.
+	 */
+	if (!found)
+		so->arraysStarted = false;
+
 	return found;
 }
 
@@ -644,8 +652,13 @@ _bt_restore_array_keys(IndexScanDesc scan)
 	 * If we changed any keys, we must redo _bt_preprocess_keys.  That might
 	 * sound like overkill, but in cases with multiple keys per index column
 	 * it seems necessary to do the full set of pushups.
+	 *
+	 * Also do this whenever the scan's set of array keys "wrapped around" at
+	 * the end of the last primitive index scan.  There won't have been a call
+	 * to _bt_preprocess_keys from some other place following wrap around, so
+	 * we do it for ourselves.
 	 */
-	if (changed)
+	if (changed || !so->arraysStarted)
 	{
 		_bt_preprocess_keys(scan);
 		/* The mark should have been set on a consistent set of keys... */
@@ -1350,10 +1363,15 @@ _bt_mark_scankey_required(ScanKey skey)
  * tupnatts: number of attributes in tupnatts (high key may be truncated)
  * dir: direction we are scanning in
  * continuescan: output parameter (will be set correctly in all cases)
+ * continuescanPrechecked: indicates that *continuescan flag is known to
+ * 						   be true for the last item on the page
+ * haveFirstMatch: indicates that we already have at least one match
+ * 							  in the current page
  */
 bool
 _bt_checkkeys(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
-			  ScanDirection dir, bool *continuescan)
+			  ScanDirection dir, bool *continuescan,
+			  bool continuescanPrechecked, bool haveFirstMatch)
 {
 	TupleDesc	tupdesc;
 	BTScanOpaque so;
@@ -1374,6 +1392,39 @@ _bt_checkkeys(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
 		Datum		datum;
 		bool		isNull;
 		Datum		test;
+		bool		requiredSameDir = false,
+					requiredOppositeDir = false;
+
+		/*
+		 * Check if the key is required for ordered scan in the same or
+		 * opposite direction.  Save as flag variables for future usage.
+		 */
+		if (((key->sk_flags & SK_BT_REQFWD) && ScanDirectionIsForward(dir)) ||
+			((key->sk_flags & SK_BT_REQBKWD) && ScanDirectionIsBackward(dir)))
+			requiredSameDir = true;
+		else if (((key->sk_flags & SK_BT_REQFWD) && ScanDirectionIsBackward(dir)) ||
+				 ((key->sk_flags & SK_BT_REQBKWD) && ScanDirectionIsForward(dir)))
+			requiredOppositeDir = true;
+
+		/*
+		 * If the caller told us the *continuescan flag is known to be true
+		 * for the last item on the page, then we know the keys required for
+		 * the current direction scan should be matched.  Otherwise, the
+		 * *continuescan flag would be set for the current item and
+		 * subsequently the last item on the page accordingly.
+		 *
+		 * If the key is required for the opposite direction scan, we can skip
+		 * the check if the caller tells us there was already at least one
+		 * matching item on the page. Also, we require the *continuescan flag
+		 * to be true for the last item on the page to know there are no
+		 * NULLs.
+		 *
+		 * Both cases above work except for the row keys, where NULLs could be
+		 * found in the middle of matching values.
+		 */
+		if ((requiredSameDir || (requiredOppositeDir && haveFirstMatch)) &&
+			!(key->sk_flags & SK_ROW_HEADER) && continuescanPrechecked)
+			continue;
 
 		if (key->sk_attno > tupnatts)
 		{
@@ -1422,11 +1473,7 @@ _bt_checkkeys(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
 			 * scan direction, then we can conclude no further tuples will
 			 * pass, either.
 			 */
-			if ((key->sk_flags & SK_BT_REQFWD) &&
-				ScanDirectionIsForward(dir))
-				*continuescan = false;
-			else if ((key->sk_flags & SK_BT_REQBKWD) &&
-					 ScanDirectionIsBackward(dir))
+			if (requiredSameDir)
 				*continuescan = false;
 
 			/*
@@ -1476,8 +1523,23 @@ _bt_checkkeys(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
 			return false;
 		}
 
-		test = FunctionCall2Coll(&key->sk_func, key->sk_collation,
-								 datum, key->sk_argument);
+		/*
+		 * Apply the key-checking function.  When the key is required for the
+		 * opposite direction scan, it must be already satisfied as soon as
+		 * there is already match on the page.  Except for the NULLs checking,
+		 * which have already done above.
+		 */
+		if (!(requiredOppositeDir && haveFirstMatch))
+		{
+			test = FunctionCall2Coll(&key->sk_func, key->sk_collation,
+									 datum, key->sk_argument);
+		}
+		else
+		{
+			test = true;
+			Assert(test == FunctionCall2Coll(&key->sk_func, key->sk_collation,
+											 datum, key->sk_argument));
+		}
 
 		if (!DatumGetBool(test))
 		{
@@ -1491,11 +1553,7 @@ _bt_checkkeys(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
 			 * initial positioning in _bt_first() when they are available. See
 			 * comments in _bt_first().
 			 */
-			if ((key->sk_flags & SK_BT_REQFWD) &&
-				ScanDirectionIsForward(dir))
-				*continuescan = false;
-			else if ((key->sk_flags & SK_BT_REQBKWD) &&
-					 ScanDirectionIsBackward(dir))
+			if (requiredSameDir)
 				*continuescan = false;
 
 			/*
@@ -1744,7 +1802,7 @@ _bt_killitems(IndexScanDesc scan)
 		 * LSN.
 		 */
 		droppedpin = false;
-		LockBuffer(so->currPos.buf, BT_READ);
+		_bt_lockbuf(scan->indexRelation, so->currPos.buf, BT_READ);
 
 		page = BufferGetPage(so->currPos.buf);
 	}
@@ -1767,7 +1825,7 @@ _bt_killitems(IndexScanDesc scan)
 		}
 	}
 
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = BTPageGetOpaque(page);
 	minoff = P_FIRSTDATAKEY(opaque);
 	maxoff = PageGetMaxOffsetNumber(page);
 
@@ -1877,7 +1935,8 @@ _bt_killitems(IndexScanDesc scan)
 	 * Since this can be redone later if needed, mark as dirty hint.
 	 *
 	 * Whenever we mark anything LP_DEAD, we also set the page's
-	 * BTP_HAS_GARBAGE flag, which is likewise just a hint.
+	 * BTP_HAS_GARBAGE flag, which is likewise just a hint.  (Note that we
+	 * only rely on the page-level flag in !heapkeyspace indexes.)
 	 */
 	if (killedsomething)
 	{
@@ -1885,7 +1944,7 @@ _bt_killitems(IndexScanDesc scan)
 		MarkBufferDirtyHint(so->currPos.buf, true);
 	}
 
-	LockBuffer(so->currPos.buf, BUFFER_LOCK_UNLOCK);
+	_bt_unlockbuf(scan->indexRelation, so->currPos.buf);
 }
 
 
@@ -2108,14 +2167,12 @@ btoptions(Datum reloptions, bool validate)
 		offsetof(BTOptions, vacuum_cleanup_index_scale_factor)},
 		{"deduplicate_items", RELOPT_TYPE_BOOL,
 		offsetof(BTOptions, deduplicate_items)}
-
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,
 									  RELOPT_KIND_BTREE,
 									  sizeof(BTOptions),
 									  tab, lengthof(tab));
-
 }
 
 /*
@@ -2466,7 +2523,7 @@ _bt_check_natts(Relation rel, bool heapkeyspace, Page page, OffsetNumber offnum)
 {
 	int16		natts = IndexRelationGetNumberOfAttributes(rel);
 	int16		nkeyatts = IndexRelationGetNumberOfKeyAttributes(rel);
-	BTPageOpaque opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	BTPageOpaque opaque = BTPageGetOpaque(page);
 	IndexTuple	itup;
 	int			tupnatts;
 
@@ -2479,13 +2536,6 @@ _bt_check_natts(Relation rel, bool heapkeyspace, Page page, OffsetNumber offnum)
 
 	Assert(offnum >= FirstOffsetNumber &&
 		   offnum <= PageGetMaxOffsetNumber(page));
-
-	/*
-	 * Mask allocated for number of keys in index tuple must be able to fit
-	 * maximum possible number of index attributes
-	 */
-	StaticAssertStmt(BT_OFFSET_MASK >= INDEX_MAX_KEYS,
-					 "BT_OFFSET_MASK can't fit INDEX_MAX_KEYS");
 
 	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
 	tupnatts = BTreeTupleGetNAtts(itup, rel);
@@ -2583,7 +2633,6 @@ _bt_check_natts(Relation rel, bool heapkeyspace, Page page, OffsetNumber offnum)
 
 			/* Use generic heapkeyspace pivot tuple handling */
 		}
-
 	}
 
 	/* Handle heapkeyspace pivot tuples (excluding minus infinity items) */
@@ -2654,7 +2703,7 @@ _bt_check_third_page(Relation rel, Relation heap, bool needheaptidspace,
 	 * Internal page insertions cannot fail here, because that would mean that
 	 * an earlier leaf level insertion that should have failed didn't
 	 */
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = BTPageGetOpaque(page);
 	if (!P_ISLEAF(opaque))
 		elog(ERROR, "cannot insert oversized tuple of size %zu on internal page of index \"%s\"",
 			 itemsz, RelationGetRelationName(rel));
@@ -2692,21 +2741,9 @@ _bt_allequalimage(Relation rel, bool debugmessage)
 {
 	bool		allequalimage = true;
 
-	/* INCLUDE indexes don't support deduplication */
+	/* INCLUDE indexes can never support deduplication */
 	if (IndexRelationGetNumberOfAttributes(rel) !=
 		IndexRelationGetNumberOfKeyAttributes(rel))
-		return false;
-
-	/*
-	 * There is no special reason why deduplication cannot work with system
-	 * relations (i.e. with system catalog indexes and TOAST indexes).  We
-	 * deem deduplication unsafe for these indexes all the same, since the
-	 * alternative is to force users to always use deduplication, without
-	 * being able to opt out.  (ALTER INDEX is not supported with system
-	 * indexes, so users would have no way to set the deduplicate_items
-	 * storage parameter to 'off'.)
-	 */
-	if (IsSystemRelation(rel))
 		return false;
 
 	for (int i = 0; i < IndexRelationGetNumberOfKeyAttributes(rel); i++)
@@ -2732,10 +2769,6 @@ _bt_allequalimage(Relation rel, bool debugmessage)
 		}
 	}
 
-	/*
-	 * Don't elog() until here to avoid reporting on a system relation index
-	 * or an INCLUDE index
-	 */
 	if (debugmessage)
 	{
 		if (allequalimage)

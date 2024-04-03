@@ -2,7 +2,7 @@
  *
  * clusterdb
  *
- * Portions Copyright (c) 2002-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2002-2024, PostgreSQL Global Development Group
  *
  * src/bin/scripts/clusterdb.c
  *
@@ -13,19 +13,17 @@
 #include "common.h"
 #include "common/logging.h"
 #include "fe_utils/cancel.h"
+#include "fe_utils/option_utils.h"
+#include "fe_utils/query_utils.h"
 #include "fe_utils/simple_list.h"
 #include "fe_utils/string_utils.h"
 
 
-static void cluster_one_database(const char *dbname, bool verbose, const char *table,
-								 const char *host, const char *port,
-								 const char *username, enum trivalue prompt_password,
-								 const char *progname, bool echo);
-static void cluster_all_databases(bool verbose, const char *maintenance_db,
-								  const char *host, const char *port,
-								  const char *username, enum trivalue prompt_password,
-								  const char *progname, bool echo, bool quiet);
-
+static void cluster_one_database(const ConnParams *cparams, const char *table,
+								 const char *progname, bool verbose, bool echo);
+static void cluster_all_databases(ConnParams *cparams, SimpleStringList *tables,
+								  const char *progname, bool verbose, bool echo,
+								  bool quiet);
 static void help(const char *progname);
 
 
@@ -58,6 +56,7 @@ main(int argc, char *argv[])
 	char	   *port = NULL;
 	char	   *username = NULL;
 	enum trivalue prompt_password = TRI_DEFAULT;
+	ConnParams	cparams;
 	bool		echo = false;
 	bool		quiet = false;
 	bool		alldb = false;
@@ -70,18 +69,36 @@ main(int argc, char *argv[])
 
 	handle_help_version_opts(argc, argv, "clusterdb", help);
 
-	while ((c = getopt_long(argc, argv, "h:p:U:wWeqd:at:v", long_options, &optindex)) != -1)
+	while ((c = getopt_long(argc, argv, "ad:eh:p:qt:U:vwW", long_options, &optindex)) != -1)
 	{
 		switch (c)
 		{
+			case 'a':
+				alldb = true;
+				break;
+			case 'd':
+				dbname = pg_strdup(optarg);
+				break;
+			case 'e':
+				echo = true;
+				break;
 			case 'h':
 				host = pg_strdup(optarg);
 				break;
 			case 'p':
 				port = pg_strdup(optarg);
 				break;
+			case 'q':
+				quiet = true;
+				break;
+			case 't':
+				simple_string_list_append(&tables, optarg);
+				break;
 			case 'U':
 				username = pg_strdup(optarg);
+				break;
+			case 'v':
+				verbose = true;
 				break;
 			case 'w':
 				prompt_password = TRI_NO;
@@ -89,29 +106,12 @@ main(int argc, char *argv[])
 			case 'W':
 				prompt_password = TRI_YES;
 				break;
-			case 'e':
-				echo = true;
-				break;
-			case 'q':
-				quiet = true;
-				break;
-			case 'd':
-				dbname = pg_strdup(optarg);
-				break;
-			case 'a':
-				alldb = true;
-				break;
-			case 't':
-				simple_string_list_append(&tables, optarg);
-				break;
-			case 'v':
-				verbose = true;
-				break;
 			case 2:
 				maintenance_db = pg_strdup(optarg);
 				break;
 			default:
-				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+				/* getopt_long already emitted a complaint */
+				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 				exit(1);
 		}
 	}
@@ -130,28 +130,28 @@ main(int argc, char *argv[])
 	{
 		pg_log_error("too many command-line arguments (first is \"%s\")",
 					 argv[optind]);
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
 	}
+
+	/* fill cparams except for dbname, which is set below */
+	cparams.pghost = host;
+	cparams.pgport = port;
+	cparams.pguser = username;
+	cparams.prompt_password = prompt_password;
+	cparams.override_dbname = NULL;
 
 	setup_cancel_handler(NULL);
 
 	if (alldb)
 	{
 		if (dbname)
-		{
-			pg_log_error("cannot cluster all databases and a specific one at the same time");
-			exit(1);
-		}
+			pg_fatal("cannot cluster all databases and a specific one at the same time");
 
-		if (tables.head != NULL)
-		{
-			pg_log_error("cannot cluster specific table(s) in all databases");
-			exit(1);
-		}
+		cparams.dbname = maintenance_db;
 
-		cluster_all_databases(verbose, maintenance_db, host, port, username, prompt_password,
-							  progname, echo, quiet);
+		cluster_all_databases(&cparams, &tables,
+							  progname, verbose, echo, quiet);
 	}
 	else
 	{
@@ -165,21 +165,21 @@ main(int argc, char *argv[])
 				dbname = get_user_name_or_exit(progname);
 		}
 
+		cparams.dbname = dbname;
+
 		if (tables.head != NULL)
 		{
 			SimpleStringListCell *cell;
 
 			for (cell = tables.head; cell; cell = cell->next)
 			{
-				cluster_one_database(dbname, verbose, cell->val,
-									 host, port, username, prompt_password,
-									 progname, echo);
+				cluster_one_database(&cparams, cell->val,
+									 progname, verbose, echo);
 			}
 		}
 		else
-			cluster_one_database(dbname, verbose, NULL,
-								 host, port, username, prompt_password,
-								 progname, echo);
+			cluster_one_database(&cparams, NULL,
+								 progname, verbose, echo);
 	}
 
 	exit(0);
@@ -187,17 +187,14 @@ main(int argc, char *argv[])
 
 
 static void
-cluster_one_database(const char *dbname, bool verbose, const char *table,
-					 const char *host, const char *port,
-					 const char *username, enum trivalue prompt_password,
-					 const char *progname, bool echo)
+cluster_one_database(const ConnParams *cparams, const char *table,
+					 const char *progname, bool verbose, bool echo)
 {
 	PQExpBufferData sql;
 
 	PGconn	   *conn;
 
-	conn = connectDatabase(dbname, host, port, username, prompt_password,
-						   progname, echo, false, false);
+	conn = connectDatabase(cparams, progname, echo, false, true);
 
 	initPQExpBuffer(&sql);
 
@@ -228,22 +225,20 @@ cluster_one_database(const char *dbname, bool verbose, const char *table,
 
 
 static void
-cluster_all_databases(bool verbose, const char *maintenance_db,
-					  const char *host, const char *port,
-					  const char *username, enum trivalue prompt_password,
-					  const char *progname, bool echo, bool quiet)
+cluster_all_databases(ConnParams *cparams, SimpleStringList *tables,
+					  const char *progname, bool verbose, bool echo,
+					  bool quiet)
 {
 	PGconn	   *conn;
 	PGresult   *result;
-	PQExpBufferData connstr;
 	int			i;
 
-	conn = connectMaintenanceDatabase(maintenance_db, host, port, username,
-									  prompt_password, progname, echo);
-	result = executeQuery(conn, "SELECT datname FROM pg_database WHERE datallowconn ORDER BY 1;", echo);
+	conn = connectMaintenanceDatabase(cparams, progname, echo);
+	result = executeQuery(conn,
+						  "SELECT datname FROM pg_database WHERE datallowconn AND datconnlimit <> -2 ORDER BY 1;",
+						  echo);
 	PQfinish(conn);
 
-	initPQExpBuffer(&connstr);
 	for (i = 0; i < PQntuples(result); i++)
 	{
 		char	   *dbname = PQgetvalue(result, i, 0);
@@ -254,15 +249,20 @@ cluster_all_databases(bool verbose, const char *maintenance_db,
 			fflush(stdout);
 		}
 
-		resetPQExpBuffer(&connstr);
-		appendPQExpBufferStr(&connstr, "dbname=");
-		appendConnStrVal(&connstr, dbname);
+		cparams->override_dbname = dbname;
 
-		cluster_one_database(connstr.data, verbose, NULL,
-							 host, port, username, prompt_password,
-							 progname, echo);
+		if (tables->head != NULL)
+		{
+			SimpleStringListCell *cell;
+
+			for (cell = tables->head; cell; cell = cell->next)
+				cluster_one_database(cparams, cell->val,
+									 progname, verbose, echo);
+		}
+		else
+			cluster_one_database(cparams, NULL,
+								 progname, verbose, echo);
 	}
-	termPQExpBuffer(&connstr);
 
 	PQclear(result);
 }

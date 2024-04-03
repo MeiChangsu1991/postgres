@@ -46,7 +46,7 @@
  *		to avoid physically constructing projection tuples in many cases.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -60,6 +60,7 @@
 #include "access/heaptoast.h"
 #include "access/htup_details.h"
 #include "access/tupdesc_details.h"
+#include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "nodes/nodeFuncs.h"
@@ -122,9 +123,8 @@ tts_virtual_clear(TupleTableSlot *slot)
 }
 
 /*
- * Attribute values are readily available in tts_values and tts_isnull array
- * in a VirtualTupleTableSlot. So there should be no need to call either of the
- * following two functions.
+ * VirtualTupleTableSlots always have fully populated tts_values and
+ * tts_isnull arrays.  So this function should never be called.
  */
 static void
 tts_virtual_getsomeattrs(TupleTableSlot *slot, int natts)
@@ -132,12 +132,37 @@ tts_virtual_getsomeattrs(TupleTableSlot *slot, int natts)
 	elog(ERROR, "getsomeattrs is not required to be called on a virtual tuple table slot");
 }
 
+/*
+ * VirtualTupleTableSlots never provide system attributes (except those
+ * handled generically, such as tableoid).  We generally shouldn't get
+ * here, but provide a user-friendly message if we do.
+ */
 static Datum
 tts_virtual_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 {
-	elog(ERROR, "virtual tuple table slot does not have system attributes");
+	Assert(!TTS_EMPTY(slot));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot retrieve a system column in this context")));
 
 	return 0;					/* silence compiler warnings */
+}
+
+/*
+ * VirtualTupleTableSlots never have storage tuples.  We generally
+ * shouldn't get here, but provide a user-friendly message if we do.
+ */
+static bool
+tts_virtual_is_current_xact_tuple(TupleTableSlot *slot)
+{
+	Assert(!TTS_EMPTY(slot));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("don't have transaction information for this type of tuple")));
+
+	return false;				/* silence compiler warnings */
 }
 
 /*
@@ -245,8 +270,6 @@ tts_virtual_copyslot(TupleTableSlot *dstslot, TupleTableSlot *srcslot)
 {
 	TupleDesc	srcdesc = srcslot->tts_tupleDescriptor;
 
-	Assert(srcdesc->natts <= dstslot->tts_tupleDescriptor->natts);
-
 	tts_virtual_clear(dstslot);
 
 	slot_getallattrs(srcslot);
@@ -335,8 +358,40 @@ tts_heap_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 
 	Assert(!TTS_EMPTY(slot));
 
+	/*
+	 * In some code paths it's possible to get here with a non-materialized
+	 * slot, in which case we can't retrieve system columns.
+	 */
+	if (!hslot->tuple)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot retrieve a system column in this context")));
+
 	return heap_getsysattr(hslot->tuple, attnum,
 						   slot->tts_tupleDescriptor, isnull);
+}
+
+static bool
+tts_heap_is_current_xact_tuple(TupleTableSlot *slot)
+{
+	HeapTupleTableSlot *hslot = (HeapTupleTableSlot *) slot;
+	TransactionId xmin;
+
+	Assert(!TTS_EMPTY(slot));
+
+	/*
+	 * In some code paths it's possible to get here with a non-materialized
+	 * slot, in which case we can't check if tuple is created by the current
+	 * transaction.
+	 */
+	if (!hslot->tuple)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("don't have a storage tuple in this context")));
+
+	xmin = HeapTupleHeaderGetRawXmin(hslot->tuple->t_data);
+
+	return TransactionIdIsCurrentTransactionId(xmin);
 }
 
 static void
@@ -368,8 +423,8 @@ tts_heap_materialize(TupleTableSlot *slot)
 	{
 		/*
 		 * The tuple contained in this slot is not allocated in the memory
-		 * context of the given slot (else it would have TTS_SHOULDFREE set).
-		 * Copy the tuple into the given slot's memory context.
+		 * context of the given slot (else it would have TTS_FLAG_SHOULDFREE
+		 * set).  Copy the tuple into the given slot's memory context.
 		 */
 		hslot->tuple = heap_copytuple(hslot->tuple);
 	}
@@ -494,12 +549,37 @@ tts_minimal_getsomeattrs(TupleTableSlot *slot, int natts)
 	slot_deform_heap_tuple(slot, mslot->tuple, &mslot->off, natts);
 }
 
+/*
+ * MinimalTupleTableSlots never provide system attributes. We generally
+ * shouldn't get here, but provide a user-friendly message if we do.
+ */
 static Datum
 tts_minimal_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 {
-	elog(ERROR, "minimal tuple table slot does not have system attributes");
+	Assert(!TTS_EMPTY(slot));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot retrieve a system column in this context")));
 
 	return 0;					/* silence compiler warnings */
+}
+
+/*
+ * Within MinimalTuple abstraction transaction information is unavailable.
+ * We generally shouldn't get here, but provide a user-friendly message if
+ * we do.
+ */
+static bool
+tts_minimal_is_current_xact_tuple(TupleTableSlot *slot)
+{
+	Assert(!TTS_EMPTY(slot));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("don't have transaction information for this type of tuple")));
+
+	return false;				/* silence compiler warnings */
 }
 
 static void
@@ -533,8 +613,9 @@ tts_minimal_materialize(TupleTableSlot *slot)
 	{
 		/*
 		 * The minimal tuple contained in this slot is not allocated in the
-		 * memory context of the given slot (else it would have TTS_SHOULDFREE
-		 * set).  Copy the minimal tuple into the given slot's memory context.
+		 * memory context of the given slot (else it would have
+		 * TTS_FLAG_SHOULDFREE set).  Copy the minimal tuple into the given
+		 * slot's memory context.
 		 */
 		mslot->mintuple = heap_copy_minimal_tuple(mslot->mintuple);
 	}
@@ -681,8 +762,40 @@ tts_buffer_heap_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 
 	Assert(!TTS_EMPTY(slot));
 
+	/*
+	 * In some code paths it's possible to get here with a non-materialized
+	 * slot, in which case we can't retrieve system columns.
+	 */
+	if (!bslot->base.tuple)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot retrieve a system column in this context")));
+
 	return heap_getsysattr(bslot->base.tuple, attnum,
 						   slot->tts_tupleDescriptor, isnull);
+}
+
+static bool
+tts_buffer_is_current_xact_tuple(TupleTableSlot *slot)
+{
+	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
+	TransactionId xmin;
+
+	Assert(!TTS_EMPTY(slot));
+
+	/*
+	 * In some code paths it's possible to get here with a non-materialized
+	 * slot, in which case we can't check if tuple is created by the current
+	 * transaction.
+	 */
+	if (!bslot->base.tuple)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("don't have a storage tuple in this context")));
+
+	xmin = HeapTupleHeaderGetRawXmin(bslot->base.tuple->t_data);
+
+	return TransactionIdIsCurrentTransactionId(xmin);
 }
 
 static void
@@ -1000,6 +1113,7 @@ const TupleTableSlotOps TTSOpsVirtual = {
 	.getsomeattrs = tts_virtual_getsomeattrs,
 	.getsysattr = tts_virtual_getsysattr,
 	.materialize = tts_virtual_materialize,
+	.is_current_xact_tuple = tts_virtual_is_current_xact_tuple,
 	.copyslot = tts_virtual_copyslot,
 
 	/*
@@ -1019,6 +1133,7 @@ const TupleTableSlotOps TTSOpsHeapTuple = {
 	.clear = tts_heap_clear,
 	.getsomeattrs = tts_heap_getsomeattrs,
 	.getsysattr = tts_heap_getsysattr,
+	.is_current_xact_tuple = tts_heap_is_current_xact_tuple,
 	.materialize = tts_heap_materialize,
 	.copyslot = tts_heap_copyslot,
 	.get_heap_tuple = tts_heap_get_heap_tuple,
@@ -1036,6 +1151,7 @@ const TupleTableSlotOps TTSOpsMinimalTuple = {
 	.clear = tts_minimal_clear,
 	.getsomeattrs = tts_minimal_getsomeattrs,
 	.getsysattr = tts_minimal_getsysattr,
+	.is_current_xact_tuple = tts_minimal_is_current_xact_tuple,
 	.materialize = tts_minimal_materialize,
 	.copyslot = tts_minimal_copyslot,
 
@@ -1053,6 +1169,7 @@ const TupleTableSlotOps TTSOpsBufferHeapTuple = {
 	.clear = tts_buffer_heap_clear,
 	.getsomeattrs = tts_buffer_heap_getsomeattrs,
 	.getsysattr = tts_buffer_heap_getsysattr,
+	.is_current_xact_tuple = tts_buffer_is_current_xact_tuple,
 	.materialize = tts_buffer_heap_materialize,
 	.copyslot = tts_buffer_heap_copyslot,
 	.get_heap_tuple = tts_buffer_heap_get_heap_tuple,
@@ -1992,51 +2109,40 @@ ExecTypeFromExprList(List *exprList)
 }
 
 /*
- * ExecTypeSetColNames - set column names in a TupleDesc
+ * ExecTypeSetColNames - set column names in a RECORD TupleDesc
  *
  * Column names must be provided as an alias list (list of String nodes).
- *
- * For some callers, the supplied tupdesc has a named rowtype (not RECORD)
- * and it is moderately likely that the alias list matches the column names
- * already present in the tupdesc.  If we do change any column names then
- * we must reset the tupdesc's type to anonymous RECORD; but we avoid doing
- * so if no names change.
  */
 void
 ExecTypeSetColNames(TupleDesc typeInfo, List *namesList)
 {
-	bool		modified = false;
 	int			colno = 0;
 	ListCell   *lc;
+
+	/* It's only OK to change col names in a not-yet-blessed RECORD type */
+	Assert(typeInfo->tdtypeid == RECORDOID);
+	Assert(typeInfo->tdtypmod < 0);
 
 	foreach(lc, namesList)
 	{
 		char	   *cname = strVal(lfirst(lc));
 		Form_pg_attribute attr;
 
-		/* Guard against too-long names list */
+		/* Guard against too-long names list (probably can't happen) */
 		if (colno >= typeInfo->natts)
 			break;
 		attr = TupleDescAttr(typeInfo, colno);
 		colno++;
 
-		/* Ignore empty aliases (these must be for dropped columns) */
-		if (cname[0] == '\0')
+		/*
+		 * Do nothing for empty aliases or dropped columns (these cases
+		 * probably can't arise in RECORD types, either)
+		 */
+		if (cname[0] == '\0' || attr->attisdropped)
 			continue;
 
-		/* Change tupdesc only if alias is actually different */
-		if (strcmp(cname, NameStr(attr->attname)) != 0)
-		{
-			namestrcpy(&(attr->attname), cname);
-			modified = true;
-		}
-	}
-
-	/* If we modified the tupdesc, it's now a new record type */
-	if (modified)
-	{
-		typeInfo->tdtypeid = RECORDOID;
-		typeInfo->tdtypmod = -1;
+		/* OK, assign the column name */
+		namestrcpy(&(attr->attname), cname);
 	}
 }
 
@@ -2253,7 +2359,7 @@ begin_tup_output_tupdesc(DestReceiver *dest,
  * write a single tuple
  */
 void
-do_tup_output(TupOutputState *tstate, Datum *values, bool *isnull)
+do_tup_output(TupOutputState *tstate, const Datum *values, const bool *isnull)
 {
 	TupleTableSlot *slot = tstate->slot;
 	int			natts = slot->tts_tupleDescriptor->natts;

@@ -2,7 +2,7 @@
  * brin_internal.h
  *		internal declarations for BRIN indexes
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -26,6 +26,9 @@ typedef struct BrinOpcInfo
 {
 	/* Number of columns stored in an index column of this opclass */
 	uint16		oi_nstored;
+
+	/* Regular processing of NULLs in BrinValues? */
+	bool		oi_regular_nulls;
 
 	/* Opaque pointer for the opclass' private use */
 	void	   *oi_opaque;
@@ -91,7 +94,9 @@ extern void brinbuildempty(Relation index);
 extern bool brininsert(Relation idxRel, Datum *values, bool *nulls,
 					   ItemPointer heaptid, Relation heapRel,
 					   IndexUniqueCheck checkUnique,
+					   bool indexUnchanged,
 					   struct IndexInfo *indexInfo);
+extern void brininsertcleanup(struct IndexInfo *indexInfo);
 extern IndexScanDesc brinbeginscan(Relation r, int nkeys, int norderbys);
 extern int64 bringetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
 extern void brinrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,

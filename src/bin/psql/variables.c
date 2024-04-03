@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2024, PostgreSQL Global Development Group
  *
  * src/bin/psql/variables.c
  */
@@ -45,7 +45,7 @@ valid_variable_name(const char *name)
  * that serves as list header.
  *
  * The list entries are kept in name order (according to strcmp).  This
- * is mainly to make the results of PrintVariables() more pleasing.
+ * is mainly to make the output of PrintVariables() more pleasing.
  */
 VariableSpace
 CreateVariableSpace(void)
@@ -255,8 +255,7 @@ SetVariable(VariableSpace space, const char *name, const char *value)
 
 			if (confirmed)
 			{
-				if (current->value)
-					pg_free(current->value);
+				pg_free(current->value);
 				current->value = new_value;
 
 				/*
@@ -272,7 +271,7 @@ SetVariable(VariableSpace space, const char *name, const char *value)
 					free(current);
 				}
 			}
-			else if (new_value)
+			else
 				pg_free(new_value); /* current->value is left unchanged */
 
 			return confirmed;
@@ -358,6 +357,32 @@ SetVariableHooks(VariableSpace space, const char *name,
 		current->value = (*shook) (current->value);
 	if (ahook)
 		(void) (*ahook) (current->value);
+}
+
+/*
+ * Return true iff the named variable has substitute and/or assign hook
+ * functions.
+ */
+bool
+VariableHasHook(VariableSpace space, const char *name)
+{
+	struct _variable *current;
+
+	Assert(space);
+	Assert(name);
+
+	for (current = space->next; current; current = current->next)
+	{
+		int			cmp = strcmp(current->name, name);
+
+		if (cmp == 0)
+			return (current->substitute_hook != NULL ||
+					current->assign_hook != NULL);
+		if (cmp > 0)
+			break;				/* it's not there */
+	}
+
+	return false;
 }
 
 /*

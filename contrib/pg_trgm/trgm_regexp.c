@@ -181,7 +181,7 @@
  * 7) Mark state 3 final because state 5 of source NFA is marked as final.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -196,6 +196,7 @@
 #include "tsearch/ts_locale.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "varatt.h"
 
 /*
  * Uncomment (or use -DTRGM_REGEXP_DEBUG) to print debug info,
@@ -282,8 +283,8 @@ typedef struct
 typedef int TrgmColor;
 
 /* We assume that colors returned by the regexp engine cannot be these: */
-#define COLOR_UNKNOWN	(-1)
-#define COLOR_BLANK		(-2)
+#define COLOR_UNKNOWN	(-3)
+#define COLOR_BLANK		(-4)
 
 typedef struct
 {
@@ -541,27 +542,16 @@ createTrgmNFA(text *text_re, Oid collation,
 	 * Stage 1: Compile the regexp into a NFA, using the regexp library.
 	 */
 #ifdef IGNORECASE
-	RE_compile(&regex, text_re, REG_ADVANCED | REG_ICASE, collation);
+	RE_compile(&regex, text_re,
+			   REG_ADVANCED | REG_NOSUB | REG_ICASE, collation);
 #else
-	RE_compile(&regex, text_re, REG_ADVANCED, collation);
+	RE_compile(&regex, text_re,
+			   REG_ADVANCED | REG_NOSUB, collation);
 #endif
 
-	/*
-	 * Since the regexp library allocates its internal data structures with
-	 * malloc, we need to use a PG_TRY block to ensure that pg_regfree() gets
-	 * done even if there's an error.
-	 */
-	PG_TRY();
-	{
-		trg = createTrgmNFAInternal(&regex, graph, rcontext);
-	}
-	PG_FINALLY();
-	{
-		pg_regfree(&regex);
-	}
-	PG_END_TRY();
+	trg = createTrgmNFAInternal(&regex, graph, rcontext);
 
-	/* Clean up all the cruft we created */
+	/* Clean up all the cruft we created (including regex) */
 	MemoryContextSwitchTo(oldcontext);
 	MemoryContextDelete(tmpcontext);
 
@@ -780,7 +770,8 @@ getColorInfo(regex_t *regex, TrgmNFA *trgmNFA)
 		palloc0(colorsCount * sizeof(TrgmColorInfo));
 
 	/*
-	 * Loop over colors, filling TrgmColorInfo about each.
+	 * Loop over colors, filling TrgmColorInfo about each.  Note we include
+	 * WHITE (0) even though we know it'll be reported as non-expandable.
 	 */
 	for (i = 0; i < colorsCount; i++)
 	{
@@ -904,6 +895,7 @@ transformGraph(TrgmNFA *trgmNFA)
 	HASHCTL		hashCtl;
 	TrgmStateKey initkey;
 	TrgmState  *initstate;
+	ListCell   *lc;
 
 	/* Initialize this stage's workspace in trgmNFA struct */
 	trgmNFA->queue = NIL;
@@ -934,12 +926,13 @@ transformGraph(TrgmNFA *trgmNFA)
 	/*
 	 * Recursively build the expanded graph by processing queue of states
 	 * (breadth-first search).  getState already put initstate in the queue.
+	 * Note that getState will append new states to the queue within the loop,
+	 * too; this works as long as we don't do repeat fetches using the "lc"
+	 * pointer.
 	 */
-	while (trgmNFA->queue != NIL)
+	foreach(lc, trgmNFA->queue)
 	{
-		TrgmState  *state = (TrgmState *) linitial(trgmNFA->queue);
-
-		trgmNFA->queue = list_delete_first(trgmNFA->queue);
+		TrgmState  *state = (TrgmState *) lfirst(lc);
 
 		/*
 		 * If we overflowed then just mark state as final.  Otherwise do
@@ -963,21 +956,28 @@ transformGraph(TrgmNFA *trgmNFA)
 static void
 processState(TrgmNFA *trgmNFA, TrgmState *state)
 {
+	ListCell   *lc;
+
 	/* keysQueue should be NIL already, but make sure */
 	trgmNFA->keysQueue = NIL;
 
 	/*
 	 * Add state's own key, and then process all keys added to keysQueue until
-	 * queue is empty.  But we can quit if the state gets marked final.
+	 * queue is finished.  But we can quit if the state gets marked final.
 	 */
 	addKey(trgmNFA, state, &state->stateKey);
-	while (trgmNFA->keysQueue != NIL && !(state->flags & TSTATE_FIN))
+	foreach(lc, trgmNFA->keysQueue)
 	{
-		TrgmStateKey *key = (TrgmStateKey *) linitial(trgmNFA->keysQueue);
+		TrgmStateKey *key = (TrgmStateKey *) lfirst(lc);
 
-		trgmNFA->keysQueue = list_delete_first(trgmNFA->keysQueue);
+		if (state->flags & TSTATE_FIN)
+			break;
 		addKey(trgmNFA, state, key);
 	}
+
+	/* Release keysQueue to clean up for next cycle */
+	list_free(trgmNFA->keysQueue);
+	trgmNFA->keysQueue = NIL;
 
 	/*
 	 * Add outgoing arcs only if state isn't final (we have no interest in
@@ -1098,9 +1098,9 @@ addKey(TrgmNFA *trgmNFA, TrgmState *state, TrgmStateKey *key)
 			/* Add enter key to this state */
 			addKeyToQueue(trgmNFA, &destKey);
 		}
-		else
+		else if (arc->co >= 0)
 		{
-			/* Regular color */
+			/* Regular color (including WHITE) */
 			TrgmColorInfo *colorInfo = &trgmNFA->colorInfo[arc->co];
 
 			if (colorInfo->expandable)
@@ -1155,6 +1155,14 @@ addKey(TrgmNFA *trgmNFA, TrgmState *state, TrgmStateKey *key)
 				destKey.nstate = arc->to;
 				addKeyToQueue(trgmNFA, &destKey);
 			}
+		}
+		else
+		{
+			/* RAINBOW: treat as unexpandable color */
+			destKey.prefix.colors[0] = COLOR_UNKNOWN;
+			destKey.prefix.colors[1] = COLOR_UNKNOWN;
+			destKey.nstate = arc->to;
+			addKeyToQueue(trgmNFA, &destKey);
 		}
 	}
 
@@ -1211,16 +1219,22 @@ addArcs(TrgmNFA *trgmNFA, TrgmState *state)
 		for (i = 0; i < arcsCount; i++)
 		{
 			regex_arc_t *arc = &arcs[i];
-			TrgmColorInfo *colorInfo = &trgmNFA->colorInfo[arc->co];
+			TrgmColorInfo *colorInfo;
 
 			/*
 			 * Ignore non-expandable colors; addKey already handled the case.
 			 *
-			 * We need no special check for begin/end pseudocolors here.  We
-			 * don't need to do any processing for them, and they will be
-			 * marked non-expandable since the regex engine will have reported
-			 * them that way.
+			 * We need no special check for WHITE or begin/end pseudocolors
+			 * here.  We don't need to do any processing for them, and they
+			 * will be marked non-expandable since the regex engine will have
+			 * reported them that way.  We do have to watch out for RAINBOW,
+			 * which has a negative color number.
 			 */
+			if (arc->co < 0)
+				continue;
+			Assert(arc->co < trgmNFA->ncolors);
+
+			colorInfo = &trgmNFA->colorInfo[arc->co];
 			if (!colorInfo->expandable)
 				continue;
 
@@ -1920,9 +1934,7 @@ packGraph(TrgmNFA *trgmNFA, MemoryContext rcontext)
 				arcsCount;
 	HASH_SEQ_STATUS scan_status;
 	TrgmState  *state;
-	TrgmPackArcInfo *arcs,
-			   *p1,
-			   *p2;
+	TrgmPackArcInfo *arcs;
 	TrgmPackedArc *packedArcs;
 	TrgmPackedGraph *result;
 	int			i,
@@ -1994,17 +2006,25 @@ packGraph(TrgmNFA *trgmNFA, MemoryContext rcontext)
 	qsort(arcs, arcIndex, sizeof(TrgmPackArcInfo), packArcInfoCmp);
 
 	/* We could have duplicates because states were merged. Remove them. */
-	/* p1 is probe point, p2 is last known non-duplicate. */
-	p2 = arcs;
-	for (p1 = arcs + 1; p1 < arcs + arcIndex; p1++)
+	if (arcIndex > 1)
 	{
-		if (packArcInfoCmp(p1, p2) > 0)
+		/* p1 is probe point, p2 is last known non-duplicate. */
+		TrgmPackArcInfo *p1,
+				   *p2;
+
+		p2 = arcs;
+		for (p1 = arcs + 1; p1 < arcs + arcIndex; p1++)
 		{
-			p2++;
-			*p2 = *p1;
+			if (packArcInfoCmp(p1, p2) > 0)
+			{
+				p2++;
+				*p2 = *p1;
+			}
 		}
+		arcsCount = (p2 - arcs) + 1;
 	}
-	arcsCount = (p2 - arcs) + 1;
+	else
+		arcsCount = arcIndex;
 
 	/* Create packed representation */
 	result = (TrgmPackedGraph *)

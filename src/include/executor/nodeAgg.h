@@ -4,7 +4,7 @@
  *	  prototypes for nodeAgg.c
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/nodeAgg.h
@@ -47,6 +47,11 @@ typedef struct AggStatePerTransData
 	 * Is this state value actually being shared by more than one Aggref?
 	 */
 	bool		aggshared;
+
+	/*
+	 * True for ORDER BY and DISTINCT Aggrefs that are not aggpresorted.
+	 */
+	bool		aggsortrequired;
 
 	/*
 	 * Number of aggregated input columns.  This includes ORDER BY expressions
@@ -136,6 +141,9 @@ typedef struct AggStatePerTransData
 	TupleTableSlot *sortslot;	/* current input tuple */
 	TupleTableSlot *uniqslot;	/* used for multi-column DISTINCT */
 	TupleDesc	sortdesc;		/* descriptor of input tuples */
+	Datum		lastdatum;		/* used for single-column DISTINCT */
+	bool		lastisnull;		/* used for single-column DISTINCT */
+	bool		haslast;		/* got a last value for DISTINCT check */
 
 	/*
 	 * These values are working state that is initialized at the start of an
@@ -320,7 +328,7 @@ extern void ExecReScanAgg(AggState *node);
 
 extern Size hash_agg_entry_size(int numTrans, Size tupleWidth,
 								Size transitionSpace);
-extern void hash_agg_set_limits(double hashentrysize, uint64 input_groups,
+extern void hash_agg_set_limits(double hashentrysize, double input_groups,
 								int used_bits, Size *mem_limit,
 								uint64 *ngroups_limit, int *num_partitions);
 

@@ -3,7 +3,7 @@
  * genam.c
  *	  general index access method routines
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,7 +20,6 @@
 #include "postgres.h"
 
 #include "access/genam.h"
-#include "access/heapam.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/transam.h"
@@ -28,14 +27,13 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/procarray.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
-#include "utils/syscache.h"
 
 
 /* ----------------------------------------------------------------
@@ -174,7 +172,7 @@ IndexScanEnd(IndexScanDesc scan)
  */
 char *
 BuildIndexValueDescription(Relation indexRelation,
-						   Datum *values, bool *isnull)
+						   const Datum *values, const bool *isnull)
 {
 	StringInfoData buf;
 	Form_pg_index idxrec;
@@ -274,12 +272,20 @@ BuildIndexValueDescription(Relation indexRelation,
 }
 
 /*
- * Get the latestRemovedXid from the table entries pointed at by the index
- * tuples being deleted.
+ * Get the snapshotConflictHorizon from the table entries pointed to by the
+ * index tuples being deleted using an AM-generic approach.
  *
- * Note: index access methods that don't consistently use the standard
- * IndexTuple + heap TID item pointer representation will need to provide
- * their own version of this function.
+ * This is a table_index_delete_tuples() shim used by index AMs that only need
+ * to consult the tableam to get a snapshotConflictHorizon value, and only
+ * expect to delete index tuples that are already known deletable (typically
+ * due to having LP_DEAD bits set).  When a snapshotConflictHorizon value
+ * isn't needed in index AM's deletion WAL record, it is safe for it to skip
+ * calling here entirely.
+ *
+ * We assume that caller index AM uses the standard IndexTuple representation,
+ * with table TIDs stored in the t_tid field.  We also expect (and assert)
+ * that the line pointers on page for 'itemnos' offsets are already marked
+ * LP_DEAD.
  */
 TransactionId
 index_compute_xid_horizon_for_tuples(Relation irel,
@@ -288,30 +294,52 @@ index_compute_xid_horizon_for_tuples(Relation irel,
 									 OffsetNumber *itemnos,
 									 int nitems)
 {
-	ItemPointerData *ttids =
-	(ItemPointerData *) palloc(sizeof(ItemPointerData) * nitems);
-	TransactionId latestRemovedXid = InvalidTransactionId;
+	TM_IndexDeleteOp delstate;
+	TransactionId snapshotConflictHorizon = InvalidTransactionId;
 	Page		ipage = BufferGetPage(ibuf);
 	IndexTuple	itup;
+
+	Assert(nitems > 0);
+
+	delstate.irel = irel;
+	delstate.iblknum = BufferGetBlockNumber(ibuf);
+	delstate.bottomup = false;
+	delstate.bottomupfreespace = 0;
+	delstate.ndeltids = 0;
+	delstate.deltids = palloc(nitems * sizeof(TM_IndexDelete));
+	delstate.status = palloc(nitems * sizeof(TM_IndexStatus));
 
 	/* identify what the index tuples about to be deleted point to */
 	for (int i = 0; i < nitems; i++)
 	{
+		OffsetNumber offnum = itemnos[i];
 		ItemId		iitemid;
 
-		iitemid = PageGetItemId(ipage, itemnos[i]);
+		iitemid = PageGetItemId(ipage, offnum);
 		itup = (IndexTuple) PageGetItem(ipage, iitemid);
 
-		ItemPointerCopy(&itup->t_tid, &ttids[i]);
+		Assert(ItemIdIsDead(iitemid));
+
+		ItemPointerCopy(&itup->t_tid, &delstate.deltids[i].tid);
+		delstate.deltids[i].id = delstate.ndeltids;
+		delstate.status[i].idxoffnum = offnum;
+		delstate.status[i].knowndeletable = true;	/* LP_DEAD-marked */
+		delstate.status[i].promising = false;	/* unused */
+		delstate.status[i].freespace = 0;	/* unused */
+
+		delstate.ndeltids++;
 	}
 
 	/* determine the actual xid horizon */
-	latestRemovedXid =
-		table_compute_xid_horizon_for_tuples(hrel, ttids, nitems);
+	snapshotConflictHorizon = table_index_delete_tuples(hrel, &delstate);
 
-	pfree(ttids);
+	/* assert tableam agrees that all items are deletable */
+	Assert(delstate.ndeltids == nitems);
 
-	return latestRemovedXid;
+	pfree(delstate.deltids);
+	pfree(delstate.status);
+
+	return snapshotConflictHorizon;
 }
 
 
@@ -429,7 +457,34 @@ systable_beginscan(Relation heapRelation,
 		sysscan->iscan = NULL;
 	}
 
+	/*
+	 * If CheckXidAlive is set then set a flag to indicate that system table
+	 * scan is in-progress.  See detailed comments in xact.c where these
+	 * variables are declared.
+	 */
+	if (TransactionIdIsValid(CheckXidAlive))
+		bsysscan = true;
+
 	return sysscan;
+}
+
+/*
+ * HandleConcurrentAbort - Handle concurrent abort of the CheckXidAlive.
+ *
+ * Error out, if CheckXidAlive is aborted. We can't directly use
+ * TransactionIdDidAbort as after crash such transaction might not have been
+ * marked as aborted.  See detailed comments in xact.c where the variable
+ * is declared.
+ */
+static inline void
+HandleConcurrentAbort()
+{
+	if (TransactionIdIsValid(CheckXidAlive) &&
+		!TransactionIdIsInProgress(CheckXidAlive) &&
+		!TransactionIdDidCommit(CheckXidAlive))
+		ereport(ERROR,
+				(errcode(ERRCODE_TRANSACTION_ROLLBACK),
+				 errmsg("transaction aborted during system catalog scan")));
 }
 
 /*
@@ -481,6 +536,12 @@ systable_getnext(SysScanDesc sysscan)
 		}
 	}
 
+	/*
+	 * Handle the concurrent abort while fetching the catalog tuple during
+	 * logical streaming of a transaction.
+	 */
+	HandleConcurrentAbort();
+
 	return htup;
 }
 
@@ -517,6 +578,12 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 											sysscan->slot,
 											freshsnap);
 
+	/*
+	 * Handle the concurrent abort while fetching the catalog tuple during
+	 * logical streaming of a transaction.
+	 */
+	HandleConcurrentAbort();
+
 	return result;
 }
 
@@ -545,6 +612,13 @@ systable_endscan(SysScanDesc sysscan)
 	if (sysscan->snapshot)
 		UnregisterSnapshot(sysscan->snapshot);
 
+	/*
+	 * Reset the bsysscan flag at the end of the systable scan.  See detailed
+	 * comments in xact.c where these variables are declared.
+	 */
+	if (TransactionIdIsValid(CheckXidAlive))
+		bsysscan = false;
+
 	pfree(sysscan);
 }
 
@@ -560,7 +634,7 @@ systable_endscan(SysScanDesc sysscan)
  * Currently we do not support non-index-based scans here.  (In principle
  * we could do a heapscan and sort, but the uses are in places that
  * probably don't need to still work with corrupted catalog indexes.)
- * For the moment, therefore, these functions are merely the thinnest of
+ * For the moment, therefore, these functions are merely the thinest of
  * wrappers around index_beginscan/index_getnext_slot.  The main reason for
  * their existence is to centralize possible future support of lossy operators
  * in catalog scans.
@@ -576,8 +650,10 @@ systable_beginscan_ordered(Relation heapRelation,
 
 	/* REINDEX can probably be a hard error here ... */
 	if (ReindexIsProcessingIndex(RelationGetRelid(indexRelation)))
-		elog(ERROR, "cannot do ordered scan on index \"%s\", because it is being reindexed",
-			 RelationGetRelationName(indexRelation));
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot access index \"%s\" while it is being reindexed",
+						RelationGetRelationName(indexRelation))));
 	/* ... but we only throw a warning about violating IgnoreSystemIndexes */
 	if (IgnoreSystemIndexes)
 		elog(WARNING, "using index \"%s\" despite IgnoreSystemIndexes",
@@ -642,6 +718,12 @@ systable_getnext_ordered(SysScanDesc sysscan, ScanDirection direction)
 	/* See notes in systable_getnext */
 	if (htup && sysscan->iscan->xs_recheck)
 		elog(ERROR, "system catalog scans with lossy index conditions are not implemented");
+
+	/*
+	 * Handle the concurrent abort while fetching the catalog tuple during
+	 * logical streaming of a transaction.
+	 */
+	HandleConcurrentAbort();
 
 	return htup;
 }

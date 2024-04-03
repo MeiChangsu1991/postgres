@@ -99,15 +99,70 @@ SELECT bt_index_parent_check('delete_test_table_pkey', true);
 -- tuple.  Bloom filter must fingerprint normalized index tuple representation.
 --
 CREATE TABLE toast_bug(buggy text);
-ALTER TABLE toast_bug ALTER COLUMN buggy SET STORAGE plain;
--- pg_attribute entry for toasty.buggy will have plain storage:
-CREATE INDEX toasty ON toast_bug(buggy);
--- Whereas pg_attribute entry for toast_bug.buggy now has extended storage:
 ALTER TABLE toast_bug ALTER COLUMN buggy SET STORAGE extended;
+CREATE INDEX toasty ON toast_bug(buggy);
+
+-- pg_attribute entry for toasty.buggy (the index) will have plain storage:
+UPDATE pg_attribute SET attstorage = 'p'
+WHERE attrelid = 'toasty'::regclass AND attname = 'buggy';
+
+-- Whereas pg_attribute entry for toast_bug.buggy (the table) still has extended storage:
+SELECT attstorage FROM pg_attribute
+WHERE attrelid = 'toast_bug'::regclass AND attname = 'buggy';
+
 -- Insert compressible heap tuple (comfortably exceeds TOAST_TUPLE_THRESHOLD):
 INSERT INTO toast_bug SELECT repeat('a', 2200);
 -- Should not get false positive report of corruption:
 SELECT bt_index_check('toasty', true);
+
+--
+-- Check that index expressions and predicates are run as the table's owner
+--
+TRUNCATE bttest_a;
+INSERT INTO bttest_a SELECT * FROM generate_series(1, 1000);
+ALTER TABLE bttest_a OWNER TO regress_bttest_role;
+-- A dummy index function checking current_user
+CREATE FUNCTION ifun(int8) RETURNS int8 AS $$
+BEGIN
+	ASSERT current_user = 'regress_bttest_role',
+		format('ifun(%s) called by %s', $1, current_user);
+	RETURN $1;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE INDEX bttest_a_expr_idx ON bttest_a ((ifun(id) + ifun(0)))
+	WHERE ifun(id + 10) > ifun(10);
+
+SELECT bt_index_check('bttest_a_expr_idx', true);
+
+-- UNIQUE constraint check
+SELECT bt_index_check('bttest_a_idx', heapallindexed => true, checkunique => true);
+SELECT bt_index_check('bttest_b_idx', heapallindexed => false, checkunique => true);
+SELECT bt_index_parent_check('bttest_a_idx', heapallindexed => true, rootdescend => true, checkunique => true);
+SELECT bt_index_parent_check('bttest_b_idx', heapallindexed => true, rootdescend => false, checkunique => true);
+
+-- Check that null values in an unique index are not treated as equal
+CREATE TABLE bttest_unique_nulls (a serial, b int, c int UNIQUE);
+INSERT INTO bttest_unique_nulls VALUES (generate_series(1, 10000), 2, default);
+SELECT bt_index_check('bttest_unique_nulls_c_key', heapallindexed => true, checkunique => true);
+CREATE INDEX on bttest_unique_nulls (b,c);
+SELECT bt_index_check('bttest_unique_nulls_b_c_idx', heapallindexed => true, checkunique => true);
+
+-- Check support of both 1B and 4B header sizes of short varlena datum
+CREATE TABLE varlena_bug (v text);
+ALTER TABLE varlena_bug ALTER column v SET storage plain;
+INSERT INTO varlena_bug VALUES ('x');
+COPY varlena_bug from stdin;
+x
+\.
+CREATE INDEX varlena_bug_idx on varlena_bug(v);
+SELECT bt_index_check('varlena_bug_idx', true);
+
+-- Also check that we compress varlena values, which were previously stored
+-- uncompressed in index.
+INSERT INTO varlena_bug VALUES (repeat('Test', 250));
+ALTER TABLE varlena_bug ALTER COLUMN v SET STORAGE extended;
+SELECT bt_index_check('varlena_bug_idx', true);
 
 -- cleanup
 DROP TABLE bttest_a;
@@ -115,5 +170,8 @@ DROP TABLE bttest_b;
 DROP TABLE bttest_multi;
 DROP TABLE delete_test_table;
 DROP TABLE toast_bug;
+DROP FUNCTION ifun(int8);
+DROP TABLE bttest_unique_nulls;
 DROP OWNED BY regress_bttest_role; -- permissions
 DROP ROLE regress_bttest_role;
+DROP TABLE varlena_bug;

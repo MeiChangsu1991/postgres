@@ -1,7 +1,8 @@
 <!-- doc/src/sgml/pgtrgm.sgml -->
 
 <sect1 id="pgtrgm" xreflabel="pg_trgm">
- <title>pg_trgm</title>
+ <title>pg_trgm &mdash;
+   support for similarity of text using trigram matching</title>
 
  <indexterm zone="pgtrgm">
   <primary>pg_trgm</primary>
@@ -21,7 +22,7 @@
   on the current database.
  </para>
 
- <sect2>
+ <sect2 id="pgtrgm-concepts">
   <title>Trigram (or Trigraph) Concepts</title>
 
   <para>
@@ -59,7 +60,7 @@
   </note>
  </sect2>
 
- <sect2>
+ <sect2 id="pgtrgm-funcs-ops">
   <title>Functions and Operators</title>
 
   <para>
@@ -355,7 +356,7 @@
   </table>
  </sect2>
 
- <sect2>
+ <sect2 id="pgtrgm-guc">
   <title>GUC Parameters</title>
 
   <variablelist>
@@ -377,9 +378,7 @@
     <term>
      <varname>pg_trgm.word_similarity_threshold</varname> (<type>real</type>)
      <indexterm>
-      <primary>
-       <varname>pg_trgm.word_similarity_threshold</varname> configuration parameter
-      </primary>
+      <primary><varname>pg_trgm.word_similarity_threshold</varname> configuration parameter</primary>
      </indexterm>
     </term>
     <listitem>
@@ -394,9 +393,7 @@
     <term>
      <varname>pg_trgm.strict_word_similarity_threshold</varname> (<type>real</type>)
      <indexterm>
-      <primary>
-       <varname>pg_trgm.strict_word_similarity_threshold</varname> configuration parameter
-      </primary>
+      <primary><varname>pg_trgm.strict_word_similarity_threshold</varname> configuration parameter</primary>
      </indexterm>
     </term>
     <listitem>
@@ -410,7 +407,7 @@
   </variablelist>
  </sect2>
 
- <sect2>
+ <sect2 id="pgtrgm-index">
   <title>Index Support</title>
 
   <para>
@@ -419,9 +416,12 @@
    the purpose of very fast similarity searches.  These index types support
    the above-described similarity operators, and additionally support
    trigram-based index searches for <literal>LIKE</literal>, <literal>ILIKE</literal>,
-   <literal>~</literal> and <literal>~*</literal> queries.  (These indexes do not
-   support equality nor simple comparison operators, so you may need a
-   regular B-tree index too.)
+   <literal>~</literal>, <literal>~*</literal> and <literal>=</literal> queries.
+   The similarity comparisons are case-insensitive in a default build of
+   <filename>pg_trgm</filename>.
+   Inequality operators are not supported.
+   Note that those indexes may not be as efficient as regular B-tree indexes
+   for equality operator.
   </para>
 
   <para>
@@ -560,7 +560,7 @@ SELECT * FROM test_trgm WHERE t ~ '(foo|bar)';
   </para>
  </sect2>
 
- <sect2>
+ <sect2 id="pgtrgm-text-search">
   <title>Text Search Integration</title>
 
   <para>
@@ -609,7 +609,7 @@ CREATE INDEX words_idx ON words USING GIN (word gin_trgm_ops);
   </note>
  </sect2>
 
- <sect2>
+ <sect2 id="pgtrgm-references">
   <title>References</title>
 
   <para>
@@ -622,7 +622,7 @@ CREATE INDEX words_idx ON words USING GIN (word gin_trgm_ops);
   </para>
  </sect2>
 
- <sect2>
+ <sect2 id="pgtrgm-authors">
   <title>Authors</title>
 
   <para>

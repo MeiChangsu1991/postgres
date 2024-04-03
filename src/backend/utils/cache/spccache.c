@@ -8,7 +8,7 @@
  * be a measurable performance gain from doing this, but that might change
  * in the future as we add more options.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -29,6 +29,7 @@
 #include "utils/inval.h"
 #include "utils/spccache.h"
 #include "utils/syscache.h"
+#include "varatt.h"
 
 
 /* Hash table for information about each tablespace */
@@ -62,7 +63,7 @@ InvalidateTableSpaceCacheCallback(Datum arg, int cacheid, uint32 hashvalue)
 		if (spc->opts)
 			pfree(spc->opts);
 		if (hash_search(TableSpaceCacheHash,
-						(void *) &spc->oid,
+						&spc->oid,
 						HASH_REMOVE,
 						NULL) == NULL)
 			elog(ERROR, "hash table corrupted");
@@ -79,7 +80,6 @@ InitializeTableSpaceCache(void)
 	HASHCTL		ctl;
 
 	/* Initialize the hash table. */
-	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(Oid);
 	ctl.entrysize = sizeof(TableSpaceCacheEntry);
 	TableSpaceCacheHash =
@@ -121,7 +121,7 @@ get_tablespace(Oid spcid)
 	if (!TableSpaceCacheHash)
 		InitializeTableSpaceCache();
 	spc = (TableSpaceCacheEntry *) hash_search(TableSpaceCacheHash,
-											   (void *) &spcid,
+											   &spcid,
 											   HASH_FIND,
 											   NULL);
 	if (spc)
@@ -163,7 +163,7 @@ get_tablespace(Oid spcid)
 	 * flush.
 	 */
 	spc = (TableSpaceCacheEntry *) hash_search(TableSpaceCacheHash,
-											   (void *) &spcid,
+											   &spcid,
 											   HASH_ENTER,
 											   NULL);
 	spc->opts = opts;

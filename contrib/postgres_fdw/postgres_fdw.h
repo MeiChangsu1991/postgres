@@ -3,7 +3,7 @@
  * postgres_fdw.h
  *		  Foreign-data wrapper for remote PostgreSQL servers
  *
- * Portions Copyright (c) 2012-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/postgres_fdw/postgres_fdw.h
@@ -16,6 +16,7 @@
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
 #include "libpq-fe.h"
+#include "nodes/execnodes.h"
 #include "nodes/pathnodes.h"
 #include "utils/relcache.h"
 
@@ -77,7 +78,8 @@ typedef struct PgFdwRelationInfo
 	bool		use_remote_estimate;
 	Cost		fdw_startup_cost;
 	Cost		fdw_tuple_cost;
-	List	   *shippable_extensions;	/* OIDs of whitelisted extensions */
+	List	   *shippable_extensions;	/* OIDs of shippable extensions */
+	bool		async_capable;
 
 	/* Cached catalog information. */
 	ForeignTable *table;
@@ -116,6 +118,10 @@ typedef struct PgFdwRelationInfo
 										 * subquery? */
 	Relids		lower_subquery_rels;	/* all relids appearing in lower
 										 * subqueries */
+	Relids		hidden_subquery_rels;	/* relids, which can't be referred to
+										 * from upper relations, used
+										 * internally for equivalence member
+										 * search */
 
 	/*
 	 * Index of the relation.  It is used to create an alias to a subquery
@@ -124,17 +130,41 @@ typedef struct PgFdwRelationInfo
 	int			relation_index;
 } PgFdwRelationInfo;
 
+/*
+ * Extra control information relating to a connection.
+ */
+typedef struct PgFdwConnState
+{
+	AsyncRequest *pendingAreq;	/* pending async request */
+} PgFdwConnState;
+
+/*
+ * Method used by ANALYZE to sample remote rows.
+ */
+typedef enum PgFdwSamplingMethod
+{
+	ANALYZE_SAMPLE_OFF,			/* no remote sampling */
+	ANALYZE_SAMPLE_AUTO,		/* choose by server version */
+	ANALYZE_SAMPLE_RANDOM,		/* remote random() */
+	ANALYZE_SAMPLE_SYSTEM,		/* TABLESAMPLE system */
+	ANALYZE_SAMPLE_BERNOULLI,	/* TABLESAMPLE bernoulli */
+} PgFdwSamplingMethod;
+
 /* in postgres_fdw.c */
 extern int	set_transmission_modes(void);
 extern void reset_transmission_modes(int nestlevel);
+extern void process_pending_request(AsyncRequest *areq);
 
 /* in connection.c */
-extern PGconn *GetConnection(UserMapping *user, bool will_prep_stmt);
+extern PGconn *GetConnection(UserMapping *user, bool will_prep_stmt,
+							 PgFdwConnState **state);
 extern void ReleaseConnection(PGconn *conn);
 extern unsigned int GetCursorNumber(PGconn *conn);
 extern unsigned int GetPrepStmtNumber(PGconn *conn);
-extern PGresult *pgfdw_get_result(PGconn *conn, const char *query);
-extern PGresult *pgfdw_exec_query(PGconn *conn, const char *query);
+extern void do_sql_command(PGconn *conn, const char *sql);
+extern PGresult *pgfdw_get_result(PGconn *conn);
+extern PGresult *pgfdw_exec_query(PGconn *conn, const char *query,
+								  PgFdwConnState *state);
 extern void pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
 							   bool clear, const char *sql);
 
@@ -144,6 +174,8 @@ extern int	ExtractConnectionOptions(List *defelems,
 									 const char **values);
 extern List *ExtractExtensionList(const char *extensionsString,
 								  bool warnOnMissing);
+extern char *process_pgfdw_appname(const char *appname);
+extern char *pgfdw_application_name;
 
 /* in deparse.c */
 extern void classifyConditions(PlannerInfo *root,
@@ -157,11 +189,18 @@ extern bool is_foreign_expr(PlannerInfo *root,
 extern bool is_foreign_param(PlannerInfo *root,
 							 RelOptInfo *baserel,
 							 Expr *expr);
+extern bool is_foreign_pathkey(PlannerInfo *root,
+							   RelOptInfo *baserel,
+							   PathKey *pathkey);
 extern void deparseInsertSql(StringInfo buf, RangeTblEntry *rte,
 							 Index rtindex, Relation rel,
 							 List *targetAttrs, bool doNothing,
 							 List *withCheckOptionList, List *returningList,
-							 List **retrieved_attrs);
+							 List **retrieved_attrs, int *values_end_len);
+extern void rebuildInsertSql(StringInfo buf, Relation rel,
+							 char *orig_query, List *target_attrs,
+							 int values_end_len, int num_params,
+							 int num_rows);
 extern void deparseUpdateSql(StringInfo buf, RangeTblEntry *rte,
 							 Index rtindex, Relation rel,
 							 List *targetAttrs,
@@ -188,16 +227,25 @@ extern void deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
 								   List *returningList,
 								   List **retrieved_attrs);
 extern void deparseAnalyzeSizeSql(StringInfo buf, Relation rel);
+extern void deparseAnalyzeInfoSql(StringInfo buf, Relation rel);
 extern void deparseAnalyzeSql(StringInfo buf, Relation rel,
+							  PgFdwSamplingMethod sample_method,
+							  double sample_frac,
 							  List **retrieved_attrs);
+extern void deparseTruncateSql(StringInfo buf,
+							   List *rels,
+							   DropBehavior behavior,
+							   bool restart_seqs);
 extern void deparseStringLiteral(StringInfo buf, const char *val);
-extern Expr *find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
-extern Expr *find_em_expr_for_input_target(PlannerInfo *root,
-										   EquivalenceClass *ec,
-										   PathTarget *target);
+extern EquivalenceMember *find_em_for_rel(PlannerInfo *root,
+										  EquivalenceClass *ec,
+										  RelOptInfo *rel);
+extern EquivalenceMember *find_em_for_rel_target(PlannerInfo *root,
+												 EquivalenceClass *ec,
+												 RelOptInfo *rel);
 extern List *build_tlist_to_deparse(RelOptInfo *foreignrel);
 extern void deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root,
-									RelOptInfo *foreignrel, List *tlist,
+									RelOptInfo *rel, List *tlist,
 									List *remote_conds, List *pathkeys,
 									bool has_final_sort, bool has_limit,
 									bool is_subquery,

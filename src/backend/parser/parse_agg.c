@@ -3,7 +3,7 @@
  * parse_agg.c
  *	  handle aggregates and window functions in parser
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,9 +14,11 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_type.h"
+#include "common/int.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
@@ -28,7 +30,7 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
-
+#include "utils/syscache.h"
 
 typedef struct
 {
@@ -109,18 +111,6 @@ transformAggregateCall(ParseState *pstate, Aggref *agg,
 	AttrNumber	attno = 1;
 	int			save_next_resno;
 	ListCell   *lc;
-
-	/*
-	 * Before separating the args into direct and aggregated args, make a list
-	 * of their data type OIDs for use later.
-	 */
-	foreach(lc, args)
-	{
-		Expr	   *arg = (Expr *) lfirst(lc);
-
-		argtypes = lappend_oid(argtypes, exprType((Node *) arg));
-	}
-	agg->aggargtypes = argtypes;
 
 	if (AGGKIND_IS_ORDERED_SET(agg->aggkind))
 	{
@@ -232,6 +222,29 @@ transformAggregateCall(ParseState *pstate, Aggref *agg,
 	agg->args = tlist;
 	agg->aggorder = torder;
 	agg->aggdistinct = tdistinct;
+
+	/*
+	 * Now build the aggargtypes list with the type OIDs of the direct and
+	 * aggregated args, ignoring any resjunk entries that might have been
+	 * added by ORDER BY/DISTINCT processing.  We can't do this earlier
+	 * because said processing can modify some args' data types, in particular
+	 * by resolving previously-unresolved "unknown" literals.
+	 */
+	foreach(lc, agg->aggdirectargs)
+	{
+		Expr	   *arg = (Expr *) lfirst(lc);
+
+		argtypes = lappend_oid(argtypes, exprType((Node *) arg));
+	}
+	foreach(lc, tlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+		if (tle->resjunk)
+			continue;			/* ignore junk */
+		argtypes = lappend_oid(argtypes, exprType((Node *) tle->expr));
+	}
+	agg->aggargtypes = argtypes;
 
 	check_agglevels_and_constraints(pstate, (Node *) agg);
 }
@@ -434,6 +447,13 @@ check_agglevels_and_constraints(ParseState *pstate, Node *expr)
 		case EXPR_KIND_UPDATE_TARGET:
 			errkind = true;
 			break;
+		case EXPR_KIND_MERGE_WHEN:
+			if (isAgg)
+				err = _("aggregate functions are not allowed in MERGE WHEN conditions");
+			else
+				err = _("grouping operations are not allowed in MERGE WHEN conditions");
+
+			break;
 		case EXPR_KIND_GROUP_BY:
 			errkind = true;
 			break;
@@ -448,6 +468,7 @@ check_agglevels_and_constraints(ParseState *pstate, Node *expr)
 			errkind = true;
 			break;
 		case EXPR_KIND_RETURNING:
+		case EXPR_KIND_MERGE_RETURNING:
 			errkind = true;
 			break;
 		case EXPR_KIND_VALUES:
@@ -483,6 +504,13 @@ check_agglevels_and_constraints(ParseState *pstate, Node *expr)
 				err = _("aggregate functions are not allowed in index predicates");
 			else
 				err = _("grouping operations are not allowed in index predicates");
+
+			break;
+		case EXPR_KIND_STATS_EXPRESSION:
+			if (isAgg)
+				err = _("aggregate functions are not allowed in statistics expressions");
+			else
+				err = _("grouping operations are not allowed in statistics expressions");
 
 			break;
 		case EXPR_KIND_ALTER_COL_TRANSFORM:
@@ -543,6 +571,10 @@ check_agglevels_and_constraints(ParseState *pstate, Node *expr)
 			else
 				err = _("grouping operations are not allowed in COPY FROM WHERE conditions");
 
+			break;
+
+		case EXPR_KIND_CYCLE_MARK:
+			errkind = true;
 			break;
 
 			/*
@@ -616,13 +648,8 @@ check_agg_arguments(ParseState *pstate,
 	context.min_agglevel = -1;
 	context.sublevels_up = 0;
 
-	(void) expression_tree_walker((Node *) args,
-								  check_agg_arguments_walker,
-								  (void *) &context);
-
-	(void) expression_tree_walker((Node *) filter,
-								  check_agg_arguments_walker,
-								  (void *) &context);
+	(void) check_agg_arguments_walker((Node *) args, &context);
+	(void) check_agg_arguments_walker((Node *) filter, &context);
 
 	/*
 	 * If we found no vars nor aggs at all, it's a level-zero aggregate;
@@ -669,9 +696,7 @@ check_agg_arguments(ParseState *pstate,
 	{
 		context.min_varlevel = -1;
 		context.min_agglevel = -1;
-		(void) expression_tree_walker((Node *) directargs,
-									  check_agg_arguments_walker,
-									  (void *) &context);
+		(void) check_agg_arguments_walker((Node *) directargs, &context);
 		if (context.min_varlevel >= 0 && context.min_varlevel < agglevel)
 			ereport(ERROR,
 					(errcode(ERRCODE_GROUPING_ERROR),
@@ -724,8 +749,7 @@ check_agg_arguments_walker(Node *node,
 				context->min_agglevel > agglevelsup)
 				context->min_agglevel = agglevelsup;
 		}
-		/* no need to examine args of the inner aggregate */
-		return false;
+		/* Continue and descend into subtree */
 	}
 	if (IsA(node, GroupingFunc))
 	{
@@ -875,6 +899,9 @@ transformWindowFuncCall(ParseState *pstate, WindowFunc *wfunc,
 		case EXPR_KIND_UPDATE_TARGET:
 			errkind = true;
 			break;
+		case EXPR_KIND_MERGE_WHEN:
+			err = _("window functions are not allowed in MERGE WHEN conditions");
+			break;
 		case EXPR_KIND_GROUP_BY:
 			errkind = true;
 			break;
@@ -889,6 +916,7 @@ transformWindowFuncCall(ParseState *pstate, WindowFunc *wfunc,
 			errkind = true;
 			break;
 		case EXPR_KIND_RETURNING:
+		case EXPR_KIND_MERGE_RETURNING:
 			errkind = true;
 			break;
 		case EXPR_KIND_VALUES:
@@ -905,6 +933,9 @@ transformWindowFuncCall(ParseState *pstate, WindowFunc *wfunc,
 			break;
 		case EXPR_KIND_INDEX_EXPRESSION:
 			err = _("window functions are not allowed in index expressions");
+			break;
+		case EXPR_KIND_STATS_EXPRESSION:
+			err = _("window functions are not allowed in statistics expressions");
 			break;
 		case EXPR_KIND_INDEX_PREDICATE:
 			err = _("window functions are not allowed in index predicates");
@@ -932,6 +963,9 @@ transformWindowFuncCall(ParseState *pstate, WindowFunc *wfunc,
 			break;
 		case EXPR_KIND_GENERATED_COLUMN:
 			err = _("window functions are not allowed in column generation expressions");
+			break;
+		case EXPR_KIND_CYCLE_MARK:
+			errkind = true;
 			break;
 
 			/*
@@ -1005,6 +1039,10 @@ transformWindowFuncCall(ParseState *pstate, WindowFunc *wfunc,
 				 /* matched, no refname */ ;
 			else
 				continue;
+
+			/*
+			 * Also see similar de-duplication code in optimize_window_clauses
+			 */
 			if (equal(refwin->partitionClause, windef->partitionClause) &&
 				equal(refwin->orderClause, windef->orderClause) &&
 				refwin->frameOptions == windef->frameOptions &&
@@ -1064,7 +1102,7 @@ parseCheckAggregates(ParseState *pstate, Query *qry)
 		 * The limit of 4096 is arbitrary and exists simply to avoid resource
 		 * issues from pathological constructs.
 		 */
-		List	   *gsets = expand_grouping_sets(qry->groupingSets, 4096);
+		List	   *gsets = expand_grouping_sets(qry->groupingSets, qry->groupDistinct, 4096);
 
 		if (!gsets)
 			ereport(ERROR,
@@ -1083,7 +1121,7 @@ parseCheckAggregates(ParseState *pstate, Query *qry)
 
 		if (gset_common)
 		{
-			for_each_cell(l, gsets, list_second_cell(gsets))
+			for_each_from(l, gsets, 1)
 			{
 				gset_common = list_intersection_int(gset_common, lfirst(l));
 				if (!gset_common)
@@ -1142,7 +1180,7 @@ parseCheckAggregates(ParseState *pstate, Query *qry)
 	 * entries are RTE_JOIN kind.
 	 */
 	if (hasJoinRTEs)
-		groupClauses = (List *) flatten_join_alias_vars(qry,
+		groupClauses = (List *) flatten_join_alias_vars(NULL, qry,
 														(Node *) groupClauses);
 
 	/*
@@ -1186,7 +1224,7 @@ parseCheckAggregates(ParseState *pstate, Query *qry)
 							groupClauses, hasJoinRTEs,
 							have_non_var_grouping);
 	if (hasJoinRTEs)
-		clause = flatten_join_alias_vars(qry, clause);
+		clause = flatten_join_alias_vars(NULL, qry, clause);
 	check_ungrouped_columns(clause, pstate, qry,
 							groupClauses, groupClauseCommonVars,
 							have_non_var_grouping,
@@ -1197,7 +1235,7 @@ parseCheckAggregates(ParseState *pstate, Query *qry)
 							groupClauses, hasJoinRTEs,
 							have_non_var_grouping);
 	if (hasJoinRTEs)
-		clause = flatten_join_alias_vars(qry, clause);
+		clause = flatten_join_alias_vars(NULL, qry, clause);
 	check_ungrouped_columns(clause, pstate, qry,
 							groupClauses, groupClauseCommonVars,
 							have_non_var_grouping,
@@ -1526,7 +1564,7 @@ finalize_grouping_exprs_walker(Node *node,
 				Index		ref = 0;
 
 				if (context->hasJoinRTEs)
-					expr = flatten_join_alias_vars(context->qry, expr);
+					expr = flatten_join_alias_vars(NULL, context->qry, expr);
 
 				/*
 				 * Each expression must match a grouping entry at the current
@@ -1725,7 +1763,35 @@ cmp_list_len_asc(const ListCell *a, const ListCell *b)
 	int			la = list_length((const List *) lfirst(a));
 	int			lb = list_length((const List *) lfirst(b));
 
-	return (la > lb) ? 1 : (la == lb) ? 0 : -1;
+	return pg_cmp_s32(la, lb);
+}
+
+/* list_sort comparator to sort sub-lists by length and contents */
+static int
+cmp_list_len_contents_asc(const ListCell *a, const ListCell *b)
+{
+	int			res = cmp_list_len_asc(a, b);
+
+	if (res == 0)
+	{
+		List	   *la = (List *) lfirst(a);
+		List	   *lb = (List *) lfirst(b);
+		ListCell   *lca;
+		ListCell   *lcb;
+
+		forboth(lca, la, lcb, lb)
+		{
+			int			va = lfirst_int(lca);
+			int			vb = lfirst_int(lcb);
+
+			if (va > vb)
+				return 1;
+			if (va < vb)
+				return -1;
+		}
+	}
+
+	return res;
 }
 
 /*
@@ -1736,7 +1802,7 @@ cmp_list_len_asc(const ListCell *a, const ListCell *b)
  * some consistency checks.
  */
 List *
-expand_grouping_sets(List *groupingSets, int limit)
+expand_grouping_sets(List *groupingSets, bool groupDistinct, int limit)
 {
 	List	   *expanded_groups = NIL;
 	List	   *result = NIL;
@@ -1774,7 +1840,7 @@ expand_grouping_sets(List *groupingSets, int limit)
 		result = lappend(result, list_union_int(NIL, (List *) lfirst(lc)));
 	}
 
-	for_each_cell(lc, expanded_groups, list_second_cell(expanded_groups))
+	for_each_from(lc, expanded_groups, 1)
 	{
 		List	   *p = lfirst(lc);
 		List	   *new_result = NIL;
@@ -1794,8 +1860,31 @@ expand_grouping_sets(List *groupingSets, int limit)
 		result = new_result;
 	}
 
-	/* Now sort the lists by length */
-	list_sort(result, cmp_list_len_asc);
+	/* Now sort the lists by length and deduplicate if necessary */
+	if (!groupDistinct || list_length(result) < 2)
+		list_sort(result, cmp_list_len_asc);
+	else
+	{
+		ListCell   *cell;
+		List	   *prev;
+
+		/* Sort each groupset individually */
+		foreach(cell, result)
+			list_sort(lfirst(cell), list_int_cmp);
+
+		/* Now sort the list of groupsets by length and contents */
+		list_sort(result, cmp_list_len_contents_asc);
+
+		/* Finally, remove duplicates */
+		prev = linitial(result);
+		for_each_from(cell, result, 1)
+		{
+			if (equal(lfirst(cell), prev))
+				result = foreach_delete_current(result, cell);
+			else
+				prev = lfirst(cell);
+		}
+	}
 
 	return result;
 }
@@ -1873,6 +1962,40 @@ resolve_aggregate_transtype(Oid aggfuncid,
 }
 
 /*
+ * agg_args_support_sendreceive
+ *		Returns true if all non-byval of aggref's arg types have send and
+ *		receive functions.
+ */
+bool
+agg_args_support_sendreceive(Aggref *aggref)
+{
+	ListCell   *lc;
+
+	foreach(lc, aggref->args)
+	{
+		HeapTuple	typeTuple;
+		Form_pg_type pt;
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		Oid			type = exprType((Node *) tle->expr);
+
+		typeTuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+		if (!HeapTupleIsValid(typeTuple))
+			elog(ERROR, "cache lookup failed for type %u", type);
+
+		pt = (Form_pg_type) GETSTRUCT(typeTuple);
+
+		if (!pt->typbyval &&
+			(!OidIsValid(pt->typsend) || !OidIsValid(pt->typreceive)))
+		{
+			ReleaseSysCache(typeTuple);
+			return false;
+		}
+		ReleaseSysCache(typeTuple);
+	}
+	return true;
+}
+
+/*
  * Create an expression tree for the transition function of an aggregate.
  * This is needed so that polymorphic functions can be used within an
  * aggregate --- without the expression tree, such functions would not know
@@ -1890,6 +2013,11 @@ resolve_aggregate_transtype(Oid aggfuncid,
  * transfn_oid and invtransfn_oid identify the funcs to be called; the
  * latter may be InvalidOid, however if invtransfn_oid is set then
  * transfn_oid must also be set.
+ *
+ * transfn_oid may also be passed as the aggcombinefn when the *transfnexpr is
+ * to be used for a combine aggregate phase.  We expect invtransfn_oid to be
+ * InvalidOid in this case since there is no such thing as an inverse
+ * combinefn.
  *
  * Pointers to the constructed trees are returned into *transfnexpr,
  * *invtransfnexpr. If there is no invtransfn, the respective pointer is set
@@ -1951,35 +2079,6 @@ build_aggregate_transfn_expr(Oid *agg_input_types,
 		else
 			*invtransfnexpr = NULL;
 	}
-}
-
-/*
- * Like build_aggregate_transfn_expr, but creates an expression tree for the
- * combine function of an aggregate, rather than the transition function.
- */
-void
-build_aggregate_combinefn_expr(Oid agg_state_type,
-							   Oid agg_input_collation,
-							   Oid combinefn_oid,
-							   Expr **combinefnexpr)
-{
-	Node	   *argp;
-	List	   *args;
-	FuncExpr   *fexpr;
-
-	/* combinefn takes two arguments of the aggregate state type */
-	argp = make_agg_arg(agg_state_type, agg_input_collation);
-
-	args = list_make2(argp, argp);
-
-	fexpr = makeFuncExpr(combinefn_oid,
-						 agg_state_type,
-						 args,
-						 InvalidOid,
-						 agg_input_collation,
-						 COERCE_EXPLICIT_CALL);
-	/* combinefn is currently never treated as variadic */
-	*combinefnexpr = (Expr *) fexpr;
 }
 
 /*

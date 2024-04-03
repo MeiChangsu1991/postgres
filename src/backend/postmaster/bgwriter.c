@@ -12,9 +12,6 @@
  *
  * As of Postgres 9.2 the bgwriter no longer handles checkpoints.
  *
- * The bgwriter is started by the postmaster as soon as the startup subprocess
- * finishes, or as soon as recovery begins if we are doing archive recovery.
- * It remains alive until the postmaster commands it to terminate.
  * Normal termination is by SIGTERM, which instructs the bgwriter to exit(0).
  * Emergency termination is by SIGQUIT; like any backend, the bgwriter will
  * simply abort and exit on SIGQUIT.
@@ -24,7 +21,7 @@
  * should be killed by SIGQUIT and then a recovery cycle started.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -35,25 +32,21 @@
 #include "postgres.h"
 
 #include "access/xlog.h"
-#include "access/xlog_internal.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/auxprocess.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
 #include "storage/fd.h"
-#include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/procsignal.h"
-#include "storage/shmem.h"
 #include "storage/smgr.h"
-#include "storage/spin.h"
 #include "storage/standby.h"
-#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
@@ -91,12 +84,17 @@ static XLogRecPtr last_snapshot_lsn = InvalidXLogRecPtr;
  * basic execution environment, but not enabled signals yet.
  */
 void
-BackgroundWriterMain(void)
+BackgroundWriterMain(char *startup_data, size_t startup_data_len)
 {
 	sigjmp_buf	local_sigjmp_buf;
 	MemoryContext bgwriter_context;
 	bool		prev_hibernate;
 	WritebackContext wb_context;
+
+	Assert(startup_data_len == 0);
+
+	MyBackendType = B_BG_WRITER;
+	AuxiliaryProcessMainCommon();
 
 	/*
 	 * Properly accept or ignore signals that might be sent to us.
@@ -104,7 +102,7 @@ BackgroundWriterMain(void)
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGINT, SIG_IGN);
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
-	pqsignal(SIGQUIT, SignalHandlerForCrashExit);
+	/* SIGQUIT handler was already set up by InitPostmasterChild */
 	pqsignal(SIGALRM, SIG_IGN);
 	pqsignal(SIGPIPE, SIG_IGN);
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
@@ -114,9 +112,6 @@ BackgroundWriterMain(void)
 	 * Reset some signals that are accepted by postmaster but not here
 	 */
 	pqsignal(SIGCHLD, SIG_DFL);
-
-	/* We allow SIGQUIT (quickdie) at all times */
-	sigdelset(&BlockSig, SIGQUIT);
 
 	/*
 	 * We just started, assume there has been either a shutdown or
@@ -140,7 +135,20 @@ BackgroundWriterMain(void)
 	/*
 	 * If an exception is encountered, processing resumes here.
 	 *
-	 * See notes in postgres.c about the design of this coding.
+	 * You might wonder why this isn't coded as an infinite loop around a
+	 * PG_TRY construct.  The reason is that this is the bottom of the
+	 * exception stack, and so with PG_TRY there would be no exception handler
+	 * in force at all during the CATCH part.  By leaving the outermost setjmp
+	 * always active, we have at least some chance of recovering from an error
+	 * during error recovery.  (If we get into an infinite loop thereby, it
+	 * will soon be stopped by overflow of elog.c's internal state stack.)
+	 *
+	 * Note that we use sigsetjmp(..., 1), so that the prevailing signal mask
+	 * (to wit, BlockSig) will be restored when longjmp'ing to here.  Thus,
+	 * signals other than SIGQUIT will be blocked until we complete error
+	 * recovery.  It might seem that this policy makes the HOLD_INTERRUPTS()
+	 * call redundant, but it is not since InterruptPending might be set
+	 * already.
 	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 	{
@@ -160,7 +168,6 @@ BackgroundWriterMain(void)
 		 */
 		LWLockReleaseAll();
 		ConditionVariableCancelSleep();
-		AbortBufferIO();
 		UnlockBuffers();
 		ReleaseAuxProcessResources(false);
 		AtEOXact_Buffers(false);
@@ -176,7 +183,7 @@ BackgroundWriterMain(void)
 		FlushErrorState();
 
 		/* Flush any leaked data in the top-level context */
-		MemoryContextResetAndDeleteChildren(bgwriter_context);
+		MemoryContextReset(bgwriter_context);
 
 		/* re-initialize to avoid repeated errors causing problems */
 		WritebackContextInit(&wb_context, &bgwriter_flush_after);
@@ -191,13 +198,6 @@ BackgroundWriterMain(void)
 		 */
 		pg_usleep(1000000L);
 
-		/*
-		 * Close all open files after any error.  This is helpful on Windows,
-		 * where holding deleted files open causes various strange errors.
-		 * It's not clear we need it elsewhere, but shouldn't hurt.
-		 */
-		smgrcloseall();
-
 		/* Report wait end here, when there is no further possibility of wait */
 		pgstat_report_wait_end();
 	}
@@ -208,7 +208,7 @@ BackgroundWriterMain(void)
 	/*
 	 * Unblock signals (they were blocked when the postmaster forked us)
 	 */
-	PG_SETMASK(&UnBlockSig);
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 
 	/*
 	 * Reset hibernation state after any error.
@@ -233,18 +233,19 @@ BackgroundWriterMain(void)
 		 */
 		can_hibernate = BgBufferSync(&wb_context);
 
-		/*
-		 * Send off activity statistics to the stats collector
-		 */
-		pgstat_send_bgwriter();
+		/* Report pending statistics to the cumulative stats system */
+		pgstat_report_bgwriter();
+		pgstat_report_wal(true);
 
 		if (FirstCallSinceLastCheckpoint())
 		{
 			/*
-			 * After any checkpoint, close all smgr files.  This is so we
-			 * won't hang onto smgr references to deleted files indefinitely.
+			 * After any checkpoint, free all smgr objects.  Otherwise we
+			 * would never do so for dropped relations, as the bgwriter does
+			 * not process shared invalidation messages or call
+			 * AtEOXact_SMgr().
 			 */
-			smgrcloseall();
+			smgrdestroyall();
 		}
 
 		/*
@@ -326,7 +327,7 @@ BackgroundWriterMain(void)
 		if (rc == WL_TIMEOUT && can_hibernate && prev_hibernate)
 		{
 			/* Ask for notification at next buffer allocation */
-			StrategyNotifyBgWriter(MyProc->pgprocno);
+			StrategyNotifyBgWriter(MyProcNumber);
 			/* Sleep ... */
 			(void) WaitLatch(MyLatch,
 							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

@@ -3,7 +3,7 @@
  * partition.c
  *		  Partitioning related data structures and functions.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,14 +25,14 @@
 #include "catalog/pg_partitioned_table.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/optimizer.h"
-#include "partitioning/partbounds.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/fmgroids.h"
 #include "utils/partcache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-static Oid	get_partition_parent_worker(Relation inhRel, Oid relid);
+static Oid	get_partition_parent_worker(Relation inhRel, Oid relid,
+										bool *detach_pending);
 static void get_partition_ancestors_worker(Relation inhRel, Oid relid,
 										   List **ancestors);
 
@@ -42,22 +42,31 @@ static void get_partition_ancestors_worker(Relation inhRel, Oid relid,
  *
  * Returns inheritance parent of a partition by scanning pg_inherits
  *
+ * If the partition is in the process of being detached, an error is thrown,
+ * unless even_if_detached is passed as true.
+ *
  * Note: Because this function assumes that the relation whose OID is passed
  * as an argument will have precisely one parent, it should only be called
  * when it is known that the relation is a partition.
  */
 Oid
-get_partition_parent(Oid relid)
+get_partition_parent(Oid relid, bool even_if_detached)
 {
 	Relation	catalogRelation;
 	Oid			result;
+	bool		detach_pending;
 
 	catalogRelation = table_open(InheritsRelationId, AccessShareLock);
 
-	result = get_partition_parent_worker(catalogRelation, relid);
+	result = get_partition_parent_worker(catalogRelation, relid,
+										 &detach_pending);
 
 	if (!OidIsValid(result))
 		elog(ERROR, "could not find tuple for parent of relation %u", relid);
+
+	if (detach_pending && !even_if_detached)
+		elog(ERROR, "relation %u has no parent because it's being detached",
+			 relid);
 
 	table_close(catalogRelation, AccessShareLock);
 
@@ -68,14 +77,19 @@ get_partition_parent(Oid relid)
  * get_partition_parent_worker
  *		Scan the pg_inherits relation to return the OID of the parent of the
  *		given relation
+ *
+ * If the partition is being detached, *detach_pending is set true (but the
+ * original parent is still returned.)
  */
 static Oid
-get_partition_parent_worker(Relation inhRel, Oid relid)
+get_partition_parent_worker(Relation inhRel, Oid relid, bool *detach_pending)
 {
 	SysScanDesc scan;
 	ScanKeyData key[2];
 	Oid			result = InvalidOid;
 	HeapTuple	tuple;
+
+	*detach_pending = false;
 
 	ScanKeyInit(&key[0],
 				Anum_pg_inherits_inhrelid,
@@ -93,6 +107,9 @@ get_partition_parent_worker(Relation inhRel, Oid relid)
 	{
 		Form_pg_inherits form = (Form_pg_inherits) GETSTRUCT(tuple);
 
+		/* Let caller know of partition being detached */
+		if (form->inhdetachpending)
+			*detach_pending = true;
 		result = form->inhparent;
 	}
 
@@ -105,7 +122,9 @@ get_partition_parent_worker(Relation inhRel, Oid relid)
  * get_partition_ancestors
  *		Obtain ancestors of given relation
  *
- * Returns a list of ancestors of the given relation.
+ * Returns a list of ancestors of the given relation.  The list is ordered:
+ * The first element is the immediate parent and the last one is the topmost
+ * parent in the partition hierarchy.
  *
  * Note: Because this function assumes that the relation whose OID is passed
  * as an argument and each ancestor will have precisely one parent, it should
@@ -134,10 +153,14 @@ static void
 get_partition_ancestors_worker(Relation inhRel, Oid relid, List **ancestors)
 {
 	Oid			parentOid;
+	bool		detach_pending;
 
-	/* Recursion ends at the topmost level, ie., when there's no parent */
-	parentOid = get_partition_parent_worker(inhRel, relid);
-	if (parentOid == InvalidOid)
+	/*
+	 * Recursion ends at the topmost level, ie., when there's no parent; also
+	 * when the partition is being detached.
+	 */
+	parentOid = get_partition_parent_worker(inhRel, relid, &detach_pending);
+	if (parentOid == InvalidOid || detach_pending)
 		return;
 
 	*ancestors = lappend_oid(*ancestors, parentOid);
@@ -170,13 +193,14 @@ index_get_partition(Relation partition, Oid indexId)
 		ReleaseSysCache(tup);
 		if (!ispartition)
 			continue;
-		if (get_partition_parent(lfirst_oid(l)) == indexId)
+		if (get_partition_parent(partIdx, false) == indexId)
 		{
 			list_free(idxlist);
 			return partIdx;
 		}
 	}
 
+	list_free(idxlist);
 	return InvalidOid;
 }
 
@@ -204,7 +228,8 @@ map_partition_varattnos(List *expr, int fromrel_varno,
 		bool		found_whole_row;
 
 		part_attmap = build_attrmap_by_name(RelationGetDescr(to_rel),
-											RelationGetDescr(from_rel));
+											RelationGetDescr(from_rel),
+											false);
 		expr = (List *) map_variable_attnos((Node *) expr,
 											fromrel_varno, 0,
 											part_attmap,

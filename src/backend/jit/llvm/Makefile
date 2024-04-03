@@ -22,6 +22,12 @@ endif
 PGFILEDESC = "llvmjit - JIT using LLVM"
 NAME = llvmjit
 
+# LLVM 14 produces deprecation warnings.  We'll need to make some changes
+# before the relevant functions are removed, but for now silence the warnings.
+ifeq ($(GCC), yes)
+LLVM_CFLAGS += -Wno-deprecated-declarations
+endif
+
 # All files in this directory use LLVM.
 CFLAGS += $(LLVM_CFLAGS)
 CXXFLAGS += $(LLVM_CXXFLAGS)
@@ -65,6 +71,6 @@ uninstall-types:
 
 include $(top_srcdir)/src/Makefile.shlib
 
-clean distclean maintainer-clean: clean-lib
+clean distclean: clean-lib
 	rm -f $(OBJS)
 	rm -f llvmjit_types.bc

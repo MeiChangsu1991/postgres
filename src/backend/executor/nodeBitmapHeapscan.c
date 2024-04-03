@@ -16,7 +16,7 @@
  * required index qual conditions.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -39,15 +39,12 @@
 
 #include "access/relscan.h"
 #include "access/tableam.h"
-#include "access/transam.h"
 #include "access/visibilitymap.h"
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/nodeBitmapHeapscan.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
-#include "storage/predicate.h"
-#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/spccache.h"
@@ -207,6 +204,11 @@ BitmapHeapNext(BitmapHeapScanState *node)
 
 			BitmapAdjustPrefetchIterator(node, tbmres);
 
+			if (tbmres->ntuples >= 0)
+				node->exact_pages++;
+			else
+				node->lossy_pages++;
+
 			/*
 			 * We can skip fetching the heap page if we don't need any fields
 			 * from the heap, and the bitmap entries don't need rechecking,
@@ -237,11 +239,6 @@ BitmapHeapNext(BitmapHeapScanState *node)
 				/* AM doesn't think this block is valid, skip */
 				continue;
 			}
-
-			if (tbmres->ntuples >= 0)
-				node->exact_pages++;
-			else
-				node->lossy_pages++;
 
 			/* Adjust the prefetch target */
 			BitmapAdjustPrefetchTarget(node);
@@ -656,18 +653,6 @@ ExecEndBitmapHeapScan(BitmapHeapScanState *node)
 	scanDesc = node->ss.ss_currentScanDesc;
 
 	/*
-	 * Free the exprcontext
-	 */
-	ExecFreeExprContext(&node->ss.ps);
-
-	/*
-	 * clear out tuple table slots
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
-
-	/*
 	 * close down subplans
 	 */
 	ExecEndNode(outerPlanState(node));
@@ -736,7 +721,6 @@ ExecInitBitmapHeapScan(BitmapHeapScan *node, EState *estate, int eflags)
 	scanstate->prefetch_iterator = NULL;
 	scanstate->prefetch_pages = 0;
 	scanstate->prefetch_target = 0;
-	scanstate->pscan_len = 0;
 	scanstate->initialized = false;
 	scanstate->shared_tbmiterator = NULL;
 	scanstate->shared_prefetch_iterator = NULL;
@@ -856,13 +840,7 @@ void
 ExecBitmapHeapEstimate(BitmapHeapScanState *node,
 					   ParallelContext *pcxt)
 {
-	EState	   *estate = node->ss.ps.state;
-
-	node->pscan_len = add_size(offsetof(ParallelBitmapHeapState,
-										phs_snapshot_data),
-							   EstimateSnapshotSpace(estate->es_snapshot));
-
-	shm_toc_estimate_chunk(&pcxt->estimator, node->pscan_len);
+	shm_toc_estimate_chunk(&pcxt->estimator, sizeof(ParallelBitmapHeapState));
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
 }
 
@@ -877,14 +855,13 @@ ExecBitmapHeapInitializeDSM(BitmapHeapScanState *node,
 							ParallelContext *pcxt)
 {
 	ParallelBitmapHeapState *pstate;
-	EState	   *estate = node->ss.ps.state;
 	dsa_area   *dsa = node->ss.ps.state->es_query_dsa;
 
 	/* If there's no DSA, there are no workers; initialize nothing. */
 	if (dsa == NULL)
 		return;
 
-	pstate = shm_toc_allocate(pcxt->toc, node->pscan_len);
+	pstate = shm_toc_allocate(pcxt->toc, sizeof(ParallelBitmapHeapState));
 
 	pstate->tbmiterator = 0;
 	pstate->prefetch_iterator = 0;
@@ -896,7 +873,6 @@ ExecBitmapHeapInitializeDSM(BitmapHeapScanState *node,
 	pstate->state = BM_INITIAL;
 
 	ConditionVariableInit(&pstate->cv);
-	SerializeSnapshot(estate->es_snapshot, pstate->phs_snapshot_data);
 
 	shm_toc_insert(pcxt->toc, node->ss.ps.plan->plan_node_id, pstate);
 	node->pstate = pstate;
@@ -942,13 +918,9 @@ ExecBitmapHeapInitializeWorker(BitmapHeapScanState *node,
 							   ParallelWorkerContext *pwcxt)
 {
 	ParallelBitmapHeapState *pstate;
-	Snapshot	snapshot;
 
 	Assert(node->ss.ps.state->es_query_dsa != NULL);
 
 	pstate = shm_toc_lookup(pwcxt->toc, node->ss.ps.plan->plan_node_id, false);
 	node->pstate = pstate;
-
-	snapshot = RestoreSnapshot(pstate->phs_snapshot_data);
-	table_scan_update_snapshot(node->ss.ss_currentScanDesc, snapshot);
 }

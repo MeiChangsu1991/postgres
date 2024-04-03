@@ -4,7 +4,7 @@
  *
  * Routines to support SELinux labels (security context)
  *
- * Copyright (c) 2010-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2024, PostgreSQL Global Development Group
  *
  * -------------------------------------------------------------------------
  */
@@ -18,7 +18,6 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
-#include "catalog/indexing.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
@@ -120,7 +119,7 @@ sepgsql_set_client_label(const char *new_label)
 		tcontext = client_label_peer;
 	else
 	{
-		if (security_check_context_raw((security_context_t) new_label) < 0)
+		if (security_check_context_raw(new_label) < 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_NAME),
 					 errmsg("SELinux: invalid security label: \"%s\"",
@@ -453,9 +452,9 @@ sepgsql_get_label(Oid classId, Oid objectId, int32 subId)
 	object.objectSubId = subId;
 
 	label = GetSecurityLabel(&object, SEPGSQL_LABEL_TAG);
-	if (!label || security_check_context_raw((security_context_t) label))
+	if (!label || security_check_context_raw(label))
 	{
-		security_context_t unlabeled;
+		char	   *unlabeled;
 
 		if (security_get_initial_context_raw("unlabeled", &unlabeled) < 0)
 			ereport(ERROR,
@@ -487,7 +486,7 @@ sepgsql_object_relabel(const ObjectAddress *object, const char *seclabel)
 	 * context of selinux.
 	 */
 	if (seclabel &&
-		security_check_context_raw((security_context_t) seclabel) < 0)
+		security_check_context_raw(seclabel) < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
 				 errmsg("SELinux: invalid security label: \"%s\"", seclabel)));
@@ -647,45 +646,24 @@ sepgsql_mcstrans_out(PG_FUNCTION_ARGS)
 /*
  * quote_object_name
  *
- * It tries to quote the supplied identifiers
+ * Concatenate as many of the given strings as aren't NULL, with dots between.
+ * Quote any of the strings that wouldn't be valid identifiers otherwise.
  */
 static char *
 quote_object_name(const char *src1, const char *src2,
 				  const char *src3, const char *src4)
 {
 	StringInfoData result;
-	const char *temp;
 
 	initStringInfo(&result);
-
 	if (src1)
-	{
-		temp = quote_identifier(src1);
-		appendStringInfoString(&result, temp);
-		if (src1 != temp)
-			pfree((void *) temp);
-	}
+		appendStringInfoString(&result, quote_identifier(src1));
 	if (src2)
-	{
-		temp = quote_identifier(src2);
-		appendStringInfo(&result, ".%s", temp);
-		if (src2 != temp)
-			pfree((void *) temp);
-	}
+		appendStringInfo(&result, ".%s", quote_identifier(src2));
 	if (src3)
-	{
-		temp = quote_identifier(src3);
-		appendStringInfo(&result, ".%s", temp);
-		if (src3 != temp)
-			pfree((void *) temp);
-	}
+		appendStringInfo(&result, ".%s", quote_identifier(src3));
 	if (src4)
-	{
-		temp = quote_identifier(src4);
-		appendStringInfo(&result, ".%s", temp);
-		if (src4 != temp)
-			pfree((void *) temp);
-	}
+		appendStringInfo(&result, ".%s", quote_identifier(src4));
 	return result.data;
 }
 
@@ -725,7 +703,7 @@ exec_object_restorecon(struct selabel_handle *sehnd, Oid catalogId)
 		char	   *objname;
 		int			objtype = 1234;
 		ObjectAddress object;
-		security_context_t context;
+		char	   *context;
 
 		/*
 		 * The way to determine object name depends on object classes. So, any

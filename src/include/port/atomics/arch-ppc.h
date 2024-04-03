@@ -3,7 +3,7 @@
  * arch-ppc.h
  *	  Atomic operations considerations specific to PowerPC
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES:
@@ -32,14 +32,14 @@ typedef struct pg_atomic_uint32
 } pg_atomic_uint32;
 
 /* 64bit atomics are only supported in 64bit mode */
-#ifdef __64BIT__
+#if SIZEOF_VOID_P >= 8
 #define PG_HAVE_ATOMIC_U64_SUPPORT
 typedef struct pg_atomic_uint64
 {
 	volatile uint64 value pg_attribute_aligned(8);
 } pg_atomic_uint64;
 
-#endif /* __64BIT__ */
+#endif
 
 /*
  * This mimics gcc __atomic_compare_exchange_n(..., __ATOMIC_SEQ_CST), but
@@ -72,14 +72,6 @@ typedef struct pg_atomic_uint64
  * the __asm__.  (That would remove the freedom to eliminate dead stores when
  * the caller ignores "expected", but few callers do.)
  *
- * The cmpwi variant may be dead code.  In gcc 7.2.0,
- * __builtin_constant_p(*expected) always reports false.
- * __atomic_compare_exchange_n() does use cmpwi when its second argument
- * points to a constant.  Hence, using this instead of
- * __atomic_compare_exchange_n() nominally penalizes the generic.h
- * pg_atomic_test_set_flag_impl().  Modern GCC will use the generic-gcc.h
- * version, making the penalty theoretical only.
- *
  * Recognizing constant "newval" would be superfluous, because there's no
  * immediate-operand version of stwcx.
  */
@@ -94,15 +86,16 @@ pg_atomic_compare_exchange_u32_impl(volatile pg_atomic_uint32 *ptr,
 
 #ifdef HAVE_I_CONSTRAINT__BUILTIN_CONSTANT_P
 	if (__builtin_constant_p(*expected) &&
-		*expected <= PG_INT16_MAX && *expected >= PG_INT16_MIN)
+		(int32) *expected <= PG_INT16_MAX &&
+		(int32) *expected >= PG_INT16_MIN)
 		__asm__ __volatile__(
 			"	sync				\n"
-			"	lwarx   %0,0,%5		\n"
+			"	lwarx   %0,0,%5,1	\n"
 			"	cmpwi   %0,%3		\n"
-			"	bne     $+12		\n"		/* branch to isync */
+			"	bne     $+12		\n"		/* branch to lwsync */
 			"	stwcx.  %4,0,%5		\n"
 			"	bne     $-16		\n"		/* branch to lwarx */
-			"	isync				\n"
+			"	lwsync				\n"
 			"	mfcr    %1          \n"
 :			"=&r"(found), "=r"(condition_register), "+m"(ptr->value)
 :			"i"(*expected), "r"(newval), "r"(&ptr->value)
@@ -111,12 +104,12 @@ pg_atomic_compare_exchange_u32_impl(volatile pg_atomic_uint32 *ptr,
 #endif
 		__asm__ __volatile__(
 			"	sync				\n"
-			"	lwarx   %0,0,%5		\n"
+			"	lwarx   %0,0,%5,1	\n"
 			"	cmpw    %0,%3		\n"
-			"	bne     $+12		\n"		/* branch to isync */
+			"	bne     $+12		\n"		/* branch to lwsync */
 			"	stwcx.  %4,0,%5		\n"
 			"	bne     $-16		\n"		/* branch to lwarx */
-			"	isync				\n"
+			"	lwsync				\n"
 			"	mfcr    %1          \n"
 :			"=&r"(found), "=r"(condition_register), "+m"(ptr->value)
 :			"r"(*expected), "r"(newval), "r"(&ptr->value)
@@ -145,11 +138,11 @@ pg_atomic_fetch_add_u32_impl(volatile pg_atomic_uint32 *ptr, int32 add_)
 		add_ <= PG_INT16_MAX && add_ >= PG_INT16_MIN)
 		__asm__ __volatile__(
 			"	sync				\n"
-			"	lwarx   %1,0,%4		\n"
+			"	lwarx   %1,0,%4,1	\n"
 			"	addi    %0,%1,%3	\n"
 			"	stwcx.  %0,0,%4		\n"
 			"	bne     $-12		\n"		/* branch to lwarx */
-			"	isync				\n"
+			"	lwsync				\n"
 :			"=&r"(_t), "=&b"(res), "+m"(ptr->value)
 :			"i"(add_), "r"(&ptr->value)
 :			"memory", "cc");
@@ -157,11 +150,11 @@ pg_atomic_fetch_add_u32_impl(volatile pg_atomic_uint32 *ptr, int32 add_)
 #endif
 		__asm__ __volatile__(
 			"	sync				\n"
-			"	lwarx   %1,0,%4		\n"
+			"	lwarx   %1,0,%4,1	\n"
 			"	add     %0,%1,%3	\n"
 			"	stwcx.  %0,0,%4		\n"
 			"	bne     $-12		\n"		/* branch to lwarx */
-			"	isync				\n"
+			"	lwsync				\n"
 :			"=&r"(_t), "=&r"(res), "+m"(ptr->value)
 :			"r"(add_), "r"(&ptr->value)
 :			"memory", "cc");
@@ -183,15 +176,16 @@ pg_atomic_compare_exchange_u64_impl(volatile pg_atomic_uint64 *ptr,
 	/* Like u32, but s/lwarx/ldarx/; s/stwcx/stdcx/; s/cmpw/cmpd/ */
 #ifdef HAVE_I_CONSTRAINT__BUILTIN_CONSTANT_P
 	if (__builtin_constant_p(*expected) &&
-		*expected <= PG_INT16_MAX && *expected >= PG_INT16_MIN)
+		(int64) *expected <= PG_INT16_MAX &&
+		(int64) *expected >= PG_INT16_MIN)
 		__asm__ __volatile__(
 			"	sync				\n"
-			"	ldarx   %0,0,%5		\n"
+			"	ldarx   %0,0,%5,1	\n"
 			"	cmpdi   %0,%3		\n"
-			"	bne     $+12		\n"		/* branch to isync */
+			"	bne     $+12		\n"		/* branch to lwsync */
 			"	stdcx.  %4,0,%5		\n"
 			"	bne     $-16		\n"		/* branch to ldarx */
-			"	isync				\n"
+			"	lwsync				\n"
 			"	mfcr    %1          \n"
 :			"=&r"(found), "=r"(condition_register), "+m"(ptr->value)
 :			"i"(*expected), "r"(newval), "r"(&ptr->value)
@@ -200,12 +194,12 @@ pg_atomic_compare_exchange_u64_impl(volatile pg_atomic_uint64 *ptr,
 #endif
 		__asm__ __volatile__(
 			"	sync				\n"
-			"	ldarx   %0,0,%5		\n"
+			"	ldarx   %0,0,%5,1	\n"
 			"	cmpd    %0,%3		\n"
-			"	bne     $+12		\n"		/* branch to isync */
+			"	bne     $+12		\n"		/* branch to lwsync */
 			"	stdcx.  %4,0,%5		\n"
 			"	bne     $-16		\n"		/* branch to ldarx */
-			"	isync				\n"
+			"	lwsync				\n"
 			"	mfcr    %1          \n"
 :			"=&r"(found), "=r"(condition_register), "+m"(ptr->value)
 :			"r"(*expected), "r"(newval), "r"(&ptr->value)
@@ -230,11 +224,11 @@ pg_atomic_fetch_add_u64_impl(volatile pg_atomic_uint64 *ptr, int64 add_)
 		add_ <= PG_INT16_MAX && add_ >= PG_INT16_MIN)
 		__asm__ __volatile__(
 			"	sync				\n"
-			"	ldarx   %1,0,%4		\n"
+			"	ldarx   %1,0,%4,1	\n"
 			"	addi    %0,%1,%3	\n"
 			"	stdcx.  %0,0,%4		\n"
 			"	bne     $-12		\n"		/* branch to ldarx */
-			"	isync				\n"
+			"	lwsync				\n"
 :			"=&r"(_t), "=&b"(res), "+m"(ptr->value)
 :			"i"(add_), "r"(&ptr->value)
 :			"memory", "cc");
@@ -242,11 +236,11 @@ pg_atomic_fetch_add_u64_impl(volatile pg_atomic_uint64 *ptr, int64 add_)
 #endif
 		__asm__ __volatile__(
 			"	sync				\n"
-			"	ldarx   %1,0,%4		\n"
+			"	ldarx   %1,0,%4,1	\n"
 			"	add     %0,%1,%3	\n"
 			"	stdcx.  %0,0,%4		\n"
 			"	bne     $-12		\n"		/* branch to ldarx */
-			"	isync				\n"
+			"	lwsync				\n"
 :			"=&r"(_t), "=&r"(res), "+m"(ptr->value)
 :			"r"(add_), "r"(&ptr->value)
 :			"memory", "cc");

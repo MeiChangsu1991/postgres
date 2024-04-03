@@ -4,7 +4,7 @@
  *	  functions for OpenSSL support in the backend.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,26 +24,33 @@
 #include <unistd.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-#endif
 
-#include <openssl/ssl.h>
-#include <openssl/dh.h>
-#include <openssl/conf.h>
-#ifndef OPENSSL_NO_ECDH
-#include <openssl/ec.h>
-#endif
-
-#include "common/openssl.h"
+#include "common/string.h"
 #include "libpq/libpq.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "tcop/tcopprot.h"
+#include "utils/builtins.h"
 #include "utils/memutils.h"
+
+/*
+ * These SSL-related #includes must come after all system-provided headers.
+ * This ensures that OpenSSL can take care of conflicts with Windows'
+ * <wincrypt.h> by #undef'ing the conflicting macros.  (We don't directly
+ * include <wincrypt.h>, but some other Windows headers do.)
+ */
+#include "common/openssl.h"
+#include <openssl/conf.h>
+#include <openssl/dh.h>
+#ifndef OPENSSL_NO_ECDH
+#include <openssl/ec.h>
+#endif
+#include <openssl/x509v3.h>
+
 
 /* default init hook can be overridden by a shared library */
 static void default_openssl_tls_init(SSL_CTX *context, bool isServerStart);
@@ -55,10 +62,10 @@ static BIO_METHOD *my_BIO_s_socket(void);
 static int	my_SSL_set_fd(Port *port, int fd);
 
 static DH  *load_dh_file(char *filename, bool isServerStart);
-static DH  *load_dh_buffer(const char *, size_t);
+static DH  *load_dh_buffer(const char *buffer, size_t len);
 static int	ssl_external_passwd_cb(char *buf, int size, int rwflag, void *userdata);
 static int	dummy_ssl_passwd_cb(char *buf, int size, int rwflag, void *userdata);
-static int	verify_cb(int, X509_STORE_CTX *);
+static int	verify_cb(int ok, X509_STORE_CTX *ctx);
 static void info_cb(const SSL *ssl, int type, int args);
 static bool initialize_dh(SSL_CTX *context, bool isServerStart);
 static bool initialize_ecdh(SSL_CTX *context, bool isServerStart);
@@ -74,6 +81,9 @@ static bool ssl_is_server_start;
 static int	ssl_protocol_version_to_openssl(int v);
 static const char *ssl_protocol_version_to_string(int v);
 
+/* for passing data back from verify_cb() */
+static const char *cert_errdetail;
+
 /* ------------------------------------------------------------ */
 /*						 Public interface						*/
 /* ------------------------------------------------------------ */
@@ -81,7 +91,6 @@ static const char *ssl_protocol_version_to_string(int v);
 int
 be_tls_init(bool isServerStart)
 {
-	STACK_OF(X509_NAME) * root_cert_list = NULL;
 	SSL_CTX    *context;
 	int			ssl_ver_min = -1;
 	int			ssl_ver_max = -1;
@@ -100,6 +109,10 @@ be_tls_init(bool isServerStart)
 	}
 
 	/*
+	 * Create a new SSL context into which we'll load all the configuration
+	 * settings.  If we fail partway through, we can avoid memory leakage by
+	 * freeing this context; we don't install it as active until the end.
+	 *
 	 * We use SSLv23_method() because it can negotiate use of the highest
 	 * mutually supported protocol version, while alternatives like
 	 * TLSv1_2_method() permit only one specific version.  Note that we don't
@@ -181,7 +194,8 @@ be_tls_init(bool isServerStart)
 		if (ssl_ver_min == -1)
 		{
 			ereport(isServerStart ? FATAL : LOG,
-					(errmsg("\"%s\" setting \"%s\" not supported by this build",
+			/*- translator: first %s is a GUC option name, second %s is its value */
+					(errmsg("%s setting \"%s\" not supported by this build",
 							"ssl_min_protocol_version",
 							GetConfigOption("ssl_min_protocol_version",
 											false, false))));
@@ -203,7 +217,8 @@ be_tls_init(bool isServerStart)
 		if (ssl_ver_max == -1)
 		{
 			ereport(isServerStart ? FATAL : LOG,
-					(errmsg("\"%s\" setting \"%s\" not supported by this build",
+			/*- translator: first %s is a GUC option name, second %s is its value */
+					(errmsg("%s setting \"%s\" not supported by this build",
 							"ssl_max_protocol_version",
 							GetConfigOption("ssl_max_protocol_version",
 											false, false))));
@@ -230,7 +245,7 @@ be_tls_init(bool isServerStart)
 		{
 			ereport(isServerStart ? FATAL : LOG,
 					(errmsg("could not set SSL protocol version range"),
-					 errdetail("\"%s\" cannot be higher than \"%s\"",
+					 errdetail("%s cannot be higher than %s",
 							   "ssl_min_protocol_version",
 							   "ssl_max_protocol_version")));
 			goto error;
@@ -242,6 +257,19 @@ be_tls_init(bool isServerStart)
 
 	/* disallow SSL session caching, too */
 	SSL_CTX_set_session_cache_mode(context, SSL_SESS_CACHE_OFF);
+
+	/* disallow SSL compression */
+	SSL_CTX_set_options(context, SSL_OP_NO_COMPRESSION);
+
+#ifdef SSL_OP_NO_RENEGOTIATION
+
+	/*
+	 * Disallow SSL renegotiation, option available since 1.1.0h.  This
+	 * concerns only TLSv1.2 and older protocol versions, as TLSv1.3 has no
+	 * support for renegotiation.
+	 */
+	SSL_CTX_set_options(context, SSL_OP_NO_RENEGOTIATION);
+#endif
 
 	/* set up ephemeral DH and ECDH keys */
 	if (!initialize_dh(context, isServerStart))
@@ -267,6 +295,8 @@ be_tls_init(bool isServerStart)
 	 */
 	if (ssl_ca_file[0])
 	{
+		STACK_OF(X509_NAME) * root_cert_list;
+
 		if (SSL_CTX_load_verify_locations(context, ssl_ca_file, NULL) != 1 ||
 			(root_cert_list = SSL_load_client_CA_file(ssl_ca_file)) == NULL)
 		{
@@ -276,38 +306,16 @@ be_tls_init(bool isServerStart)
 							ssl_ca_file, SSLerrmessage(ERR_get_error()))));
 			goto error;
 		}
-	}
 
-	/*----------
-	 * Load the Certificate Revocation List (CRL).
-	 * http://searchsecurity.techtarget.com/sDefinition/0,,sid14_gci803160,00.html
-	 *----------
-	 */
-	if (ssl_crl_file[0])
-	{
-		X509_STORE *cvstore = SSL_CTX_get_cert_store(context);
+		/*
+		 * Tell OpenSSL to send the list of root certs we trust to clients in
+		 * CertificateRequests.  This lets a client with a keystore select the
+		 * appropriate client certificate to send to us.  Also, this ensures
+		 * that the SSL context will "own" the root_cert_list and remember to
+		 * free it when no longer needed.
+		 */
+		SSL_CTX_set_client_CA_list(context, root_cert_list);
 
-		if (cvstore)
-		{
-			/* Set the flags to check against the complete CRL chain */
-			if (X509_STORE_load_locations(cvstore, ssl_crl_file, NULL) == 1)
-			{
-				X509_STORE_set_flags(cvstore,
-									 X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
-			}
-			else
-			{
-				ereport(isServerStart ? FATAL : LOG,
-						(errcode(ERRCODE_CONFIG_FILE_ERROR),
-						 errmsg("could not load SSL certificate revocation list file \"%s\": %s",
-								ssl_crl_file, SSLerrmessage(ERR_get_error()))));
-				goto error;
-			}
-		}
-	}
-
-	if (ssl_ca_file[0])
-	{
 		/*
 		 * Always ask for SSL client cert, but don't fail if it's not
 		 * presented.  We might fail such connections later, depending on what
@@ -317,13 +325,54 @@ be_tls_init(bool isServerStart)
 						   (SSL_VERIFY_PEER |
 							SSL_VERIFY_CLIENT_ONCE),
 						   verify_cb);
+	}
 
-		/*
-		 * Tell OpenSSL to send the list of root certs we trust to clients in
-		 * CertificateRequests.  This lets a client with a keystore select the
-		 * appropriate client certificate to send to us.
-		 */
-		SSL_CTX_set_client_CA_list(context, root_cert_list);
+	/*----------
+	 * Load the Certificate Revocation List (CRL).
+	 * http://searchsecurity.techtarget.com/sDefinition/0,,sid14_gci803160,00.html
+	 *----------
+	 */
+	if (ssl_crl_file[0] || ssl_crl_dir[0])
+	{
+		X509_STORE *cvstore = SSL_CTX_get_cert_store(context);
+
+		if (cvstore)
+		{
+			/* Set the flags to check against the complete CRL chain */
+			if (X509_STORE_load_locations(cvstore,
+										  ssl_crl_file[0] ? ssl_crl_file : NULL,
+										  ssl_crl_dir[0] ? ssl_crl_dir : NULL)
+				== 1)
+			{
+				X509_STORE_set_flags(cvstore,
+									 X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
+			}
+			else if (ssl_crl_dir[0] == 0)
+			{
+				ereport(isServerStart ? FATAL : LOG,
+						(errcode(ERRCODE_CONFIG_FILE_ERROR),
+						 errmsg("could not load SSL certificate revocation list file \"%s\": %s",
+								ssl_crl_file, SSLerrmessage(ERR_get_error()))));
+				goto error;
+			}
+			else if (ssl_crl_file[0] == 0)
+			{
+				ereport(isServerStart ? FATAL : LOG,
+						(errcode(ERRCODE_CONFIG_FILE_ERROR),
+						 errmsg("could not load SSL certificate revocation list directory \"%s\": %s",
+								ssl_crl_dir, SSLerrmessage(ERR_get_error()))));
+				goto error;
+			}
+			else
+			{
+				ereport(isServerStart ? FATAL : LOG,
+						(errcode(ERRCODE_CONFIG_FILE_ERROR),
+						 errmsg("could not load SSL certificate revocation list file \"%s\" or directory \"%s\": %s",
+								ssl_crl_file, ssl_crl_dir,
+								SSLerrmessage(ERR_get_error()))));
+				goto error;
+			}
+		}
 	}
 
 	/*
@@ -344,6 +393,7 @@ be_tls_init(bool isServerStart)
 
 	return 0;
 
+	/* Clean up by releasing working context. */
 error:
 	if (context)
 		SSL_CTX_free(context);
@@ -379,6 +429,9 @@ be_tls_open_server(Port *port)
 		return -1;
 	}
 
+	/* set up debugging/info callback */
+	SSL_CTX_set_info_callback(SSL_context, info_cb);
+
 	if (!(port->ssl = SSL_new(SSL_context)))
 	{
 		ereport(COMMERROR,
@@ -407,6 +460,7 @@ aloop:
 	 * per-thread error queue following another call to an OpenSSL I/O
 	 * routine.
 	 */
+	errno = 0;
 	ERR_clear_error();
 	r = SSL_accept(port->ssl);
 	if (r <= 0)
@@ -443,7 +497,7 @@ aloop:
 										 WAIT_EVENT_SSL_OPEN_SERVER);
 				goto aloop;
 			case SSL_ERROR_SYSCALL:
-				if (r < 0)
+				if (r < 0 && errno != 0)
 					ereport(COMMERROR,
 							(errcode_for_socket_access(),
 							 errmsg("could not accept SSL connection: %m")));
@@ -491,6 +545,7 @@ aloop:
 						(errcode(ERRCODE_PROTOCOL_VIOLATION),
 						 errmsg("could not accept SSL connection: %s",
 								SSLerrmessage(ecode)),
+						 cert_errdetail ? errdetail_internal("%s", cert_errdetail) : 0,
 						 give_proto_hint ?
 						 errhint("This may indicate that the client does not support any SSL protocol version between %s and %s.",
 								 ssl_min_protocol_version ?
@@ -499,6 +554,7 @@ aloop:
 								 ssl_max_protocol_version ?
 								 ssl_protocol_version_to_string(ssl_max_protocol_version) :
 								 MAX_OPENSSL_TLS_VERSION) : 0));
+				cert_errdetail = NULL;
 				break;
 			case SSL_ERROR_ZERO_RETURN:
 				ereport(COMMERROR,
@@ -518,22 +574,26 @@ aloop:
 	/* Get client certificate, if available. */
 	port->peer = SSL_get_peer_certificate(port->ssl);
 
-	/* and extract the Common Name from it. */
+	/* and extract the Common Name and Distinguished Name from it. */
 	port->peer_cn = NULL;
+	port->peer_dn = NULL;
 	port->peer_cert_valid = false;
 	if (port->peer != NULL)
 	{
 		int			len;
+		X509_NAME  *x509name = X509_get_subject_name(port->peer);
+		char	   *peer_dn;
+		BIO		   *bio = NULL;
+		BUF_MEM    *bio_buf = NULL;
 
-		len = X509_NAME_get_text_by_NID(X509_get_subject_name(port->peer),
-										NID_commonName, NULL, 0);
+		len = X509_NAME_get_text_by_NID(x509name, NID_commonName, NULL, 0);
 		if (len != -1)
 		{
 			char	   *peer_cn;
 
 			peer_cn = MemoryContextAlloc(TopMemoryContext, len + 1);
-			r = X509_NAME_get_text_by_NID(X509_get_subject_name(port->peer),
-										  NID_commonName, peer_cn, len + 1);
+			r = X509_NAME_get_text_by_NID(x509name, NID_commonName, peer_cn,
+										  len + 1);
 			peer_cn[len] = '\0';
 			if (r != len)
 			{
@@ -557,11 +617,59 @@ aloop:
 
 			port->peer_cn = peer_cn;
 		}
+
+		bio = BIO_new(BIO_s_mem());
+		if (!bio)
+		{
+			if (port->peer_cn != NULL)
+			{
+				pfree(port->peer_cn);
+				port->peer_cn = NULL;
+			}
+			return -1;
+		}
+
+		/*
+		 * RFC2253 is the closest thing to an accepted standard format for
+		 * DNs. We have documented how to produce this format from a
+		 * certificate. It uses commas instead of slashes for delimiters,
+		 * which make regular expression matching a bit easier. Also note that
+		 * it prints the Subject fields in reverse order.
+		 */
+		if (X509_NAME_print_ex(bio, x509name, 0, XN_FLAG_RFC2253) == -1 ||
+			BIO_get_mem_ptr(bio, &bio_buf) <= 0)
+		{
+			BIO_free(bio);
+			if (port->peer_cn != NULL)
+			{
+				pfree(port->peer_cn);
+				port->peer_cn = NULL;
+			}
+			return -1;
+		}
+		peer_dn = MemoryContextAlloc(TopMemoryContext, bio_buf->length + 1);
+		memcpy(peer_dn, bio_buf->data, bio_buf->length);
+		len = bio_buf->length;
+		BIO_free(bio);
+		peer_dn[len] = '\0';
+		if (len != strlen(peer_dn))
+		{
+			ereport(COMMERROR,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("SSL certificate's distinguished name contains embedded null")));
+			pfree(peer_dn);
+			if (port->peer_cn != NULL)
+			{
+				pfree(port->peer_cn);
+				port->peer_cn = NULL;
+			}
+			return -1;
+		}
+
+		port->peer_dn = peer_dn;
+
 		port->peer_cert_valid = true;
 	}
-
-	/* set up debugging/info callback */
-	SSL_CTX_set_info_callback(SSL_context, info_cb);
 
 	return 0;
 }
@@ -587,6 +695,12 @@ be_tls_close(Port *port)
 	{
 		pfree(port->peer_cn);
 		port->peer_cn = NULL;
+	}
+
+	if (port->peer_dn)
+	{
+		pfree(port->peer_dn);
+		port->peer_dn = NULL;
 	}
 }
 
@@ -619,7 +733,7 @@ be_tls_read(Port *port, void *ptr, size_t len, int *waitfor)
 			break;
 		case SSL_ERROR_SYSCALL:
 			/* leave it to caller to ereport the value of errno */
-			if (n != -1)
+			if (n != -1 || errno == 0)
 			{
 				errno = ECONNRESET;
 				n = -1;
@@ -677,8 +791,14 @@ be_tls_write(Port *port, void *ptr, size_t len, int *waitfor)
 			n = -1;
 			break;
 		case SSL_ERROR_SYSCALL:
-			/* leave it to caller to ereport the value of errno */
-			if (n != -1)
+
+			/*
+			 * Leave it to caller to ereport the value of errno.  However, if
+			 * errno is still zero then assume it's a read EOF situation, and
+			 * report ECONNRESET.  (This seems possible because SSL_write can
+			 * also do reads.)
+			 */
+			if (n != -1 || errno == 0)
 			{
 				errno = ECONNRESET;
 				n = -1;
@@ -727,14 +847,7 @@ be_tls_write(Port *port, void *ptr, size_t len, int *waitfor)
  *
  * These functions are closely modelled on the standard socket BIO in OpenSSL;
  * see sock_read() and sock_write() in OpenSSL's crypto/bio/bss_sock.c.
- * XXX OpenSSL 1.0.1e considers many more errcodes than just EINTR as reasons
- * to retry; do we need to adopt their logic for that?
  */
-
-#ifndef HAVE_BIO_GET_DATA
-#define BIO_get_data(bio) (bio->ptr)
-#define BIO_set_data(bio, data) (bio->ptr = data)
-#endif
 
 static BIO_METHOD *my_bio_methods = NULL;
 
@@ -745,7 +858,7 @@ my_sock_read(BIO *h, char *buf, int size)
 
 	if (buf != NULL)
 	{
-		res = secure_raw_read(((Port *) BIO_get_data(h)), buf, size);
+		res = secure_raw_read(((Port *) BIO_get_app_data(h)), buf, size);
 		BIO_clear_retry_flags(h);
 		if (res <= 0)
 		{
@@ -765,7 +878,7 @@ my_sock_write(BIO *h, const char *buf, int size)
 {
 	int			res = 0;
 
-	res = secure_raw_write(((Port *) BIO_get_data(h)), buf, size);
+	res = secure_raw_write(((Port *) BIO_get_app_data(h)), buf, size);
 	BIO_clear_retry_flags(h);
 	if (res <= 0)
 	{
@@ -791,6 +904,7 @@ my_BIO_s_socket(void)
 		my_bio_index = BIO_get_new_index();
 		if (my_bio_index == -1)
 			return NULL;
+		my_bio_index |= (BIO_TYPE_DESCRIPTOR | BIO_TYPE_SOURCE_SINK);
 		my_bio_methods = BIO_meth_new(my_bio_index, "PostgreSQL backend socket");
 		if (!my_bio_methods)
 			return NULL;
@@ -840,7 +954,7 @@ my_SSL_set_fd(Port *port, int fd)
 		SSLerr(SSL_F_SSL_SET_FD, ERR_R_BUF_LIB);
 		goto err;
 	}
-	BIO_set_data(bio, port);
+	BIO_set_app_data(bio, port);
 
 	BIO_set_fd(bio, fd, BIO_NOCLOSE);
 	SSL_set_bio(port->ssl, bio, bio);
@@ -892,6 +1006,7 @@ load_dh_file(char *filename, bool isServerStart)
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
 				 errmsg("invalid DH parameters: %s",
 						SSLerrmessage(ERR_get_error()))));
+		DH_free(dh);
 		return NULL;
 	}
 	if (codes & DH_CHECK_P_NOT_PRIME)
@@ -899,6 +1014,7 @@ load_dh_file(char *filename, bool isServerStart)
 		ereport(isServerStart ? FATAL : LOG,
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
 				 errmsg("invalid DH parameters: p is not prime")));
+		DH_free(dh);
 		return NULL;
 	}
 	if ((codes & DH_NOT_SUITABLE_GENERATOR) &&
@@ -907,6 +1023,7 @@ load_dh_file(char *filename, bool isServerStart)
 		ereport(isServerStart ? FATAL : LOG,
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
 				 errmsg("invalid DH parameters: neither suitable generator or safe prime")));
+		DH_free(dh);
 		return NULL;
 	}
 
@@ -917,7 +1034,7 @@ load_dh_file(char *filename, bool isServerStart)
  *	Load hardcoded DH parameters.
  *
  *	If DH parameters cannot be loaded from a specified file, we can load
- *	the	hardcoded DH parameters supplied with the backend to prevent
+ *	the hardcoded DH parameters supplied with the backend to prevent
  *	problems.
  */
 static DH  *
@@ -974,11 +1091,46 @@ dummy_ssl_passwd_cb(char *buf, int size, int rwflag, void *userdata)
 }
 
 /*
+ * Examines the provided certificate name, and if it's too long to log or
+ * contains unprintable ASCII, escapes and truncates it. The return value is
+ * always a new palloc'd string. (The input string is still modified in place,
+ * for ease of implementation.)
+ */
+static char *
+prepare_cert_name(char *name)
+{
+	size_t		namelen = strlen(name);
+	char	   *truncated = name;
+
+	/*
+	 * Common Names are 64 chars max, so for a common case where the CN is the
+	 * last field, we can still print the longest possible CN with a
+	 * 7-character prefix (".../CN=[64 chars]"), for a reasonable limit of 71
+	 * characters.
+	 */
+#define MAXLEN 71
+
+	if (namelen > MAXLEN)
+	{
+		/*
+		 * Keep the end of the name, not the beginning, since the most
+		 * specific field is likely to give users the most information.
+		 */
+		truncated = name + namelen - MAXLEN;
+		truncated[0] = truncated[1] = truncated[2] = '.';
+		namelen = MAXLEN;
+	}
+
+#undef MAXLEN
+
+	return pg_clean_ascii(truncated, 0);
+}
+
+/*
  *	Certificate verification callback
  *
- *	This callback allows us to log intermediate problems during
- *	verification, but for now we'll see if the final error message
- *	contains enough information.
+ *	This callback allows us to examine intermediate problems during
+ *	verification, for later logging.
  *
  *	This callback also allows us to override the default acceptance
  *	criteria (e.g., accepting self-signed or expired certs), but
@@ -987,6 +1139,75 @@ dummy_ssl_passwd_cb(char *buf, int size, int rwflag, void *userdata)
 static int
 verify_cb(int ok, X509_STORE_CTX *ctx)
 {
+	int			depth;
+	int			errcode;
+	const char *errstring;
+	StringInfoData str;
+	X509	   *cert;
+
+	if (ok)
+	{
+		/* Nothing to do for the successful case. */
+		return ok;
+	}
+
+	/* Pull all the information we have on the verification failure. */
+	depth = X509_STORE_CTX_get_error_depth(ctx);
+	errcode = X509_STORE_CTX_get_error(ctx);
+	errstring = X509_verify_cert_error_string(errcode);
+
+	initStringInfo(&str);
+	appendStringInfo(&str,
+					 _("Client certificate verification failed at depth %d: %s."),
+					 depth, errstring);
+
+	cert = X509_STORE_CTX_get_current_cert(ctx);
+	if (cert)
+	{
+		char	   *subject,
+				   *issuer;
+		char	   *sub_prepared,
+				   *iss_prepared;
+		char	   *serialno;
+		ASN1_INTEGER *sn;
+		BIGNUM	   *b;
+
+		/*
+		 * Get the Subject and Issuer for logging, but don't let maliciously
+		 * huge certs flood the logs, and don't reflect non-ASCII bytes into
+		 * it either.
+		 */
+		subject = X509_NAME_to_cstring(X509_get_subject_name(cert));
+		sub_prepared = prepare_cert_name(subject);
+		pfree(subject);
+
+		issuer = X509_NAME_to_cstring(X509_get_issuer_name(cert));
+		iss_prepared = prepare_cert_name(issuer);
+		pfree(issuer);
+
+		/*
+		 * Pull the serial number, too, in case a Subject is still ambiguous.
+		 * This mirrors be_tls_get_peer_serial().
+		 */
+		sn = X509_get_serialNumber(cert);
+		b = ASN1_INTEGER_to_BN(sn, NULL);
+		serialno = BN_bn2dec(b);
+
+		appendStringInfoChar(&str, '\n');
+		appendStringInfo(&str,
+						 _("Failed certificate data (unverified): subject \"%s\", serial number %s, issuer \"%s\"."),
+						 sub_prepared, serialno ? serialno : _("unknown"),
+						 iss_prepared);
+
+		BN_free(b);
+		OPENSSL_free(serialno);
+		pfree(iss_prepared);
+		pfree(sub_prepared);
+	}
+
+	/* Store our detail message to be logged later. */
+	cert_errdetail = str.data;
+
 	return ok;
 }
 
@@ -997,39 +1218,43 @@ verify_cb(int ok, X509_STORE_CTX *ctx)
 static void
 info_cb(const SSL *ssl, int type, int args)
 {
+	const char *desc;
+
+	desc = SSL_state_string_long(ssl);
+
 	switch (type)
 	{
 		case SSL_CB_HANDSHAKE_START:
 			ereport(DEBUG4,
-					(errmsg_internal("SSL: handshake start")));
+					(errmsg_internal("SSL: handshake start: \"%s\"", desc)));
 			break;
 		case SSL_CB_HANDSHAKE_DONE:
 			ereport(DEBUG4,
-					(errmsg_internal("SSL: handshake done")));
+					(errmsg_internal("SSL: handshake done: \"%s\"", desc)));
 			break;
 		case SSL_CB_ACCEPT_LOOP:
 			ereport(DEBUG4,
-					(errmsg_internal("SSL: accept loop")));
+					(errmsg_internal("SSL: accept loop: \"%s\"", desc)));
 			break;
 		case SSL_CB_ACCEPT_EXIT:
 			ereport(DEBUG4,
-					(errmsg_internal("SSL: accept exit (%d)", args)));
+					(errmsg_internal("SSL: accept exit (%d): \"%s\"", args, desc)));
 			break;
 		case SSL_CB_CONNECT_LOOP:
 			ereport(DEBUG4,
-					(errmsg_internal("SSL: connect loop")));
+					(errmsg_internal("SSL: connect loop: \"%s\"", desc)));
 			break;
 		case SSL_CB_CONNECT_EXIT:
 			ereport(DEBUG4,
-					(errmsg_internal("SSL: connect exit (%d)", args)));
+					(errmsg_internal("SSL: connect exit (%d): \"%s\"", args, desc)));
 			break;
 		case SSL_CB_READ_ALERT:
 			ereport(DEBUG4,
-					(errmsg_internal("SSL: read alert (0x%04x)", args)));
+					(errmsg_internal("SSL: read alert (0x%04x): \"%s\"", args, desc)));
 			break;
 		case SSL_CB_WRITE_ALERT:
 			ereport(DEBUG4,
-					(errmsg_internal("SSL: write alert (0x%04x)", args)));
+					(errmsg_internal("SSL: write alert (0x%04x): \"%s\"", args, desc)));
 			break;
 	}
 }
@@ -1123,9 +1348,9 @@ initialize_ecdh(SSL_CTX *context, bool isServerStart)
  *
  * ERR_get_error() is used by caller to get errcode to pass here.
  *
- * Some caution is needed here since ERR_reason_error_string will
- * return NULL if it doesn't recognize the error code.  We don't
- * want to return NULL ever.
+ * Some caution is needed here since ERR_reason_error_string will return NULL
+ * if it doesn't recognize the error code, or (in OpenSSL >= 3) if the code
+ * represents a system errno value.  We don't want to return NULL ever.
  */
 static const char *
 SSLerrmessage(unsigned long ecode)
@@ -1138,6 +1363,19 @@ SSLerrmessage(unsigned long ecode)
 	errreason = ERR_reason_error_string(ecode);
 	if (errreason != NULL)
 		return errreason;
+
+	/*
+	 * In OpenSSL 3.0.0 and later, ERR_reason_error_string randomly refuses to
+	 * map system errno values.  We can cover that shortcoming with this bit
+	 * of code.  Older OpenSSL versions don't have the ERR_SYSTEM_ERROR macro,
+	 * but that's okay because they don't have the shortcoming either.
+	 */
+#ifdef ERR_SYSTEM_ERROR
+	if (ERR_SYSTEM_ERROR(ecode))
+		return strerror(ERR_GET_REASON(ecode));
+#endif
+
+	/* No choice but to report the numeric ecode */
 	snprintf(errbuf, sizeof(errbuf), _("SSL error code %lu"), ecode);
 	return errbuf;
 }
@@ -1154,15 +1392,6 @@ be_tls_get_cipher_bits(Port *port)
 	}
 	else
 		return 0;
-}
-
-bool
-be_tls_get_compression(Port *port)
-{
-	if (port->ssl)
-		return (SSL_get_current_compression(port->ssl) != NULL);
-	else
-		return false;
 }
 
 const char *
@@ -1222,7 +1451,6 @@ be_tls_get_peer_serial(Port *port, char *ptr, size_t len)
 		ptr[0] = '\0';
 }
 
-#ifdef HAVE_X509_GET_SIGNATURE_NID
 char *
 be_tls_get_certificate_hash(Port *port, size_t *len)
 {
@@ -1240,10 +1468,15 @@ be_tls_get_certificate_hash(Port *port, size_t *len)
 
 	/*
 	 * Get the signature algorithm of the certificate to determine the hash
-	 * algorithm to use for the result.
+	 * algorithm to use for the result.  Prefer X509_get_signature_info(),
+	 * introduced in OpenSSL 1.1.1, which can handle RSA-PSS signatures.
 	 */
+#if HAVE_X509_GET_SIGNATURE_INFO
+	if (!X509_get_signature_info(server_cert, &algo_nid, NULL, NULL, NULL))
+#else
 	if (!OBJ_find_sigid_algs(X509_get_signature_nid(server_cert),
 							 &algo_nid, NULL))
+#endif
 		elog(ERROR, "could not determine server certificate signature algorithm");
 
 	/*
@@ -1276,7 +1509,6 @@ be_tls_get_certificate_hash(Port *port, size_t *len)
 
 	return cert_hash;
 }
-#endif
 
 /*
  * Convert an X509 subject name to a cstring.
@@ -1298,15 +1530,28 @@ X509_NAME_to_cstring(X509_NAME *name)
 	char	   *dp;
 	char	   *result;
 
+	if (membuf == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("could not create BIO")));
+
 	(void) BIO_set_close(membuf, BIO_CLOSE);
 	for (i = 0; i < count; i++)
 	{
 		e = X509_NAME_get_entry(name, i);
 		nid = OBJ_obj2nid(X509_NAME_ENTRY_get_object(e));
+		if (nid == NID_undef)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("could not get NID for ASN1_OBJECT object")));
 		v = X509_NAME_ENTRY_get_data(e);
 		field_name = OBJ_nid2sn(nid);
-		if (!field_name)
+		if (field_name == NULL)
 			field_name = OBJ_nid2ln(nid);
+		if (field_name == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("could not convert NID %d to an ASN1_OBJECT structure", nid)));
 		BIO_printf(membuf, "/%s=", field_name);
 		ASN1_STRING_print_ex(membuf, v,
 							 ((ASN1_STRFLGS_RFC2253 & ~ASN1_STRFLGS_ESC_MSB)
@@ -1322,7 +1567,8 @@ X509_NAME_to_cstring(X509_NAME *name)
 	result = pstrdup(dp);
 	if (dp != sp)
 		pfree(dp);
-	BIO_free(membuf);
+	if (BIO_free(membuf) != 1)
+		elog(ERROR, "could not free OpenSSL BIO structure");
 
 	return result;
 }
@@ -1331,7 +1577,8 @@ X509_NAME_to_cstring(X509_NAME *name)
  * Convert TLS protocol version GUC enum to OpenSSL values
  *
  * This is a straightforward one-to-one mapping, but doing it this way makes
- * guc.c independent of OpenSSL availability and version.
+ * the definitions of ssl_min_protocol_version and ssl_max_protocol_version
+ * independent of OpenSSL availability and version.
  *
  * If a version is passed that is not supported by the current OpenSSL
  * version, then we return -1.  If a nonnegative value is returned,

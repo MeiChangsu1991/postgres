@@ -9,7 +9,7 @@
  * though.)
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -20,19 +20,31 @@
 #include "postgres.h"
 
 #include "access/xlog.h"
+#include "access/xlogrecovery.h"
+#include "access/xlogutils.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
-#include "pgstat.h"
-#include "postmaster/interrupt.h"
+#include "postmaster/auxprocess.h"
 #include "postmaster/startup.h"
 #include "storage/ipc.h"
-#include "storage/latch.h"
 #include "storage/pmsignal.h"
 #include "storage/procsignal.h"
 #include "storage/standby.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/timeout.h"
 
+
+#ifndef USE_POSTMASTER_DEATH_SIGNAL
+/*
+ * On systems that need to make a system call to find out if the postmaster has
+ * gone away, we'll do so only every Nth call to HandleStartupProcInterrupts().
+ * This only affects how long it takes us to detect the condition while we're
+ * busy replaying WAL.  Latch waits and similar which should react immediately
+ * through the usual techniques.
+ */
+#define POSTMASTER_POLL_RATE_LIMIT 1024
+#endif
 
 /*
  * Flags set by interrupt handlers for later service in the redo loop.
@@ -47,9 +59,28 @@ static volatile sig_atomic_t promote_signaled = false;
  */
 static volatile sig_atomic_t in_restore_command = false;
 
+/*
+ * Time at which the most recent startup operation started.
+ */
+static TimestampTz startup_progress_phase_start_time;
+
+/*
+ * Indicates whether the startup progress interval mentioned by the user is
+ * elapsed or not. TRUE if timeout occurred, FALSE otherwise.
+ */
+static volatile sig_atomic_t startup_progress_timer_expired = false;
+
+/*
+ * Time between progress updates for long-running startup operations.
+ */
+int			log_startup_progress_interval = 10000;	/* 10 sec */
+
 /* Signal handlers */
 static void StartupProcTriggerHandler(SIGNAL_ARGS);
 static void StartupProcSigHupHandler(SIGNAL_ARGS);
+
+/* Callbacks */
+static void StartupProcExit(int code, Datum arg);
 
 
 /* --------------------------------
@@ -61,39 +92,27 @@ static void StartupProcSigHupHandler(SIGNAL_ARGS);
 static void
 StartupProcTriggerHandler(SIGNAL_ARGS)
 {
-	int			save_errno = errno;
-
 	promote_signaled = true;
 	WakeupRecovery();
-
-	errno = save_errno;
 }
 
 /* SIGHUP: set flag to re-read config file at next convenient time */
 static void
 StartupProcSigHupHandler(SIGNAL_ARGS)
 {
-	int			save_errno = errno;
-
 	got_SIGHUP = true;
 	WakeupRecovery();
-
-	errno = save_errno;
 }
 
 /* SIGTERM: set flag to abort redo and exit */
 static void
 StartupProcShutdownHandler(SIGNAL_ARGS)
 {
-	int			save_errno = errno;
-
 	if (in_restore_command)
 		proc_exit(1);
 	else
 		shutdown_requested = true;
 	WakeupRecovery();
-
-	errno = save_errno;
 }
 
 /*
@@ -134,6 +153,10 @@ StartupRereadConfig(void)
 void
 HandleStartupProcInterrupts(void)
 {
+#ifdef POSTMASTER_POLL_RATE_LIMIT
+	static uint32 postmaster_poll_count = 0;
+#endif
+
 	/*
 	 * Process any requests or signals received recently.
 	 */
@@ -151,14 +174,37 @@ HandleStartupProcInterrupts(void)
 
 	/*
 	 * Emergency bailout if postmaster has died.  This is to avoid the
-	 * necessity for manual cleanup of all postmaster children.
+	 * necessity for manual cleanup of all postmaster children.  Do this less
+	 * frequently on systems for which we don't have signals to make that
+	 * cheap.
 	 */
-	if (IsUnderPostmaster && !PostmasterIsAlive())
+	if (IsUnderPostmaster &&
+#ifdef POSTMASTER_POLL_RATE_LIMIT
+		postmaster_poll_count++ % POSTMASTER_POLL_RATE_LIMIT == 0 &&
+#endif
+		!PostmasterIsAlive())
 		exit(1);
 
 	/* Process barrier events */
 	if (ProcSignalBarrierPending)
 		ProcessProcSignalBarrier();
+
+	/* Perform logging of memory contexts of this process */
+	if (LogMemoryContextPending)
+		ProcessLogMemoryContextInterrupt();
+}
+
+
+/* --------------------------------
+ *		signal handler routines
+ * --------------------------------
+ */
+static void
+StartupProcExit(int code, Datum arg)
+{
+	/* Shutdown the recovery environment */
+	if (standbyState != STANDBY_DISABLED)
+		ShutdownRecoveryTransactionEnvironment();
 }
 
 
@@ -167,15 +213,23 @@ HandleStartupProcInterrupts(void)
  * ----------------------------------
  */
 void
-StartupProcessMain(void)
+StartupProcessMain(char *startup_data, size_t startup_data_len)
 {
+	Assert(startup_data_len == 0);
+
+	MyBackendType = B_STARTUP;
+	AuxiliaryProcessMainCommon();
+
+	/* Arrange to clean up at startup process exit */
+	on_shmem_exit(StartupProcExit, 0);
+
 	/*
 	 * Properly accept or ignore signals the postmaster might send us.
 	 */
 	pqsignal(SIGHUP, StartupProcSigHupHandler); /* reload config file */
 	pqsignal(SIGINT, SIG_IGN);	/* ignore query cancel */
 	pqsignal(SIGTERM, StartupProcShutdownHandler);	/* request shutdown */
-	pqsignal(SIGQUIT, SignalHandlerForCrashExit);
+	/* SIGQUIT handler was already set up by InitPostmasterChild */
 	InitializeTimeouts();		/* establishes SIGALRM handler */
 	pqsignal(SIGPIPE, SIG_IGN);
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
@@ -196,7 +250,7 @@ StartupProcessMain(void)
 	/*
 	 * Unblock signals (they were blocked when the postmaster forked us)
 	 */
-	PG_SETMASK(&UnBlockSig);
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 
 	/*
 	 * Do what we came for.
@@ -240,4 +294,85 @@ void
 ResetPromoteSignaled(void)
 {
 	promote_signaled = false;
+}
+
+/*
+ * Set a flag indicating that it's time to log a progress report.
+ */
+void
+startup_progress_timeout_handler(void)
+{
+	startup_progress_timer_expired = true;
+}
+
+void
+disable_startup_progress_timeout(void)
+{
+	/* Feature is disabled. */
+	if (log_startup_progress_interval == 0)
+		return;
+
+	disable_timeout(STARTUP_PROGRESS_TIMEOUT, false);
+	startup_progress_timer_expired = false;
+}
+
+/*
+ * Set the start timestamp of the current operation and enable the timeout.
+ */
+void
+enable_startup_progress_timeout(void)
+{
+	TimestampTz fin_time;
+
+	/* Feature is disabled. */
+	if (log_startup_progress_interval == 0)
+		return;
+
+	startup_progress_phase_start_time = GetCurrentTimestamp();
+	fin_time = TimestampTzPlusMilliseconds(startup_progress_phase_start_time,
+										   log_startup_progress_interval);
+	enable_timeout_every(STARTUP_PROGRESS_TIMEOUT, fin_time,
+						 log_startup_progress_interval);
+}
+
+/*
+ * A thin wrapper to first disable and then enable the startup progress
+ * timeout.
+ */
+void
+begin_startup_progress_phase(void)
+{
+	/* Feature is disabled. */
+	if (log_startup_progress_interval == 0)
+		return;
+
+	disable_startup_progress_timeout();
+	enable_startup_progress_timeout();
+}
+
+/*
+ * Report whether startup progress timeout has occurred. Reset the timer flag
+ * if it did, set the elapsed time to the out parameters and return true,
+ * otherwise return false.
+ */
+bool
+has_startup_progress_timeout_expired(long *secs, int *usecs)
+{
+	long		seconds;
+	int			useconds;
+	TimestampTz now;
+
+	/* No timeout has occurred. */
+	if (!startup_progress_timer_expired)
+		return false;
+
+	/* Calculate the elapsed time. */
+	now = GetCurrentTimestamp();
+	TimestampDifference(startup_progress_phase_start_time, now, &seconds, &useconds);
+
+	*secs = seconds;
+	*usecs = useconds;
+	startup_progress_timer_expired = false;
+
+	return true;
 }

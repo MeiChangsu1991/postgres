@@ -134,7 +134,8 @@ main(int argc, char *argv[])
 				break;
 
 			default:
-				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+				/* getopt_long already emitted a complaint */
+				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 				exit(1);
 		}
 	}
@@ -152,39 +153,37 @@ main(int argc, char *argv[])
 	{
 		pg_log_error("too many command-line arguments (first is \"%s\")",
 					 argv[optind]);
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
 	}
 
 	if (DataDir == NULL)
 	{
 		pg_log_error("no data directory specified");
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
 	}
 
 	/* get a copy of the control file */
 	ControlFile = get_controlfile(DataDir, &crc_ok);
 	if (!crc_ok)
-		printf(_("WARNING: Calculated CRC checksum does not match value stored in file.\n"
-				 "Either the file is corrupt, or it has a different layout than this program\n"
-				 "is expecting.  The results below are untrustworthy.\n\n"));
+	{
+		pg_log_warning("calculated CRC checksum does not match value stored in control file");
+		pg_log_warning_detail("Either the control file is corrupt, or it has a different layout than this program "
+							  "is expecting.  The results below are untrustworthy.");
+	}
 
 	/* set wal segment size */
 	WalSegSz = ControlFile->xlog_seg_size;
 
 	if (!IsValidWalSegSize(WalSegSz))
 	{
-		printf(_("WARNING: invalid WAL segment size\n"));
-		printf(ngettext("The WAL segment size stored in the file, %d byte, is not a power of two\n"
-						"between 1 MB and 1 GB.  The file is corrupt and the results below are\n"
-						"untrustworthy.\n\n",
-						"The WAL segment size stored in the file, %d bytes, is not a power of two\n"
-						"between 1 MB and 1 GB.  The file is corrupt and the results below are\n"
-						"untrustworthy.\n\n",
-						WalSegSz),
-			   WalSegSz);
+		pg_log_warning(ngettext("invalid WAL segment size in control file (%d byte)",
+								"invalid WAL segment size in control file (%d bytes)",
+								WalSegSz),
+					   WalSegSz);
+		pg_log_warning_detail("The WAL segment size must be a power of two between 1 MB and 1 GB.");
+		pg_log_warning_detail("The file is corrupt and the results below are untrustworthy.");
 	}
 
 	/*
@@ -236,11 +235,9 @@ main(int argc, char *argv[])
 	printf(_("pg_control last modified:             %s\n"),
 		   pgctime_str);
 	printf(_("Latest checkpoint location:           %X/%X\n"),
-		   (uint32) (ControlFile->checkPoint >> 32),
-		   (uint32) ControlFile->checkPoint);
+		   LSN_FORMAT_ARGS(ControlFile->checkPoint));
 	printf(_("Latest checkpoint's REDO location:    %X/%X\n"),
-		   (uint32) (ControlFile->checkPointCopy.redo >> 32),
-		   (uint32) ControlFile->checkPointCopy.redo);
+		   LSN_FORMAT_ARGS(ControlFile->checkPointCopy.redo));
 	printf(_("Latest checkpoint's REDO WAL file:    %s\n"),
 		   xlogfilename);
 	printf(_("Latest checkpoint's TimeLineID:       %u\n"),
@@ -250,8 +247,8 @@ main(int argc, char *argv[])
 	printf(_("Latest checkpoint's full_page_writes: %s\n"),
 		   ControlFile->checkPointCopy.fullPageWrites ? _("on") : _("off"));
 	printf(_("Latest checkpoint's NextXID:          %u:%u\n"),
-		   EpochFromFullTransactionId(ControlFile->checkPointCopy.nextFullXid),
-		   XidFromFullTransactionId(ControlFile->checkPointCopy.nextFullXid));
+		   EpochFromFullTransactionId(ControlFile->checkPointCopy.nextXid),
+		   XidFromFullTransactionId(ControlFile->checkPointCopy.nextXid));
 	printf(_("Latest checkpoint's NextOID:          %u\n"),
 		   ControlFile->checkPointCopy.nextOid);
 	printf(_("Latest checkpoint's NextMultiXactId:  %u\n"),
@@ -275,19 +272,15 @@ main(int argc, char *argv[])
 	printf(_("Time of latest checkpoint:            %s\n"),
 		   ckpttime_str);
 	printf(_("Fake LSN counter for unlogged rels:   %X/%X\n"),
-		   (uint32) (ControlFile->unloggedLSN >> 32),
-		   (uint32) ControlFile->unloggedLSN);
+		   LSN_FORMAT_ARGS(ControlFile->unloggedLSN));
 	printf(_("Minimum recovery ending location:     %X/%X\n"),
-		   (uint32) (ControlFile->minRecoveryPoint >> 32),
-		   (uint32) ControlFile->minRecoveryPoint);
+		   LSN_FORMAT_ARGS(ControlFile->minRecoveryPoint));
 	printf(_("Min recovery ending loc's timeline:   %u\n"),
 		   ControlFile->minRecoveryPointTLI);
 	printf(_("Backup start location:                %X/%X\n"),
-		   (uint32) (ControlFile->backupStartPoint >> 32),
-		   (uint32) ControlFile->backupStartPoint);
+		   LSN_FORMAT_ARGS(ControlFile->backupStartPoint));
 	printf(_("Backup end location:                  %X/%X\n"),
-		   (uint32) (ControlFile->backupEndPoint >> 32),
-		   (uint32) ControlFile->backupEndPoint);
+		   LSN_FORMAT_ARGS(ControlFile->backupEndPoint));
 	printf(_("End-of-backup record required:        %s\n"),
 		   ControlFile->backupEndRequired ? _("yes") : _("no"));
 	printf(_("wal_level setting:                    %s\n"),

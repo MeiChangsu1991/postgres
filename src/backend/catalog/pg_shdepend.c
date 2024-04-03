@@ -3,7 +3,7 @@
  * pg_shdepend.c
  *	  routines to support manipulation of the pg_shdepend relation
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,6 +22,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_auth_members.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database.h"
@@ -32,7 +33,6 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_largeobject.h"
-#include "catalog/pg_largeobject_metadata.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
@@ -47,30 +47,28 @@
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/alter.h"
-#include "commands/collationcmds.h"
-#include "commands/conversioncmds.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
-#include "commands/extension.h"
 #include "commands/policy.h"
-#include "commands/proclang.h"
 #include "commands/publicationcmds.h"
 #include "commands/schemacmds.h"
 #include "commands/subscriptioncmds.h"
 #include "commands/tablecmds.h"
+#include "commands/tablespace.h"
 #include "commands/typecmds.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/fmgroids.h"
+#include "utils/memutils.h"
 #include "utils/syscache.h"
 
 typedef enum
 {
 	LOCAL_OBJECT,
 	SHARED_OBJECT,
-	REMOTE_OBJECT
+	REMOTE_OBJECT,
 } SharedDependencyObjectType;
 
 typedef struct
@@ -100,7 +98,6 @@ static void storeObjectDescription(StringInfo descs,
 								   ObjectAddress *object,
 								   SharedDependencyType deptype,
 								   int count);
-static bool isSharedObjectPinned(Oid classId, Oid objectId, Relation sdepRel);
 
 
 /*
@@ -139,8 +136,7 @@ recordSharedDependencyOn(ObjectAddress *depender,
 	sdepRel = table_open(SharedDependRelationId, RowExclusiveLock);
 
 	/* If the referenced object is pinned, do nothing. */
-	if (!isSharedObjectPinned(referenced->classId, referenced->objectId,
-							  sdepRel))
+	if (!IsPinnedObject(referenced->classId, referenced->objectId))
 	{
 		shdepAddDependency(sdepRel, depender->classId, depender->objectId,
 						   depender->objectSubId,
@@ -186,11 +182,14 @@ recordDependencyOnOwner(Oid classId, Oid objectId, Oid owner)
  *
  * There must be no more than one existing entry for the given dependent
  * object and dependency type!	So in practice this can only be used for
- * updating SHARED_DEPENDENCY_OWNER entries, which should have that property.
+ * updating SHARED_DEPENDENCY_OWNER and SHARED_DEPENDENCY_TABLESPACE
+ * entries, which should have that property.
  *
  * If there is no previous entry, we assume it was referencing a PINned
  * object, so we create a new entry.  If the new referenced object is
  * PINned, we don't create an entry (and drop the old one, if any).
+ * (For tablespaces, we don't record dependencies in certain cases, so
+ * there are other possible reasons for entries to be missing.)
  *
  * sdepRel must be the pg_shdepend relation, already opened and suitably
  * locked.
@@ -251,7 +250,7 @@ shdepChangeDep(Relation sdepRel,
 
 	systable_endscan(scan);
 
-	if (isSharedObjectPinned(refclassid, refobjid, sdepRel))
+	if (IsPinnedObject(refclassid, refobjid))
 	{
 		/* No new entry needed, so just delete existing entry if any */
 		if (oldtup)
@@ -340,6 +339,58 @@ changeDependencyOnOwner(Oid classId, Oid objectId, Oid newOwnerId)
 	shdepDropDependency(sdepRel, classId, objectId, 0, true,
 						AuthIdRelationId, newOwnerId,
 						SHARED_DEPENDENCY_ACL);
+
+	table_close(sdepRel, RowExclusiveLock);
+}
+
+/*
+ * recordDependencyOnTablespace
+ *
+ * A convenient wrapper of recordSharedDependencyOn -- register the specified
+ * tablespace as default for the given object.
+ *
+ * Note: it's the caller's responsibility to ensure that there isn't a
+ * tablespace entry for the object already.
+ */
+void
+recordDependencyOnTablespace(Oid classId, Oid objectId, Oid tablespace)
+{
+	ObjectAddress myself,
+				referenced;
+
+	ObjectAddressSet(myself, classId, objectId);
+	ObjectAddressSet(referenced, TableSpaceRelationId, tablespace);
+
+	recordSharedDependencyOn(&myself, &referenced,
+							 SHARED_DEPENDENCY_TABLESPACE);
+}
+
+/*
+ * changeDependencyOnTablespace
+ *
+ * Update the shared dependencies to account for the new tablespace.
+ *
+ * Note: we don't need an objsubid argument because only whole objects
+ * have tablespaces.
+ */
+void
+changeDependencyOnTablespace(Oid classId, Oid objectId, Oid newTablespaceId)
+{
+	Relation	sdepRel;
+
+	sdepRel = table_open(SharedDependRelationId, RowExclusiveLock);
+
+	if (newTablespaceId != DEFAULTTABLESPACE_OID &&
+		newTablespaceId != InvalidOid)
+		shdepChangeDep(sdepRel,
+					   classId, objectId, 0,
+					   TableSpaceRelationId, newTablespaceId,
+					   SHARED_DEPENDENCY_TABLESPACE);
+	else
+		shdepDropDependency(sdepRel,
+							classId, objectId, 0, true,
+							InvalidOid, InvalidOid,
+							SHARED_DEPENDENCY_INVALID);
 
 	table_close(sdepRel, RowExclusiveLock);
 }
@@ -457,7 +508,7 @@ updateAclDependencies(Oid classId, Oid objectId, int32 objsubId,
 				continue;
 
 			/* Skip pinned roles; they don't need dependency entries */
-			if (isSharedObjectPinned(AuthIdRelationId, roleid, sdepRel))
+			if (IsPinnedObject(AuthIdRelationId, roleid))
 				continue;
 
 			shdepAddDependency(sdepRel, classId, objectId, objsubId,
@@ -475,7 +526,7 @@ updateAclDependencies(Oid classId, Oid objectId, int32 objsubId,
 				continue;
 
 			/* Skip pinned roles */
-			if (isSharedObjectPinned(AuthIdRelationId, roleid, sdepRel))
+			if (IsPinnedObject(AuthIdRelationId, roleid))
 				continue;
 
 			shdepDropDependency(sdepRel, classId, objectId, objsubId,
@@ -570,8 +621,6 @@ shared_dependency_comparator(const void *a, const void *b)
  * on objects local to other databases.  We can (and do) provide descriptions
  * of the two former kinds of objects, but we can't do that for "remote"
  * objects, so we just provide a count of them.
- *
- * If we find a SHARED_DEPENDENCY_PIN entry, we can error out early.
  */
 bool
 checkSharedDependencies(Oid classId, Oid objectId,
@@ -592,6 +641,18 @@ checkSharedDependencies(Oid classId, Oid objectId,
 	int			allocedobjects;
 	StringInfoData descs;
 	StringInfoData alldescs;
+
+	/* This case can be dispatched quickly */
+	if (IsPinnedObject(classId, objectId))
+	{
+		object.classId = classId;
+		object.objectId = objectId;
+		object.objectSubId = 0;
+		ereport(ERROR,
+				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+				 errmsg("cannot drop %s because it is required by the database system",
+						getObjectDescription(&object, false))));
+	}
 
 	/*
 	 * We limit the number of dependencies reported to the client to
@@ -628,18 +689,6 @@ checkSharedDependencies(Oid classId, Oid objectId,
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
 		Form_pg_shdepend sdepForm = (Form_pg_shdepend) GETSTRUCT(tup);
-
-		/* This case can be dispatched quickly */
-		if (sdepForm->deptype == SHARED_DEPENDENCY_PIN)
-		{
-			object.classId = classId;
-			object.objectId = objectId;
-			object.objectSubId = 0;
-			ereport(ERROR,
-					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
-					 errmsg("cannot drop %s because it is required by the database system",
-							getObjectDescription(&object, false))));
-		}
 
 		object.classId = sdepForm->classid;
 		object.objectId = sdepForm->objid;
@@ -708,7 +757,7 @@ checkSharedDependencies(Oid classId, Oid objectId,
 	 * Sort and report local and shared objects.
 	 */
 	if (numobjects > 1)
-		qsort((void *) objects, numobjects,
+		qsort(objects, numobjects,
 			  sizeof(ShDependObjectInfo), shared_dependency_comparator);
 
 	for (int i = 0; i < numobjects; i++)
@@ -785,6 +834,7 @@ checkSharedDependencies(Oid classId, Oid objectId,
 	return true;
 }
 
+
 /*
  * copyTemplateDependencies
  *
@@ -800,12 +850,20 @@ copyTemplateDependencies(Oid templateDbId, Oid newDbId)
 	SysScanDesc scan;
 	HeapTuple	tup;
 	CatalogIndexState indstate;
-	Datum		values[Natts_pg_shdepend];
-	bool		nulls[Natts_pg_shdepend];
-	bool		replace[Natts_pg_shdepend];
+	TupleTableSlot **slot;
+	int			max_slots,
+				slot_init_count,
+				slot_stored_count;
 
 	sdepRel = table_open(SharedDependRelationId, RowExclusiveLock);
 	sdepDesc = RelationGetDescr(sdepRel);
+
+	/*
+	 * Allocate the slots to use, but delay costly initialization until we
+	 * know that they will be used.
+	 */
+	max_slots = MAX_CATALOG_MULTI_INSERT_BYTES / sizeof(FormData_pg_shdepend);
+	slot = palloc(sizeof(TupleTableSlot *) * max_slots);
 
 	indstate = CatalogOpenIndexes(sdepRel);
 
@@ -818,13 +876,10 @@ copyTemplateDependencies(Oid templateDbId, Oid newDbId)
 	scan = systable_beginscan(sdepRel, SharedDependDependerIndexId, true,
 							  NULL, 1, key);
 
-	/* Set up to copy the tuples except for inserting newDbId */
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-	memset(replace, false, sizeof(replace));
-
-	replace[Anum_pg_shdepend_dbid - 1] = true;
-	values[Anum_pg_shdepend_dbid - 1] = ObjectIdGetDatum(newDbId);
+	/* number of slots currently storing tuples */
+	slot_stored_count = 0;
+	/* number of slots currently initialized */
+	slot_init_count = 0;
 
 	/*
 	 * Copy the entries of the original database, changing the database Id to
@@ -835,18 +890,53 @@ copyTemplateDependencies(Oid templateDbId, Oid newDbId)
 	 */
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
-		HeapTuple	newtup;
+		Form_pg_shdepend shdep;
 
-		newtup = heap_modify_tuple(tup, sdepDesc, values, nulls, replace);
-		CatalogTupleInsertWithInfo(sdepRel, newtup, indstate);
+		if (slot_init_count < max_slots)
+		{
+			slot[slot_stored_count] = MakeSingleTupleTableSlot(sdepDesc, &TTSOpsHeapTuple);
+			slot_init_count++;
+		}
 
-		heap_freetuple(newtup);
+		ExecClearTuple(slot[slot_stored_count]);
+
+		memset(slot[slot_stored_count]->tts_isnull, false,
+			   slot[slot_stored_count]->tts_tupleDescriptor->natts * sizeof(bool));
+
+		shdep = (Form_pg_shdepend) GETSTRUCT(tup);
+
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_dbid - 1] = ObjectIdGetDatum(newDbId);
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_classid - 1] = shdep->classid;
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_objid - 1] = shdep->objid;
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_objsubid - 1] = shdep->objsubid;
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_refclassid - 1] = shdep->refclassid;
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_refobjid - 1] = shdep->refobjid;
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_deptype - 1] = shdep->deptype;
+
+		ExecStoreVirtualTuple(slot[slot_stored_count]);
+		slot_stored_count++;
+
+		/* If slots are full, insert a batch of tuples */
+		if (slot_stored_count == max_slots)
+		{
+			CatalogTuplesMultiInsertWithInfo(sdepRel, slot, slot_stored_count, indstate);
+			slot_stored_count = 0;
+		}
 	}
+
+	/* Insert any tuples left in the buffer */
+	if (slot_stored_count > 0)
+		CatalogTuplesMultiInsertWithInfo(sdepRel, slot, slot_stored_count, indstate);
 
 	systable_endscan(scan);
 
 	CatalogCloseIndexes(indstate);
 	table_close(sdepRel, RowExclusiveLock);
+
+	/* Drop only the number of slots used */
+	for (int i = 0; i < slot_init_count; i++)
+		ExecDropSingleTupleTableSlot(slot[i]);
+	pfree(slot);
 }
 
 /*
@@ -1083,13 +1173,6 @@ shdepLockAndCheckObject(Oid classId, Oid objectId)
 								objectId)));
 			break;
 
-			/*
-			 * Currently, this routine need not support any other shared
-			 * object types besides roles.  If we wanted to record explicit
-			 * dependencies on databases or tablespaces, we'd need code along
-			 * these lines:
-			 */
-#ifdef NOT_USED
 		case TableSpaceRelationId:
 			{
 				/* For lack of a syscache on pg_tablespace, do this: */
@@ -1103,7 +1186,6 @@ shdepLockAndCheckObject(Oid classId, Oid objectId)
 				pfree(tablespace);
 				break;
 			}
-#endif
 
 		case DatabaseRelationId:
 			{
@@ -1149,6 +1231,12 @@ storeObjectDescription(StringInfo descs,
 {
 	char	   *objdesc = getObjectDescription(object, false);
 
+	/*
+	 * An object being dropped concurrently doesn't need to be reported.
+	 */
+	if (objdesc == NULL)
+		return;
+
 	/* separate entries with a newline */
 	if (descs->len != 0)
 		appendStringInfoChar(descs, '\n');
@@ -1163,6 +1251,8 @@ storeObjectDescription(StringInfo descs,
 				appendStringInfo(descs, _("privileges for %s"), objdesc);
 			else if (deptype == SHARED_DEPENDENCY_POLICY)
 				appendStringInfo(descs, _("target of %s"), objdesc);
+			else if (deptype == SHARED_DEPENDENCY_TABLESPACE)
+				appendStringInfo(descs, _("tablespace for %s"), objdesc);
 			else
 				elog(ERROR, "unrecognized dependency type: %d",
 					 (int) deptype);
@@ -1183,53 +1273,6 @@ storeObjectDescription(StringInfo descs,
 	pfree(objdesc);
 }
 
-
-/*
- * isSharedObjectPinned
- *		Return whether a given shared object has a SHARED_DEPENDENCY_PIN entry.
- *
- * sdepRel must be the pg_shdepend relation, already opened and suitably
- * locked.
- */
-static bool
-isSharedObjectPinned(Oid classId, Oid objectId, Relation sdepRel)
-{
-	bool		result = false;
-	ScanKeyData key[2];
-	SysScanDesc scan;
-	HeapTuple	tup;
-
-	ScanKeyInit(&key[0],
-				Anum_pg_shdepend_refclassid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(classId));
-	ScanKeyInit(&key[1],
-				Anum_pg_shdepend_refobjid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(objectId));
-
-	scan = systable_beginscan(sdepRel, SharedDependReferenceIndexId, true,
-							  NULL, 2, key);
-
-	/*
-	 * Since we won't generate additional pg_shdepend entries for pinned
-	 * objects, there can be at most one entry referencing a pinned object.
-	 * Hence, it's sufficient to look at the first returned tuple; we don't
-	 * need to loop.
-	 */
-	tup = systable_getnext(scan);
-	if (HeapTupleIsValid(tup))
-	{
-		Form_pg_shdepend shdepForm = (Form_pg_shdepend) GETSTRUCT(tup);
-
-		if (shdepForm->deptype == SHARED_DEPENDENCY_PIN)
-			result = true;
-	}
-
-	systable_endscan(scan);
-
-	return result;
-}
 
 /*
  * shdepDropOwned
@@ -1271,7 +1314,7 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 		HeapTuple	tuple;
 
 		/* Doesn't work for pinned objects */
-		if (isSharedObjectPinned(AuthIdRelationId, roleid, sdepRel))
+		if (IsPinnedObject(AuthIdRelationId, roleid))
 		{
 			ObjectAddress obj;
 
@@ -1314,14 +1357,8 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 			switch (sdepForm->deptype)
 			{
 					/* Shouldn't happen */
-				case SHARED_DEPENDENCY_PIN:
 				case SHARED_DEPENDENCY_INVALID:
 					elog(ERROR, "unexpected dependency type");
-					break;
-				case SHARED_DEPENDENCY_ACL:
-					RemoveRoleFromObjectACL(roleid,
-											sdepForm->classid,
-											sdepForm->objid);
 					break;
 				case SHARED_DEPENDENCY_POLICY:
 
@@ -1352,9 +1389,34 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 						add_exact_object_address(&obj, deleteobjs);
 					}
 					break;
+				case SHARED_DEPENDENCY_ACL:
+
+					/*
+					 * Dependencies on role grants are recorded using
+					 * SHARED_DEPENDENCY_ACL, but unlike a regular ACL list
+					 * which stores all permissions for a particular object in
+					 * a single ACL array, there's a separate catalog row for
+					 * each grant - so removing the grant just means removing
+					 * the entire row.
+					 */
+					if (sdepForm->classid != AuthMemRelationId)
+					{
+						RemoveRoleFromObjectACL(roleid,
+												sdepForm->classid,
+												sdepForm->objid);
+						break;
+					}
+					/* FALLTHROUGH */
+
 				case SHARED_DEPENDENCY_OWNER:
-					/* If a local object, save it for deletion below */
-					if (sdepForm->dbid == MyDatabaseId)
+
+					/*
+					 * Save it for deletion below, if it's a local object or a
+					 * role grant. Other shared objects, such as databases,
+					 * should not be removed here.
+					 */
+					if (sdepForm->dbid == MyDatabaseId ||
+						sdepForm->classid == AuthMemRelationId)
 					{
 						obj.classId = sdepForm->classid;
 						obj.objectId = sdepForm->objid;
@@ -1418,7 +1480,7 @@ shdepReassignOwned(List *roleids, Oid newrole)
 		Oid			roleid = lfirst_oid(cell);
 
 		/* Refuse to work on pinned roles */
-		if (isSharedObjectPinned(AuthIdRelationId, roleid, sdepRel))
+		if (IsPinnedObject(AuthIdRelationId, roleid))
 		{
 			ObjectAddress obj;
 
@@ -1452,6 +1514,8 @@ shdepReassignOwned(List *roleids, Oid newrole)
 		while ((tuple = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_shdepend sdepForm = (Form_pg_shdepend) GETSTRUCT(tuple);
+			MemoryContext cxt,
+						oldcxt;
 
 			/*
 			 * We only operate on shared objects and objects in the current
@@ -1461,13 +1525,21 @@ shdepReassignOwned(List *roleids, Oid newrole)
 				sdepForm->dbid != InvalidOid)
 				continue;
 
-			/* Unexpected because we checked for pins above */
-			if (sdepForm->deptype == SHARED_DEPENDENCY_PIN)
-				elog(ERROR, "unexpected shared pin");
-
 			/* We leave non-owner dependencies alone */
 			if (sdepForm->deptype != SHARED_DEPENDENCY_OWNER)
 				continue;
+
+			/*
+			 * The various ALTER OWNER routines tend to leak memory in
+			 * CurrentMemoryContext.  That's not a problem when they're only
+			 * called once per command; but in this usage where we might be
+			 * touching many objects, it can amount to a serious memory leak.
+			 * Fix that by running each call in a short-lived context.
+			 */
+			cxt = AllocSetContextCreate(CurrentMemoryContext,
+										"shdepReassignOwned",
+										ALLOCSET_DEFAULT_SIZES);
+			oldcxt = MemoryContextSwitchTo(cxt);
 
 			/* Issue the appropriate ALTER OWNER call */
 			switch (sdepForm->classid)
@@ -1537,26 +1609,20 @@ shdepReassignOwned(List *roleids, Oid newrole)
 				case DatabaseRelationId:
 				case TSConfigRelationId:
 				case TSDictionaryRelationId:
-					{
-						Oid			classId = sdepForm->classid;
-						Relation	catalog;
-
-						if (classId == LargeObjectRelationId)
-							classId = LargeObjectMetadataRelationId;
-
-						catalog = table_open(classId, RowExclusiveLock);
-
-						AlterObjectOwner_internal(catalog, sdepForm->objid,
-												  newrole);
-
-						table_close(catalog, NoLock);
-					}
+					AlterObjectOwner_internal(sdepForm->classid,
+											  sdepForm->objid,
+											  newrole);
 					break;
 
 				default:
 					elog(ERROR, "unexpected classid %u", sdepForm->classid);
 					break;
 			}
+
+			/* Clean up */
+			MemoryContextSwitchTo(oldcxt);
+			MemoryContextDelete(cxt);
+
 			/* Make sure the next iteration will see my changes */
 			CommandCounterIncrement();
 		}

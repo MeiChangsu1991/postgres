@@ -4,7 +4,7 @@
  *	  This file contains definitions for structures and
  *	  externs for functions used by frontend postgres applications.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/libpq-fe.h
@@ -21,12 +21,24 @@ extern "C"
 #endif
 
 #include <stdio.h>
+#include <time.h>
 
 /*
  * postgres_ext.h defines the backend's externally visible types,
  * such as Oid.
  */
 #include "postgres_ext.h"
+
+/*
+ * These symbols may be used in compile-time #ifdef tests for the availability
+ * of newer libpq features.
+ */
+/* Indicates presence of PQenterPipelineMode and friends */
+#define LIBPQ_HAS_PIPELINING 1
+/* Indicates presence of PQsetTraceFlags; also new PQtrace output format */
+#define LIBPQ_HAS_TRACE_FLAGS 1
+/* Indicates that PQsslAttribute(NULL, "library") is useful */
+#define LIBPQ_HAS_SSL_LIBRARY_DETECTION 1
 
 /*
  * Option flags for PQcopyResult
@@ -60,15 +72,17 @@ typedef enum
 									 * postmaster.        */
 	CONNECTION_AUTH_OK,			/* Received authentication; waiting for
 								 * backend startup. */
-	CONNECTION_SETENV,			/* Negotiating environment. */
+	CONNECTION_SETENV,			/* This state is no longer used. */
 	CONNECTION_SSL_STARTUP,		/* Negotiating SSL. */
-	CONNECTION_NEEDED,			/* Internal state: connect() needed */
-	CONNECTION_CHECK_WRITABLE,	/* Check if we could make a writable
-								 * connection. */
-	CONNECTION_CONSUME,			/* Wait for any pending message and consume
-								 * them. */
+	CONNECTION_NEEDED,			/* Internal state: connect() needed. */
+	CONNECTION_CHECK_WRITABLE,	/* Checking if session is read-write. */
+	CONNECTION_CONSUME,			/* Consuming any extra messages. */
 	CONNECTION_GSS_STARTUP,		/* Negotiating GSSAPI. */
-	CONNECTION_CHECK_TARGET		/* Check if we have a proper target connection */
+	CONNECTION_CHECK_TARGET,	/* Internal state: checking target server
+								 * properties. */
+	CONNECTION_CHECK_STANDBY,	/* Checking if server is in standby mode. */
+	CONNECTION_ALLOCATED		/* Waiting for connection attempt to be
+								 * started.  */
 } ConnStatusType;
 
 typedef enum
@@ -97,7 +111,10 @@ typedef enum
 	PGRES_NONFATAL_ERROR,		/* notice or warning message */
 	PGRES_FATAL_ERROR,			/* query failed */
 	PGRES_COPY_BOTH,			/* Copy In/Out data transfer in progress */
-	PGRES_SINGLE_TUPLE			/* single tuple from larger resultset */
+	PGRES_SINGLE_TUPLE,			/* single tuple from larger resultset */
+	PGRES_PIPELINE_SYNC,		/* pipeline synchronization point */
+	PGRES_PIPELINE_ABORTED		/* Command didn't run because of an abort
+								 * earlier in a pipeline */
 } ExecStatusType;
 
 typedef enum
@@ -137,10 +154,25 @@ typedef enum
 	PQPING_NO_ATTEMPT			/* connection not attempted (bad params) */
 } PGPing;
 
+/*
+ * PGpipelineStatus - Current status of pipeline mode
+ */
+typedef enum
+{
+	PQ_PIPELINE_OFF,
+	PQ_PIPELINE_ON,
+	PQ_PIPELINE_ABORTED
+} PGpipelineStatus;
+
 /* PGconn encapsulates a connection to the backend.
  * The contents of this struct are not supposed to be known to applications.
  */
 typedef struct pg_conn PGconn;
+
+/* PGcancelConn encapsulates a cancel connection to the backend.
+ * The contents of this struct are not supposed to be known to applications.
+ */
+typedef struct pg_cancel_conn PGcancelConn;
 
 /* PGresult encapsulates the result of a query (or more precisely, of a single
  * SQL command --- a query string given to PQsendQuery can contain multiple
@@ -251,7 +283,7 @@ typedef struct pgresAttDesc
  * ----------------
  */
 
-/* ===	in fe-connect.c === */
+/* === in fe-connect.c === */
 
 /* make a new client connection to the backend */
 /* Asynchronous (non-blocking) */
@@ -298,16 +330,34 @@ extern PostgresPollingStatusType PQresetPoll(PGconn *conn);
 /* Synchronous (blocking) */
 extern void PQreset(PGconn *conn);
 
+/* Create a PGcancelConn that's used to cancel a query on the given PGconn */
+extern PGcancelConn *PQcancelCreate(PGconn *conn);
+
+/* issue a cancel request in a non-blocking manner */
+extern int	PQcancelStart(PGcancelConn *cancelConn);
+
+/* issue a blocking cancel request */
+extern int	PQcancelBlocking(PGcancelConn *cancelConn);
+
+/* poll a non-blocking cancel request */
+extern PostgresPollingStatusType PQcancelPoll(PGcancelConn *cancelConn);
+extern ConnStatusType PQcancelStatus(const PGcancelConn *cancelConn);
+extern int	PQcancelSocket(const PGcancelConn *cancelConn);
+extern char *PQcancelErrorMessage(const PGcancelConn *cancelConn);
+extern void PQcancelReset(PGcancelConn *cancelConn);
+extern void PQcancelFinish(PGcancelConn *cancelConn);
+
+
 /* request a cancel structure */
 extern PGcancel *PQgetCancel(PGconn *conn);
 
 /* free a cancel structure */
 extern void PQfreeCancel(PGcancel *cancel);
 
-/* issue a cancel request */
+/* deprecated version of PQcancelBlocking, but one which is signal-safe */
 extern int	PQcancel(PGcancel *cancel, char *errbuf, int errbufsize);
 
-/* backwards compatible version of PQcancel; not thread-safe */
+/* deprecated version of PQcancel; not thread-safe */
 extern int	PQrequestCancel(PGconn *conn);
 
 /* Accessor functions for PGconn objects */
@@ -328,8 +378,10 @@ extern int	PQserverVersion(const PGconn *conn);
 extern char *PQerrorMessage(const PGconn *conn);
 extern int	PQsocket(const PGconn *conn);
 extern int	PQbackendPID(const PGconn *conn);
+extern PGpipelineStatus PQpipelineStatus(const PGconn *conn);
 extern int	PQconnectionNeedsPassword(const PGconn *conn);
 extern int	PQconnectionUsedPassword(const PGconn *conn);
+extern int	PQconnectionUsedGSSAPI(const PGconn *conn);
 extern int	PQclientEncoding(const PGconn *conn);
 extern int	PQsetClientEncoding(PGconn *conn, const char *encoding);
 
@@ -362,10 +414,6 @@ extern PGVerbosity PQsetErrorVerbosity(PGconn *conn, PGVerbosity verbosity);
 extern PGContextVisibility PQsetErrorContextVisibility(PGconn *conn,
 													   PGContextVisibility show_context);
 
-/* Enable/disable tracing */
-extern void PQtrace(PGconn *conn, FILE *debug_port);
-extern void PQuntrace(PGconn *conn);
-
 /* Override default notice handling routines */
 extern PQnoticeReceiver PQsetNoticeReceiver(PGconn *conn,
 											PQnoticeReceiver proc,
@@ -384,6 +432,17 @@ extern PQnoticeProcessor PQsetNoticeProcessor(PGconn *conn,
 typedef void (*pgthreadlock_t) (int acquire);
 
 extern pgthreadlock_t PQregisterThreadLock(pgthreadlock_t newhandler);
+
+/* === in fe-trace.c === */
+extern void PQtrace(PGconn *conn, FILE *debug_port);
+extern void PQuntrace(PGconn *conn);
+
+/* flags controlling trace output: */
+/* omit timestamps from each line */
+#define PQTRACE_SUPPRESS_TIMESTAMPS		(1<<0)
+/* redact portions of some messages, for testing frameworks */
+#define PQTRACE_REGRESS_MODE			(1<<1)
+extern void PQsetTraceFlags(PGconn *conn, int flags);
 
 /* === in fe-exec.c === */
 
@@ -409,6 +468,8 @@ extern PGresult *PQexecPrepared(PGconn *conn,
 								int resultFormat);
 
 /* Interface for multiple-result or asynchronous queries */
+#define PQ_QUERY_PARAM_MAX_LIMIT 65535
+
 extern int	PQsendQuery(PGconn *conn, const char *query);
 extern int	PQsendQueryParams(PGconn *conn,
 							  const char *command,
@@ -435,6 +496,13 @@ extern PGresult *PQgetResult(PGconn *conn);
 extern int	PQisBusy(PGconn *conn);
 extern int	PQconsumeInput(PGconn *conn);
 
+/* Routines for pipeline mode management */
+extern int	PQenterPipelineMode(PGconn *conn);
+extern int	PQexitPipelineMode(PGconn *conn);
+extern int	PQpipelineSync(PGconn *conn);
+extern int	PQsendFlushRequest(PGconn *conn);
+extern int	PQsendPipelineSync(PGconn *conn);
+
 /* LISTEN/NOTIFY support */
 extern PGnotify *PQnotifies(PGconn *conn);
 
@@ -444,7 +512,7 @@ extern int	PQputCopyEnd(PGconn *conn, const char *errormsg);
 extern int	PQgetCopyData(PGconn *conn, char **buffer, int async);
 
 /* Deprecated routines for copy in/out */
-extern int	PQgetline(PGconn *conn, char *string, int length);
+extern int	PQgetline(PGconn *conn, char *buffer, int length);
 extern int	PQputline(PGconn *conn, const char *string);
 extern int	PQgetlineAsync(PGconn *conn, char *buffer, int bufsize);
 extern int	PQputnbytes(PGconn *conn, const char *buffer, int nbytes);
@@ -508,6 +576,12 @@ extern PGresult *PQdescribePortal(PGconn *conn, const char *portal);
 extern int	PQsendDescribePrepared(PGconn *conn, const char *stmt);
 extern int	PQsendDescribePortal(PGconn *conn, const char *portal);
 
+/* Close prepared statements and portals */
+extern PGresult *PQclosePrepared(PGconn *conn, const char *stmt);
+extern PGresult *PQclosePortal(PGconn *conn, const char *portal);
+extern int	PQsendClosePrepared(PGconn *conn, const char *stmt);
+extern int	PQsendClosePortal(PGconn *conn, const char *portal);
+
 /* Delete a PGresult */
 extern void PQclear(PGresult *res);
 
@@ -552,7 +626,7 @@ extern unsigned char *PQescapeBytea(const unsigned char *from, size_t from_lengt
 
 extern void PQprint(FILE *fout, /* output stream */
 					const PGresult *res,
-					const PQprintOpt *ps);	/* option structure */
+					const PQprintOpt *po);	/* option structure */
 
 /*
  * really old printing routines
@@ -597,8 +671,14 @@ extern int	lo_export(PGconn *conn, Oid lobjId, const char *filename);
 /* Get the version of the libpq library in use */
 extern int	PQlibVersion(void);
 
+/* Poll a socket for reading and/or writing with an optional timeout */
+extern int	PQsocketPoll(int sock, int forRead, int forWrite, time_t end_time);
+
 /* Determine length of multibyte encoded char at *s */
 extern int	PQmblen(const char *s, int encoding);
+
+/* Same, but not more than the distance to the end of string s */
+extern int	PQmblenBounded(const char *s, int encoding);
 
 /* Determine display length of multibyte encoded char at *s */
 extern int	PQdsplen(const char *s, int encoding);
@@ -610,6 +690,7 @@ extern int	PQenv2encoding(void);
 
 extern char *PQencryptPassword(const char *passwd, const char *user);
 extern char *PQencryptPasswordConn(PGconn *conn, const char *passwd, const char *user, const char *algorithm);
+extern PGresult *PQchangePassword(PGconn *conn, const char *user, const char *passwd);
 
 /* === in encnames.c === */
 
@@ -619,7 +700,7 @@ extern int	pg_valid_server_encoding_id(int encoding);
 
 /* === in fe-secure-openssl.c === */
 
-/* Support for overriding sslpassword handling with a callback. */
+/* Support for overriding sslpassword handling with a callback */
 typedef int (*PQsslKeyPassHook_OpenSSL_type) (char *buf, int size, PGconn *conn);
 extern PQsslKeyPassHook_OpenSSL_type PQgetSSLKeyPassHook_OpenSSL(void);
 extern void PQsetSSLKeyPassHook_OpenSSL(PQsslKeyPassHook_OpenSSL_type hook);

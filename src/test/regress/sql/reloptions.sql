@@ -52,16 +52,24 @@ SELECT reloptions FROM pg_class WHERE oid = 'reloptions_test'::regclass AND
 -- RESET fails if a value is specified
 ALTER TABLE reloptions_test RESET (fillfactor=12);
 
+-- We can RESET an invalid option which for some reason is already set
+UPDATE pg_class
+	SET reloptions = '{fillfactor=13,autovacuum_enabled=false,illegal_option=4}'
+	WHERE oid = 'reloptions_test'::regclass;
+ALTER TABLE reloptions_test RESET (illegal_option);
+SELECT reloptions FROM pg_class WHERE oid = 'reloptions_test'::regclass;
+
 -- Test vacuum_truncate option
 DROP TABLE reloptions_test;
 
-CREATE TABLE reloptions_test(i INT NOT NULL, j text)
+CREATE TEMP TABLE reloptions_test(i INT NOT NULL, j text)
 	WITH (vacuum_truncate=false,
 	toast.vacuum_truncate=false,
 	autovacuum_enabled=false);
 SELECT reloptions FROM pg_class WHERE oid = 'reloptions_test'::regclass;
 INSERT INTO reloptions_test VALUES (1, NULL), (NULL, NULL);
-VACUUM reloptions_test;
+-- Do an aggressive vacuum to prevent page-skipping.
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) reloptions_test;
 SELECT pg_relation_size('reloptions_test') > 0;
 
 SELECT reloptions FROM pg_class WHERE oid =
@@ -71,7 +79,8 @@ SELECT reloptions FROM pg_class WHERE oid =
 ALTER TABLE reloptions_test RESET (vacuum_truncate);
 SELECT reloptions FROM pg_class WHERE oid = 'reloptions_test'::regclass;
 INSERT INTO reloptions_test VALUES (1, NULL), (NULL, NULL);
-VACUUM reloptions_test;
+-- Do an aggressive vacuum to prevent page-skipping.
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) reloptions_test;
 SELECT pg_relation_size('reloptions_test') = 0;
 
 -- Test toast.* options

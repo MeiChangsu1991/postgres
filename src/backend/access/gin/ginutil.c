@@ -4,7 +4,7 @@
  *	  Utility routines for the Postgres inverted index access method.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -23,10 +23,9 @@
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "storage/indexfsm.h"
-#include "storage/lmgr.h"
-#include "storage/predicate.h"
 #include "utils/builtins.h"
 #include "utils/index_selfuncs.h"
+#include "utils/rel.h"
 #include "utils/typcache.h"
 
 
@@ -54,8 +53,10 @@ ginhandler(PG_FUNCTION_ARGS)
 	amroutine->amclusterable = false;
 	amroutine->ampredlocks = true;
 	amroutine->amcanparallel = false;
+	amroutine->amcanbuildparallel = false;
 	amroutine->amcaninclude = false;
 	amroutine->amusemaintenanceworkmem = true;
+	amroutine->amsummarizing = false;
 	amroutine->amparallelvacuumoptions =
 		VACUUM_OPTION_PARALLEL_BULKDEL | VACUUM_OPTION_PARALLEL_CLEANUP;
 	amroutine->amkeytype = InvalidOid;
@@ -63,6 +64,7 @@ ginhandler(PG_FUNCTION_ARGS)
 	amroutine->ambuild = ginbuild;
 	amroutine->ambuildempty = ginbuildempty;
 	amroutine->aminsert = gininsert;
+	amroutine->aminsertcleanup = NULL;
 	amroutine->ambulkdelete = ginbulkdelete;
 	amroutine->amvacuumcleanup = ginvacuumcleanup;
 	amroutine->amcanreturn = NULL;
@@ -71,6 +73,7 @@ ginhandler(PG_FUNCTION_ARGS)
 	amroutine->amproperty = NULL;
 	amroutine->ambuildphasename = NULL;
 	amroutine->amvalidate = ginvalidate;
+	amroutine->amadjustmembers = ginadjustmembers;
 	amroutine->ambeginscan = ginbeginscan;
 	amroutine->amrescan = ginrescan;
 	amroutine->amgettuple = NULL;
@@ -99,7 +102,7 @@ initGinState(GinState *state, Relation index)
 	MemSet(state, 0, sizeof(GinState));
 
 	state->index = index;
-	state->oneCol = (origTupdesc->natts == 1) ? true : false;
+	state->oneCol = (origTupdesc->natts == 1);
 	state->origTupdesc = origTupdesc;
 
 	for (i = 0; i < origTupdesc->natts; i++)
@@ -297,7 +300,6 @@ Buffer
 GinNewBuffer(Relation index)
 {
 	Buffer		buffer;
-	bool		needLock;
 
 	/* First, try to get a page from FSM */
 	for (;;)
@@ -326,15 +328,8 @@ GinNewBuffer(Relation index)
 	}
 
 	/* Must extend the file */
-	needLock = !RELATION_IS_LOCAL(index);
-	if (needLock)
-		LockRelationForExtension(index, ExclusiveLock);
-
-	buffer = ReadBuffer(index, P_NEW);
-	LockBuffer(buffer, GIN_EXCLUSIVE);
-
-	if (needLock)
-		UnlockRelationForExtension(index, ExclusiveLock);
+	buffer = ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL,
+							   EB_LOCK_FIRST);
 
 	return buffer;
 }
@@ -347,7 +342,6 @@ GinInitPage(Page page, uint32 f, Size pageSize)
 	PageInit(page, pageSize, sizeof(GinPageOpaqueData));
 
 	opaque = GinPageGetOpaque(page);
-	memset(opaque, 0, sizeof(GinPageOpaqueData));
 	opaque->flags = f;
 	opaque->rightlink = InvalidBlockNumber;
 }
@@ -560,7 +554,7 @@ ginExtractEntries(GinState *ginstate, OffsetNumber attnum,
 		arg.collation = ginstate->supportCollation[attnum - 1];
 		arg.haveDups = false;
 		qsort_arg(keydata, *nentries, sizeof(keyEntryData),
-				  cmpEntries, (void *) &arg);
+				  cmpEntries, &arg);
 
 		if (arg.haveDups)
 		{
@@ -688,7 +682,7 @@ ginUpdateStats(Relation index, const GinStatsData *stats, bool is_build)
 		XLogRecPtr	recptr;
 		ginxlogUpdateMeta data;
 
-		data.node = index->rd_node;
+		data.locator = index->rd_locator;
 		data.ntuples = 0;
 		data.newRightlink = data.prevTail = InvalidBlockNumber;
 		memcpy(&data.metadata, metadata, sizeof(GinMetaPageData));

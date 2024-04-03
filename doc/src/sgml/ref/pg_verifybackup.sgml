@@ -40,7 +40,7 @@ PostgreSQL documentation
 
   <para>
    It is important to note that the validation which is performed by
-   <application>pg_verifybackup</application> does not and can not include
+   <application>pg_verifybackup</application> does not and cannot include
    every check which will be performed by a running server when attempting
    to make use of the backup. Even if you use this tool, you should still
    perform test restores and verify that the resulting databases work as
@@ -53,9 +53,10 @@ PostgreSQL documentation
    Backup verification proceeds in four stages. First,
    <literal>pg_verifybackup</literal> reads the
    <literal>backup_manifest</literal> file. If that file
-   does not exist, cannot be read, is malformed, or fails verification
-   against its own internal checksum, <literal>pg_verifybackup</literal>
-   will terminate with a fatal error.
+   does not exist, cannot be read, is malformed, fails to match the system
+   identifier with <filename>pg_control</filename> of the backup directory or
+   fails verification against its own internal checksum,
+   <literal>pg_verifybackup</literal> will terminate with a fatal error.
   </para>
 
   <para>
@@ -82,8 +83,8 @@ PostgreSQL documentation
    for any files for which the computed checksum does not match the
    checksum stored in the manifest. This step is not performed for any files
    which produced errors in the previous step, since they are already known
-   to have problems. Also, files which were ignored in the previous step are
-   also ignored in this step.
+   to have problems. Files which were ignored in the previous step are also
+   ignored in this step.
   </para>
 
   <para>
@@ -121,7 +122,8 @@ PostgreSQL documentation
   <title>Options</title>
 
    <para>
-    The following command-line options control the behavior.
+    <application>pg_verifybackup</application> accepts the following
+    command-line arguments:
 
     <variablelist>
      <varlistentry>
@@ -173,6 +175,21 @@ PostgreSQL documentation
        <para>
         Don't attempt to parse write-ahead log data that will be needed
         to recover from this backup.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-P</option></term>
+      <term><option>--progress</option></term>
+      <listitem>
+       <para>
+        Enable progress reporting. Turning this on will deliver a progress
+        report while verifying checksums.
+       </para>
+       <para>
+        This option cannot be used together with the option
+        <option>--quiet</option>.
        </para>
       </listitem>
      </varlistentry>

@@ -3,7 +3,7 @@
  * file_fdw.c
  *		  foreign-data wrapper for server-side flat files (or programs).
  *
- * Copyright (c) 2010-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/file_fdw/file_fdw.c
@@ -37,6 +37,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/sampling.h"
+#include "utils/varlena.h"
 
 PG_MODULE_MAGIC;
 
@@ -71,6 +72,7 @@ static const struct FileFdwOption valid_options[] = {
 	{"quote", ForeignTableRelationId},
 	{"escape", ForeignTableRelationId},
 	{"null", ForeignTableRelationId},
+	{"default", ForeignTableRelationId},
 	{"encoding", ForeignTableRelationId},
 	{"force_not_null", AttributeRelationId},
 	{"force_null", AttributeRelationId},
@@ -105,7 +107,7 @@ typedef struct FileFdwExecutionState
 	bool		is_program;		/* true if filename represents an OS command */
 	List	   *options;		/* merged COPY options, excluding filename and
 								 * is_program */
-	CopyState	cstate;			/* COPY execution state */
+	CopyFromState cstate;		/* COPY execution state */
 } FileFdwExecutionState;
 
 /*
@@ -214,27 +216,32 @@ file_fdw_validator(PG_FUNCTION_ARGS)
 		if (!is_valid_option(def->defname, catalog))
 		{
 			const struct FileFdwOption *opt;
-			StringInfoData buf;
+			const char *closest_match;
+			ClosestMatchState match_state;
+			bool		has_valid_options = false;
 
 			/*
 			 * Unknown option specified, complain about it. Provide a hint
-			 * with list of valid options for the object.
+			 * with a valid option that looks similar, if there is one.
 			 */
-			initStringInfo(&buf);
+			initClosestMatch(&match_state, def->defname, 4);
 			for (opt = valid_options; opt->optname; opt++)
 			{
 				if (catalog == opt->optcontext)
-					appendStringInfo(&buf, "%s%s", (buf.len > 0) ? ", " : "",
-									 opt->optname);
+				{
+					has_valid_options = true;
+					updateClosestMatch(&match_state, opt->optname);
+				}
 			}
 
+			closest_match = getClosestMatch(&match_state);
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 					 errmsg("invalid option \"%s\"", def->defname),
-					 buf.len > 0
-					 ? errhint("Valid options in this context are: %s",
-							   buf.data)
-					 : errhint("There are no valid options in this context.")));
+					 has_valid_options ? closest_match ?
+					 errhint("Perhaps you meant the option \"%s\".",
+							 closest_match) : 0 :
+					 errhint("There are no valid options in this context.")));
 		}
 
 		/*
@@ -269,16 +276,22 @@ file_fdw_validator(PG_FUNCTION_ARGS)
 			 * otherwise there'd still be a security hole.
 			 */
 			if (strcmp(def->defname, "filename") == 0 &&
-				!is_member_of_role(GetUserId(), DEFAULT_ROLE_READ_SERVER_FILES))
+				!has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
 				ereport(ERROR,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-						 errmsg("only superuser or a member of the pg_read_server_files role may specify the filename option of a file_fdw foreign table")));
+						 errmsg("permission denied to set the \"%s\" option of a file_fdw foreign table",
+								"filename"),
+						 errdetail("Only roles with privileges of the \"%s\" role may set this option.",
+								   "pg_read_server_files")));
 
 			if (strcmp(def->defname, "program") == 0 &&
-				!is_member_of_role(GetUserId(), DEFAULT_ROLE_EXECUTE_SERVER_PROGRAM))
+				!has_privs_of_role(GetUserId(), ROLE_PG_EXECUTE_SERVER_PROGRAM))
 				ereport(ERROR,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-						 errmsg("only superuser or a member of the pg_execute_server_program role may specify the program option of a file_fdw foreign table")));
+						 errmsg("permission denied to set the \"%s\" option of a file_fdw foreign table",
+								"program"),
+						 errdetail("Only roles with privileges of the \"%s\" role may set this option.",
+								   "pg_execute_server_program")));
 
 			filename = defGetString(def);
 		}
@@ -444,15 +457,15 @@ get_file_fdw_attribute_options(Oid relid)
 	for (attnum = 1; attnum <= natts; attnum++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupleDesc, attnum - 1);
-		List	   *options;
+		List	   *column_options;
 		ListCell   *lc;
 
 		/* Skip dropped attributes. */
 		if (attr->attisdropped)
 			continue;
 
-		options = GetForeignColumnOptions(relid, attnum);
-		foreach(lc, options)
+		column_options = GetForeignColumnOptions(relid, attnum);
+		foreach(lc, column_options)
 		{
 			DefElem    *def = (DefElem *) lfirst(lc);
 
@@ -474,7 +487,7 @@ get_file_fdw_attribute_options(Oid relid)
 					fncolumns = lappend(fncolumns, makeString(attname));
 				}
 			}
-			/* maybe in future handle other options here */
+			/* maybe in future handle other column options here */
 		}
 	}
 
@@ -568,6 +581,7 @@ fileGetForeignPaths(PlannerInfo *root,
 									 NIL,	/* no pathkeys */
 									 baserel->lateral_relids,
 									 NULL,	/* no extra plan */
+									 NIL,	/* no fdw_restrictinfo list */
 									 coptions));
 
 	/*
@@ -655,7 +669,7 @@ fileBeginForeignScan(ForeignScanState *node, int eflags)
 	char	   *filename;
 	bool		is_program;
 	List	   *options;
-	CopyState	cstate;
+	CopyFromState cstate;
 	FileFdwExecutionState *festate;
 
 	/*
@@ -677,6 +691,7 @@ fileBeginForeignScan(ForeignScanState *node, int eflags)
 	 */
 	cstate = BeginCopyFrom(NULL,
 						   node->ss.ss_currentRelation,
+						   NULL,
 						   filename,
 						   is_program,
 						   NULL,
@@ -705,6 +720,9 @@ static TupleTableSlot *
 fileIterateForeignScan(ForeignScanState *node)
 {
 	FileFdwExecutionState *festate = (FileFdwExecutionState *) node->fdw_state;
+	EState	   *estate = CreateExecutorState();
+	ExprContext *econtext;
+	MemoryContext oldcontext;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	bool		found;
 	ErrorContextCallback errcallback;
@@ -721,17 +739,24 @@ fileIterateForeignScan(ForeignScanState *node)
 	 * ExecStoreVirtualTuple.  If we don't find another row in the file, we
 	 * just skip the last step, leaving the slot empty as required.
 	 *
-	 * We can pass ExprContext = NULL because we read all columns from the
-	 * file, so no need to evaluate default expressions.
-	 *
-	 * We can also pass tupleOid = NULL because we don't allow oids for
-	 * foreign tables.
+	 * We pass ExprContext because there might be a use of the DEFAULT option
+	 * in COPY FROM, so we may need to evaluate default expressions.
 	 */
 	ExecClearTuple(slot);
-	found = NextCopyFrom(festate->cstate, NULL,
+	econtext = GetPerTupleExprContext(estate);
+
+	/*
+	 * DEFAULT expressions need to be evaluated in a per-tuple context, so
+	 * switch in case we are doing that.
+	 */
+	oldcontext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+	found = NextCopyFrom(festate->cstate, econtext,
 						 slot->tts_values, slot->tts_isnull);
 	if (found)
 		ExecStoreVirtualTuple(slot);
+
+	/* Switch back to original memory context */
+	MemoryContextSwitchTo(oldcontext);
 
 	/* Remove error callback. */
 	error_context_stack = errcallback.previous;
@@ -752,6 +777,7 @@ fileReScanForeignScan(ForeignScanState *node)
 
 	festate->cstate = BeginCopyFrom(NULL,
 									node->ss.ss_currentRelation,
+									NULL,
 									festate->filename,
 									festate->is_program,
 									NULL,
@@ -853,7 +879,7 @@ check_selective_binary_conversion(RelOptInfo *baserel,
 	ListCell   *lc;
 	Relation	rel;
 	TupleDesc	tupleDesc;
-	AttrNumber	attnum;
+	int			attidx;
 	Bitmapset  *attrs_used = NULL;
 	bool		has_wholerow = false;
 	int			numattrs;
@@ -896,10 +922,11 @@ check_selective_binary_conversion(RelOptInfo *baserel,
 	rel = table_open(foreigntableid, AccessShareLock);
 	tupleDesc = RelationGetDescr(rel);
 
-	while ((attnum = bms_first_member(attrs_used)) >= 0)
+	attidx = -1;
+	while ((attidx = bms_next_member(attrs_used, attidx)) >= 0)
 	{
-		/* Adjust for system attributes. */
-		attnum += FirstLowInvalidHeapAttributeNumber;
+		/* attidx is zero-based, attnum is the normal attribute number */
+		AttrNumber	attnum = attidx + FirstLowInvalidHeapAttributeNumber;
 
 		if (attnum == 0)
 		{
@@ -996,7 +1023,7 @@ estimate_size(PlannerInfo *root, RelOptInfo *baserel,
 	/*
 	 * Estimate the number of tuples in the file.
 	 */
-	if (baserel->pages > 0)
+	if (baserel->tuples >= 0 && baserel->pages > 0)
 	{
 		/*
 		 * We have # of pages and # of tuples from pg_class (that is, from a
@@ -1107,7 +1134,7 @@ file_acquire_sample_rows(Relation onerel, int elevel,
 	char	   *filename;
 	bool		is_program;
 	List	   *options;
-	CopyState	cstate;
+	CopyFromState cstate;
 	ErrorContextCallback errcallback;
 	MemoryContext oldcontext = CurrentMemoryContext;
 	MemoryContext tupcontext;
@@ -1125,7 +1152,7 @@ file_acquire_sample_rows(Relation onerel, int elevel,
 	/*
 	 * Create CopyState from FDW options.
 	 */
-	cstate = BeginCopyFrom(NULL, onerel, filename, is_program, NULL, NIL,
+	cstate = BeginCopyFrom(NULL, onerel, NULL, filename, is_program, NULL, NIL,
 						   options);
 
 	/*
@@ -1189,7 +1216,7 @@ file_acquire_sample_rows(Relation onerel, int elevel,
 				 * Found a suitable tuple, so save it, replacing one old tuple
 				 * at random
 				 */
-				int			k = (int) (targrows * sampler_random_fract(rstate.randstate));
+				int			k = (int) (targrows * sampler_random_fract(&rstate.randstate));
 
 				Assert(k >= 0 && k < targrows);
 				heap_freetuple(rows[k]);

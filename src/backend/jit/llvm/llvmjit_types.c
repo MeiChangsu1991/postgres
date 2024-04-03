@@ -16,7 +16,7 @@
  * bitcode.
  *
  *
- * Copyright (c) 2016-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/jit/llvm/llvmjit_types.c
@@ -49,6 +49,9 @@ PGFunction	TypePGFunction;
 size_t		TypeSizeT;
 bool		TypeStorageBool;
 
+ExecEvalSubroutine TypeExecEvalSubroutine;
+ExecEvalBoolSubroutine TypeExecEvalBoolSubroutine;
+
 NullableDatum StructNullableDatum;
 AggState	StructAggState;
 AggStatePerGroupData StructAggStatePerGroupData;
@@ -58,11 +61,14 @@ ExprEvalStep StructExprEvalStep;
 ExprState	StructExprState;
 FunctionCallInfoBaseData StructFunctionCallInfoData;
 HeapTupleData StructHeapTupleData;
+HeapTupleHeaderData StructHeapTupleHeaderData;
 MemoryContextData StructMemoryContextData;
 TupleTableSlot StructTupleTableSlot;
 HeapTupleTableSlot StructHeapTupleTableSlot;
 MinimalTupleTableSlot StructMinimalTupleTableSlot;
 TupleDescData StructTupleDescData;
+PlanState	StructPlanState;
+MinimalTupleData StructMinimalTupleData;
 
 
 /*
@@ -74,7 +80,40 @@ extern Datum AttributeTemplate(PG_FUNCTION_ARGS);
 Datum
 AttributeTemplate(PG_FUNCTION_ARGS)
 {
+	AssertVariableIsOfType(&AttributeTemplate, PGFunction);
+
 	PG_RETURN_NULL();
+}
+
+/*
+ * And some more "templates" to give us examples of function types
+ * corresponding to function pointer types.
+ */
+
+extern void ExecEvalSubroutineTemplate(ExprState *state,
+									   struct ExprEvalStep *op,
+									   ExprContext *econtext);
+void
+ExecEvalSubroutineTemplate(ExprState *state,
+						   struct ExprEvalStep *op,
+						   ExprContext *econtext)
+{
+	AssertVariableIsOfType(&ExecEvalSubroutineTemplate,
+						   ExecEvalSubroutine);
+}
+
+extern bool ExecEvalBoolSubroutineTemplate(ExprState *state,
+										   struct ExprEvalStep *op,
+										   ExprContext *econtext);
+bool
+ExecEvalBoolSubroutineTemplate(ExprState *state,
+							   struct ExprEvalStep *op,
+							   ExprContext *econtext)
+{
+	AssertVariableIsOfType(&ExecEvalBoolSubroutineTemplate,
+						   ExecEvalBoolSubroutine);
+
+	return false;
 }
 
 /*
@@ -99,10 +138,11 @@ FunctionReturningBool(void)
 void	   *referenced_functions[] =
 {
 	ExecAggInitGroup,
-	ExecAggTransReparent,
+	ExecAggCopyTransValue,
+	ExecEvalPreOrderedDistinctSingle,
+	ExecEvalPreOrderedDistinctMulti,
 	ExecEvalAggOrderedTransDatum,
 	ExecEvalAggOrderedTransTuple,
-	ExecEvalAlternativeSubPlan,
 	ExecEvalArrayCoerce,
 	ExecEvalArrayExpr,
 	ExecEvalConstraintCheck,
@@ -115,6 +155,7 @@ void	   *referenced_functions[] =
 	ExecEvalFuncExprFusage,
 	ExecEvalFuncExprStrictFusage,
 	ExecEvalGroupingFunc,
+	ExecEvalMergeSupportFunc,
 	ExecEvalMinMax,
 	ExecEvalNextValueExpr,
 	ExecEvalParamExec,
@@ -122,19 +163,23 @@ void	   *referenced_functions[] =
 	ExecEvalRow,
 	ExecEvalRowNotNull,
 	ExecEvalRowNull,
+	ExecEvalCoerceViaIOSafe,
 	ExecEvalSQLValueFunction,
 	ExecEvalScalarArrayOp,
+	ExecEvalHashedScalarArrayOp,
 	ExecEvalSubPlan,
-	ExecEvalSubscriptingRef,
-	ExecEvalSubscriptingRefAssign,
-	ExecEvalSubscriptingRefFetch,
-	ExecEvalSubscriptingRefOld,
 	ExecEvalSysVar,
 	ExecEvalWholeRowVar,
 	ExecEvalXmlExpr,
+	ExecEvalJsonConstructor,
+	ExecEvalJsonIsPredicate,
+	ExecEvalJsonCoercion,
+	ExecEvalJsonCoercionFinish,
+	ExecEvalJsonExprPath,
 	MakeExpandedObjectReadOnlyInternal,
 	slot_getmissingattrs,
 	slot_getsomeattrs_int,
 	strlen,
 	varsize_any,
+	ExecInterpExprStillValid,
 };

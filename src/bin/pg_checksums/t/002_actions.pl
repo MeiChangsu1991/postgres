@@ -1,11 +1,16 @@
+
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
+
 # Do basic sanity checks supported by pg_checksums using
 # an initialized cluster.
 
 use strict;
-use warnings;
-use PostgresNode;
-use TestLib;
-use Test::More tests => 63;
+use warnings FATAL => 'all';
+use Config;
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+
+use Test::More;
 
 
 # Utility routine to create and check a table with corrupted checksums
@@ -14,14 +19,15 @@ use Test::More tests => 63;
 # at the end.
 sub check_relation_corruption
 {
-	my $node       = shift;
-	my $table      = shift;
+	my $node = shift;
+	my $table = shift;
 	my $tablespace = shift;
-	my $pgdata     = $node->data_dir;
+	my $pgdata = $node->data_dir;
 
+	# Create table and discover its filesystem location.
 	$node->safe_psql(
 		'postgres',
-		"SELECT a INTO $table FROM generate_series(1,10000) AS a;
+		"CREATE TABLE $table AS SELECT a FROM generate_series(1,10000) AS a;
 		ALTER TABLE $table SET (autovacuum_enabled=false);");
 
 	$node->safe_psql('postgres',
@@ -32,9 +38,6 @@ sub check_relation_corruption
 	my $relfilenode_corrupted = $node->safe_psql('postgres',
 		"SELECT relfilenode FROM pg_class WHERE relname = '$table';");
 
-	# Set page header and block size
-	my $pageheader_size = 24;
-	my $block_size = $node->safe_psql('postgres', 'SHOW block_size;');
 	$node->stop;
 
 	# Checksums are correct for single relfilenode as the table is not
@@ -42,24 +45,21 @@ sub check_relation_corruption
 	command_ok(
 		[
 			'pg_checksums', '--check',
-			'-D',           $pgdata,
-			'--filenode',   $relfilenode_corrupted
+			'-D', $pgdata,
+			'--filenode', $relfilenode_corrupted
 		],
 		"succeeds for single relfilenode on tablespace $tablespace with offline cluster"
 	);
 
 	# Time to create some corruption
-	open my $file, '+<', "$pgdata/$file_corrupted";
-	seek($file, $pageheader_size, 0);
-	syswrite($file, "\0\0\0\0\0\0\0\0\0");
-	close $file;
+	$node->corrupt_page_checksum($file_corrupted, 0);
 
 	# Checksum checks on single relfilenode fail
 	$node->command_checks_all(
 		[
 			'pg_checksums', '--check',
-			'-D',           $pgdata,
-			'--filenode',   $relfilenode_corrupted
+			'-D', $pgdata,
+			'--filenode', $relfilenode_corrupted
 		],
 		1,
 		[qr/Bad checksums:.*1/],
@@ -87,7 +87,7 @@ sub check_relation_corruption
 }
 
 # Initialize node with checksums disabled.
-my $node = get_new_node('node_checksum');
+my $node = PostgreSQL::Test::Cluster->new('node_checksum');
 $node->init();
 my $pgdata = $node->data_dir;
 
@@ -98,22 +98,28 @@ command_like(
 	'checksums disabled in control file');
 
 # These are correct but empty files, so they should pass through.
-append_to_file "$pgdata/global/99999",          "";
-append_to_file "$pgdata/global/99999.123",      "";
-append_to_file "$pgdata/global/99999_fsm",      "";
-append_to_file "$pgdata/global/99999_init",     "";
-append_to_file "$pgdata/global/99999_vm",       "";
+append_to_file "$pgdata/global/99999", "";
+append_to_file "$pgdata/global/99999.123", "";
+append_to_file "$pgdata/global/99999_fsm", "";
+append_to_file "$pgdata/global/99999_init", "";
+append_to_file "$pgdata/global/99999_vm", "";
 append_to_file "$pgdata/global/99999_init.123", "";
-append_to_file "$pgdata/global/99999_fsm.123",  "";
-append_to_file "$pgdata/global/99999_vm.123",   "";
+append_to_file "$pgdata/global/99999_fsm.123", "";
+append_to_file "$pgdata/global/99999_vm.123", "";
 
 # These are temporary files and folders with dummy contents, which
 # should be ignored by the scan.
 append_to_file "$pgdata/global/pgsql_tmp_123", "foo";
 mkdir "$pgdata/global/pgsql_tmp";
-append_to_file "$pgdata/global/pgsql_tmp/1.1",        "foo";
-append_to_file "$pgdata/global/pg_internal.init",     "foo";
+append_to_file "$pgdata/global/pgsql_tmp/1.1", "foo";
+append_to_file "$pgdata/global/pg_internal.init", "foo";
 append_to_file "$pgdata/global/pg_internal.init.123", "foo";
+
+# These are non-postgres macOS files, which should be ignored by the scan.
+# Only perform this test on non-macOS systems though as creating incorrect
+# system files may have side effects on macOS.
+append_to_file "$pgdata/global/.DS_Store", "foo"
+	unless ($Config{osname} eq 'darwin');
 
 # Enable checksums.
 command_ok([ 'pg_checksums', '--enable', '--no-sync', '-D', $pgdata ],
@@ -173,6 +179,22 @@ command_fails(
 	[ 'pg_checksums', '--enable', '--filenode', '1234', '-D', $pgdata ],
 	"fails when relfilenodes are requested and action is --enable");
 
+# Test postgres -C for an offline cluster.
+# Run-time GUCs are safe to query here.  Note that a lock file is created,
+# then removed, leading to an extra LOG entry showing in stderr.  This uses
+# log_min_messages=fatal to remove any noise.  This test uses a startup
+# wrapped with pg_ctl to allow the case where this runs under a privileged
+# account on Windows.
+command_checks_all(
+	[
+		'pg_ctl', 'start', '-D', $pgdata, '-s', '-o',
+		'-C data_checksums -c log_min_messages=fatal'
+	],
+	1,
+	[qr/^on$/],
+	[qr/could not start server/],
+	'data_checksums=on is reported on an offline cluster');
+
 # Checks cannot happen with an online cluster
 $node->start;
 command_fails([ 'pg_checksums', '--check', '-D', $pgdata ],
@@ -182,10 +204,9 @@ command_fails([ 'pg_checksums', '--check', '-D', $pgdata ],
 check_relation_corruption($node, 'corrupt1', 'pg_default');
 
 # Create tablespace to check corruptions in a non-default tablespace.
-my $basedir        = $node->basedir;
+my $basedir = $node->basedir;
 my $tablespace_dir = "$basedir/ts_corrupt_dir";
 mkdir($tablespace_dir);
-$tablespace_dir = TestLib::perl2host($tablespace_dir);
 $node->safe_psql('postgres',
 	"CREATE TABLESPACE ts_corrupt LOCATION '$tablespace_dir';");
 check_relation_corruption($node, 'corrupt2', 'ts_corrupt');
@@ -194,8 +215,8 @@ check_relation_corruption($node, 'corrupt2', 'ts_corrupt');
 # correctly-named relation files filled with some corrupted data.
 sub fail_corrupt
 {
-	my $node   = shift;
-	my $file   = shift;
+	my $node = shift;
+	my $file = shift;
 	my $pgdata = $node->data_dir;
 
 	# Create the file with some dummy data in it.
@@ -235,3 +256,5 @@ fail_corrupt($node, "99990_vm");
 fail_corrupt($node, "99990_init.123");
 fail_corrupt($node, "99990_fsm.123");
 fail_corrupt($node, "99990_vm.123");
+
+done_testing();

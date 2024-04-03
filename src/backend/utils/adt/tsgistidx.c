@@ -3,7 +3,7 @@
  * tsgistidx.c
  *	  GiST support functions for tsvector_ops
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -17,10 +17,11 @@
 #include "access/gist.h"
 #include "access/heaptoast.h"
 #include "access/reloptions.h"
+#include "common/int.h"
 #include "lib/qunique.h"
 #include "port/pg_bitutils.h"
 #include "tsearch/ts_utils.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/pg_crc.h"
 
 
@@ -87,10 +88,12 @@ static int32 sizebitvec(BITVECP sign, int siglen);
 Datum
 gtsvectorin(PG_FUNCTION_ARGS)
 {
+	/* There's no need to support input of gtsvectors */
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("gtsvector_in not implemented")));
-	PG_RETURN_DATUM(0);
+			 errmsg("cannot accept a value of type %s", "gtsvector")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
 }
 
 #define SINGOUTSTR	"%d true bits, %d false bits"
@@ -102,7 +105,7 @@ static int	outbuf_maxlen = 0;
 Datum
 gtsvectorout(PG_FUNCTION_ARGS)
 {
-	SignTSVector *key = (SignTSVector *) PG_DETOAST_DATUM(PG_GETARG_POINTER(0));
+	SignTSVector *key = (SignTSVector *) PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
 	char	   *outbuf;
 
 	if (outbuf_maxlen == 0)
@@ -113,10 +116,15 @@ gtsvectorout(PG_FUNCTION_ARGS)
 		sprintf(outbuf, ARROUTSTR, (int) ARRNELEM(key));
 	else
 	{
-		int			siglen = GETSIGLEN(key);
-		int			cnttrue = (ISALLTRUE(key)) ? SIGLENBIT(siglen) : sizebitvec(GETSIGN(key), siglen);
+		if (ISALLTRUE(key))
+			sprintf(outbuf, "all true bits");
+		else
+		{
+			int			siglen = GETSIGLEN(key);
+			int			cnttrue = sizebitvec(GETSIGN(key), siglen);
 
-		sprintf(outbuf, SINGOUTSTR, cnttrue, (int) SIGLENBIT(siglen) - cnttrue);
+			sprintf(outbuf, SINGOUTSTR, cnttrue, (int) SIGLENBIT(siglen) - cnttrue);
+		}
 	}
 
 	PG_FREE_IF_COPY(key, 0);
@@ -129,9 +137,7 @@ compareint(const void *va, const void *vb)
 	int32		a = *((const int32 *) va);
 	int32		b = *((const int32 *) vb);
 
-	if (a == b)
-		return 0;
-	return (a > b) ? 1 : -1;
+	return pg_cmp_s32(a, b);
 }
 
 static void
@@ -141,7 +147,7 @@ makesign(BITVECP sign, SignTSVector *a, int siglen)
 				len = ARRNELEM(a);
 	int32	   *ptr = GETARR(a);
 
-	MemSet((void *) sign, 0, siglen);
+	MemSet(sign, 0, siglen);
 	for (k = 0; k < len; k++)
 		HASH(sign, ptr[k], siglen);
 }
@@ -202,7 +208,7 @@ gtsvector_compress(PG_FUNCTION_ARGS)
 			 * val->size
 			 */
 			len = CALCGTSIZE(ARRKEY, len);
-			res = (SignTSVector *) repalloc((void *) res, len);
+			res = (SignTSVector *) repalloc(res, len);
 			SET_VARSIZE(res, len);
 		}
 
@@ -273,9 +279,9 @@ typedef struct
 } CHKVAL;
 
 /*
- * is there value 'val' in array or not ?
+ * TS_execute callback for matching a tsquery operand to GIST leaf-page data
  */
-static bool
+static TSTernaryValue
 checkcondition_arr(void *checkval, QueryOperand *val, ExecPhraseData *data)
 {
 	int32	   *StopLow = ((CHKVAL *) checkval)->arrb;
@@ -288,23 +294,26 @@ checkcondition_arr(void *checkval, QueryOperand *val, ExecPhraseData *data)
 	 * we are not able to find a prefix by hash value
 	 */
 	if (val->prefix)
-		return true;
+		return TS_MAYBE;
 
 	while (StopLow < StopHigh)
 	{
 		StopMiddle = StopLow + (StopHigh - StopLow) / 2;
 		if (*StopMiddle == val->valcrc)
-			return true;
+			return TS_MAYBE;
 		else if (*StopMiddle < val->valcrc)
 			StopLow = StopMiddle + 1;
 		else
 			StopHigh = StopMiddle;
 	}
 
-	return false;
+	return TS_NO;
 }
 
-static bool
+/*
+ * TS_execute callback for matching a tsquery operand to GIST non-leaf data
+ */
+static TSTernaryValue
 checkcondition_bit(void *checkval, QueryOperand *val, ExecPhraseData *data)
 {
 	void	   *key = (SignTSVector *) checkval;
@@ -313,8 +322,12 @@ checkcondition_bit(void *checkval, QueryOperand *val, ExecPhraseData *data)
 	 * we are not able to find a prefix in signature tree
 	 */
 	if (val->prefix)
-		return true;
-	return GETBIT(GETSIGN(key), HASHVAL(val->valcrc, GETSIGLEN(key)));
+		return TS_MAYBE;
+
+	if (GETBIT(GETSIGN(key), HASHVAL(val->valcrc, GETSIGLEN(key))))
+		return TS_MAYBE;
+	else
+		return TS_NO;
 }
 
 Datum
@@ -339,7 +352,6 @@ gtsvector_consistent(PG_FUNCTION_ARGS)
 		if (ISALLTRUE(key))
 			PG_RETURN_BOOL(true);
 
-		/* since signature is lossy, cannot specify CALC_NOT here */
 		PG_RETURN_BOOL(TS_execute(GETQUERY(query),
 								  key,
 								  TS_EXEC_PHRASE_NO_POS,
@@ -353,7 +365,7 @@ gtsvector_consistent(PG_FUNCTION_ARGS)
 		chkval.arre = chkval.arrb + ARRNELEM(key);
 		PG_RETURN_BOOL(TS_execute(GETQUERY(query),
 								  (void *) &chkval,
-								  TS_EXEC_PHRASE_NO_POS | TS_EXEC_CALC_NOT,
+								  TS_EXEC_PHRASE_NO_POS,
 								  checkcondition_arr));
 	}
 }
@@ -569,7 +581,7 @@ fillcache(CACHESIGN *item, SignTSVector *key, int siglen)
 	else if (ISALLTRUE(key))
 		item->allistrue = true;
 	else
-		memcpy((void *) item->sign, (void *) GETSIGN(key), siglen);
+		memcpy(item->sign, GETSIGN(key), siglen);
 }
 
 #define WISH_F(a,b,c) (double)( -(double)(((a)-(b))*((a)-(b))*((a)-(b)))*(c) )
@@ -585,10 +597,7 @@ comparecost(const void *va, const void *vb)
 	const SPLITCOST *a = (const SPLITCOST *) va;
 	const SPLITCOST *b = (const SPLITCOST *) vb;
 
-	if (a->cost == b->cost)
-		return 0;
-	else
-		return (a->cost > b->cost) ? 1 : -1;
+	return pg_cmp_s32(a->cost, b->cost);
 }
 
 
@@ -694,9 +703,9 @@ gtsvector_picksplit(PG_FUNCTION_ARGS)
 		costvector[j - 1].pos = j;
 		size_alpha = hemdistcache(&(cache[seed_1]), &(cache[j]), siglen);
 		size_beta = hemdistcache(&(cache[seed_2]), &(cache[j]), siglen);
-		costvector[j - 1].cost = Abs(size_alpha - size_beta);
+		costvector[j - 1].cost = abs(size_alpha - size_beta);
 	}
-	qsort((void *) costvector, maxoff, sizeof(SPLITCOST), comparecost);
+	qsort(costvector, maxoff, sizeof(SPLITCOST), comparecost);
 
 	for (k = 0; k < maxoff; k++)
 	{
@@ -722,7 +731,7 @@ gtsvector_picksplit(PG_FUNCTION_ARGS)
 				size_alpha = SIGLENBIT(siglen) -
 					sizebitvec((cache[j].allistrue) ?
 							   GETSIGN(datum_l) :
-							   GETSIGN(cache[j].sign),
+							   cache[j].sign,
 							   siglen);
 		}
 		else
@@ -736,7 +745,7 @@ gtsvector_picksplit(PG_FUNCTION_ARGS)
 				size_beta = SIGLENBIT(siglen) -
 					sizebitvec((cache[j].allistrue) ?
 							   GETSIGN(datum_r) :
-							   GETSIGN(cache[j].sign),
+							   cache[j].sign,
 							   siglen);
 		}
 		else
@@ -747,7 +756,7 @@ gtsvector_picksplit(PG_FUNCTION_ARGS)
 			if (ISALLTRUE(datum_l) || cache[j].allistrue)
 			{
 				if (!ISALLTRUE(datum_l))
-					MemSet((void *) GETSIGN(datum_l), 0xff, siglen);
+					memset(GETSIGN(datum_l), 0xff, siglen);
 			}
 			else
 			{
@@ -763,7 +772,7 @@ gtsvector_picksplit(PG_FUNCTION_ARGS)
 			if (ISALLTRUE(datum_r) || cache[j].allistrue)
 			{
 				if (!ISALLTRUE(datum_r))
-					MemSet((void *) GETSIGN(datum_r), 0xff, siglen);
+					memset(GETSIGN(datum_r), 0xff, siglen);
 			}
 			else
 			{

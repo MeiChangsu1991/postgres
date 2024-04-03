@@ -273,6 +273,31 @@ SELECT E'De\\123dBeEf'::bytea;
  DeSdBeEf
 (1 row)
 
+-- Test non-error-throwing API too
+SELECT pg_input_is_valid(E'\\xDeAdBeE', 'bytea');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT * FROM pg_input_error_info(E'\\xDeAdBeE', 'bytea');
+                    message                     | detail | hint | sql_error_code 
+------------------------------------------------+--------+------+----------------
+ invalid hexadecimal data: odd number of digits |        |      | 22023
+(1 row)
+
+SELECT * FROM pg_input_error_info(E'\\xDeAdBeEx', 'bytea');
+            message             | detail | hint | sql_error_code 
+--------------------------------+--------+------+----------------
+ invalid hexadecimal digit: "x" |        |      | 22023
+(1 row)
+
+SELECT * FROM pg_input_error_info(E'foo\\99bar', 'bytea');
+               message               | detail | hint | sql_error_code 
+-------------------------------------+--------+------+----------------
+ invalid input syntax for type bytea |        |      | 22P02
+(1 row)
+
 --
 -- test conversions between various string types
 -- E021-10 implicit casting among the character data types
@@ -396,6 +421,21 @@ SELECT SUBSTRING('1234567890' FROM 4 FOR 3) = '456' AS "456";
  t
 (1 row)
 
+-- test overflow cases
+SELECT SUBSTRING('string' FROM 2 FOR 2147483646) AS "tring";
+ tring 
+-------
+ tring
+(1 row)
+
+SELECT SUBSTRING('string' FROM -10 FOR 2147483646) AS "string";
+ string 
+--------
+ string
+(1 row)
+
+SELECT SUBSTRING('string' FROM -10 FOR -2147483646) AS "error";
+ERROR:  negative substring length not allowed
 -- T581 regular expression substring (with SQL's bizarre regexp syntax)
 SELECT SUBSTRING('abcdefg' SIMILAR 'a#"(b_d)#"%' ESCAPE '#') AS "bcd";
  bcd 
@@ -500,6 +540,13 @@ SELECT SUBSTRING('abcdefg' FROM 'b(.*)f') AS "cde";
  cde
 (1 row)
 
+-- Check case where we have a match, but not a subexpression match
+SELECT SUBSTRING('foo' FROM 'foo(bar)?') IS NULL AS t;
+ t 
+---
+ t
+(1 row)
+
 -- Check behavior of SIMILAR TO, which uses largely the same regexp variant
 SELECT 'abcdefg' SIMILAR TO '_bcd%' AS true;
  true 
@@ -549,11 +596,30 @@ SELECT 'abcdefg' SIMILAR TO '_bcd%' ESCAPE NULL AS null;
 SELECT 'abcdefg' SIMILAR TO '_bcd#%' ESCAPE '##' AS error;
 ERROR:  invalid escape string
 HINT:  Escape string must be empty or one character.
--- Test back reference in regexp_replace
+-- Test backslash escapes in regexp_replace's replacement string
 SELECT regexp_replace('1112223333', E'(\\d{3})(\\d{3})(\\d{4})', E'(\\1) \\2-\\3');
  regexp_replace 
 ----------------
  (111) 222-3333
+(1 row)
+
+SELECT regexp_replace('foobarrbazz', E'(.)\\1', E'X\\&Y', 'g');
+  regexp_replace   
+-------------------
+ fXooYbaXrrYbaXzzY
+(1 row)
+
+SELECT regexp_replace('foobarrbazz', E'(.)\\1', E'X\\\\Y', 'g');
+ regexp_replace 
+----------------
+ fX\YbaX\YbaX\Y
+(1 row)
+
+-- not an error, though perhaps it should be:
+SELECT regexp_replace('foobarrbazz', E'(.)\\1', E'X\\Y\\1Z\\');
+ regexp_replace  
+-----------------
+ fX\YoZ\barrbazz
 (1 row)
 
 SELECT regexp_replace('AAA   BBB   CCC   ', E'\\s+', ' ', 'g');
@@ -577,6 +643,370 @@ SELECT regexp_replace('AAA aaa', 'A+', 'Z', 'gi');
 -- invalid regexp option
 SELECT regexp_replace('AAA aaa', 'A+', 'Z', 'z');
 ERROR:  invalid regular expression option: "z"
+-- extended regexp_replace tests
+SELECT regexp_replace('A PostgreSQL function', 'A|e|i|o|u', 'X', 1);
+    regexp_replace     
+-----------------------
+ X PostgreSQL function
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'A|e|i|o|u', 'X', 1, 2);
+    regexp_replace     
+-----------------------
+ A PXstgreSQL function
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, 0, 'i');
+    regexp_replace     
+-----------------------
+ X PXstgrXSQL fXnctXXn
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, 1, 'i');
+    regexp_replace     
+-----------------------
+ X PostgreSQL function
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, 2, 'i');
+    regexp_replace     
+-----------------------
+ A PXstgreSQL function
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, 3, 'i');
+    regexp_replace     
+-----------------------
+ A PostgrXSQL function
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, 9, 'i');
+    regexp_replace     
+-----------------------
+ A PostgreSQL function
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'A|e|i|o|u', 'X', 7, 0, 'i');
+    regexp_replace     
+-----------------------
+ A PostgrXSQL fXnctXXn
+(1 row)
+
+-- 'g' flag should be ignored when N is specified
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, 1, 'g');
+    regexp_replace     
+-----------------------
+ A PXstgreSQL function
+(1 row)
+
+-- errors
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', -1, 0, 'i');
+ERROR:  invalid value for parameter "start": -1
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, -1, 'i');
+ERROR:  invalid value for parameter "n": -1
+-- erroneous invocation of non-extended form
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', '1');
+ERROR:  invalid regular expression option: "1"
+HINT:  If you meant to use regexp_replace() with a start parameter, cast the fourth argument to integer explicitly.
+--  regexp_count tests
+SELECT regexp_count('123123123123123', '(12)3');
+ regexp_count 
+--------------
+            5
+(1 row)
+
+SELECT regexp_count('123123123123', '123', 1);
+ regexp_count 
+--------------
+            4
+(1 row)
+
+SELECT regexp_count('123123123123', '123', 3);
+ regexp_count 
+--------------
+            3
+(1 row)
+
+SELECT regexp_count('123123123123', '123', 33);
+ regexp_count 
+--------------
+            0
+(1 row)
+
+SELECT regexp_count('ABCABCABCABC', 'Abc', 1, '');
+ regexp_count 
+--------------
+            0
+(1 row)
+
+SELECT regexp_count('ABCABCABCABC', 'Abc', 1, 'i');
+ regexp_count 
+--------------
+            4
+(1 row)
+
+-- errors
+SELECT regexp_count('123123123123', '123', 0);
+ERROR:  invalid value for parameter "start": 0
+SELECT regexp_count('123123123123', '123', -3);
+ERROR:  invalid value for parameter "start": -3
+-- regexp_like tests
+SELECT regexp_like('Steven', '^Ste(v|ph)en$');
+ regexp_like 
+-------------
+ t
+(1 row)
+
+SELECT regexp_like('a'||CHR(10)||'d', 'a.d', 'n');
+ regexp_like 
+-------------
+ f
+(1 row)
+
+SELECT regexp_like('a'||CHR(10)||'d', 'a.d', 's');
+ regexp_like 
+-------------
+ t
+(1 row)
+
+SELECT regexp_like('abc', ' a . c ', 'x');
+ regexp_like 
+-------------
+ t
+(1 row)
+
+SELECT regexp_like('abc', 'a.c', 'g');  -- error
+ERROR:  regexp_like() does not support the "global" option
+-- regexp_instr tests
+SELECT regexp_instr('abcdefghi', 'd.f');
+ regexp_instr 
+--------------
+            4
+(1 row)
+
+SELECT regexp_instr('abcdefghi', 'd.q');
+ regexp_instr 
+--------------
+            0
+(1 row)
+
+SELECT regexp_instr('abcabcabc', 'a.c');
+ regexp_instr 
+--------------
+            1
+(1 row)
+
+SELECT regexp_instr('abcabcabc', 'a.c', 2);
+ regexp_instr 
+--------------
+            4
+(1 row)
+
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 3);
+ regexp_instr 
+--------------
+            7
+(1 row)
+
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 4);
+ regexp_instr 
+--------------
+            0
+(1 row)
+
+SELECT regexp_instr('abcabcabc', 'A.C', 1, 2, 0, 'i');
+ regexp_instr 
+--------------
+            4
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 0, 'i', 0);
+ regexp_instr 
+--------------
+            1
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 0, 'i', 1);
+ regexp_instr 
+--------------
+            1
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 0, 'i', 2);
+ regexp_instr 
+--------------
+            4
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 0, 'i', 3);
+ regexp_instr 
+--------------
+            5
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 0, 'i', 4);
+ regexp_instr 
+--------------
+            7
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 0, 'i', 5);
+ regexp_instr 
+--------------
+            0
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 1, 'i', 0);
+ regexp_instr 
+--------------
+            9
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 1, 'i', 1);
+ regexp_instr 
+--------------
+            4
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 1, 'i', 2);
+ regexp_instr 
+--------------
+            9
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 1, 'i', 3);
+ regexp_instr 
+--------------
+            7
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 1, 'i', 4);
+ regexp_instr 
+--------------
+            9
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 1, 'i', 5);
+ regexp_instr 
+--------------
+            0
+(1 row)
+
+-- Check case where we have a match, but not a subexpression match
+SELECT regexp_instr('foo', 'foo(bar)?', 1, 1, 0, '', 1);
+ regexp_instr 
+--------------
+            0
+(1 row)
+
+-- errors
+SELECT regexp_instr('abcabcabc', 'a.c', 0, 1);
+ERROR:  invalid value for parameter "start": 0
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 0);
+ERROR:  invalid value for parameter "n": 0
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 1, -1);
+ERROR:  invalid value for parameter "endoption": -1
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 1, 2);
+ERROR:  invalid value for parameter "endoption": 2
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 1, 0, 'g');
+ERROR:  regexp_instr() does not support the "global" option
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 1, 0, '', -1);
+ERROR:  invalid value for parameter "subexpr": -1
+-- regexp_substr tests
+SELECT regexp_substr('abcdefghi', 'd.f');
+ regexp_substr 
+---------------
+ def
+(1 row)
+
+SELECT regexp_substr('abcdefghi', 'd.q') IS NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+SELECT regexp_substr('abcabcabc', 'a.c');
+ regexp_substr 
+---------------
+ abc
+(1 row)
+
+SELECT regexp_substr('abcabcabc', 'a.c', 2);
+ regexp_substr 
+---------------
+ abc
+(1 row)
+
+SELECT regexp_substr('abcabcabc', 'a.c', 1, 3);
+ regexp_substr 
+---------------
+ abc
+(1 row)
+
+SELECT regexp_substr('abcabcabc', 'a.c', 1, 4) IS NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+SELECT regexp_substr('abcabcabc', 'A.C', 1, 2, 'i');
+ regexp_substr 
+---------------
+ abc
+(1 row)
+
+SELECT regexp_substr('1234567890', '(123)(4(56)(78))', 1, 1, 'i', 0);
+ regexp_substr 
+---------------
+ 12345678
+(1 row)
+
+SELECT regexp_substr('1234567890', '(123)(4(56)(78))', 1, 1, 'i', 1);
+ regexp_substr 
+---------------
+ 123
+(1 row)
+
+SELECT regexp_substr('1234567890', '(123)(4(56)(78))', 1, 1, 'i', 2);
+ regexp_substr 
+---------------
+ 45678
+(1 row)
+
+SELECT regexp_substr('1234567890', '(123)(4(56)(78))', 1, 1, 'i', 3);
+ regexp_substr 
+---------------
+ 56
+(1 row)
+
+SELECT regexp_substr('1234567890', '(123)(4(56)(78))', 1, 1, 'i', 4);
+ regexp_substr 
+---------------
+ 78
+(1 row)
+
+SELECT regexp_substr('1234567890', '(123)(4(56)(78))', 1, 1, 'i', 5) IS NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+-- Check case where we have a match, but not a subexpression match
+SELECT regexp_substr('foo', 'foo(bar)?', 1, 1, '', 1) IS NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+-- errors
+SELECT regexp_substr('abcabcabc', 'a.c', 0, 1);
+ERROR:  invalid value for parameter "start": 0
+SELECT regexp_substr('abcabcabc', 'a.c', 1, 0);
+ERROR:  invalid value for parameter "n": 0
+SELECT regexp_substr('abcabcabc', 'a.c', 1, 1, 'g');
+ERROR:  regexp_substr() does not support the "global" option
+SELECT regexp_substr('abcabcabc', 'a.c', 1, 1, '', -1);
+ERROR:  invalid value for parameter "subexpr": -1
 -- set so we can tell NULL from empty string
 \pset null '\\N'
 -- return all matches from regexp
@@ -1020,6 +1450,30 @@ SELECT 'indio' NOT LIKE 'in_o' AS "true";
  t
 (1 row)
 
+SELECT 'abc'::name LIKE '_b_' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'abc'::name NOT LIKE '_b_' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'abc'::bytea LIKE '_b_'::bytea AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'abc'::bytea NOT LIKE '_b_'::bytea AS "false";
+ false 
+-------
+ f
+(1 row)
+
 -- unused escape character
 SELECT 'hawkeye' LIKE 'h%' ESCAPE '#' AS "true";
  true 
@@ -1143,6 +1597,18 @@ SELECT 'i_dio' NOT LIKE 'i$_d%o' ESCAPE '$' AS "false";
  f
 (1 row)
 
+SELECT 'a_c'::bytea LIKE 'a$__'::bytea ESCAPE '$'::bytea AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'a_c'::bytea NOT LIKE 'a$__'::bytea ESCAPE '$'::bytea AS "false";
+ false 
+-------
+ f
+(1 row)
+
 -- escape character same as pattern character
 SELECT 'maca' LIKE 'm%aca' ESCAPE '%' AS "true";
  true 
@@ -1251,6 +1717,18 @@ SELECT 'Hawkeye' ILIKE 'h%' AS "true";
 (1 row)
 
 SELECT 'Hawkeye' NOT ILIKE 'h%' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'ABC'::name ILIKE '_b_' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'ABC'::name NOT ILIKE '_b_' AS "false";
  false 
 -------
  f
@@ -1552,8 +2030,56 @@ SELECT replace('yabadoo', 'bad', '') AS "yaoo";
 --
 -- test split_part
 --
+select split_part('','@',1) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
+select split_part('','@',-1) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
+select split_part('joeuser@mydatabase','',1) AS "joeuser@mydatabase";
+ joeuser@mydatabase 
+--------------------
+ joeuser@mydatabase
+(1 row)
+
+select split_part('joeuser@mydatabase','',2) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
+select split_part('joeuser@mydatabase','',-1) AS "joeuser@mydatabase";
+ joeuser@mydatabase 
+--------------------
+ joeuser@mydatabase
+(1 row)
+
+select split_part('joeuser@mydatabase','',-2) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
 select split_part('joeuser@mydatabase','@',0) AS "an error";
-ERROR:  field position must be greater than zero
+ERROR:  field position must not be zero
+select split_part('joeuser@mydatabase','@@',1) AS "joeuser@mydatabase";
+ joeuser@mydatabase 
+--------------------
+ joeuser@mydatabase
+(1 row)
+
+select split_part('joeuser@mydatabase','@@',2) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
 select split_part('joeuser@mydatabase','@',1) AS "joeuser";
  joeuser 
 ---------
@@ -1578,9 +2104,93 @@ select split_part('@joeuser@mydatabase@','@',2) AS "joeuser";
  joeuser
 (1 row)
 
+select split_part('joeuser@mydatabase','@',-1) AS "mydatabase";
+ mydatabase 
+------------
+ mydatabase
+(1 row)
+
+select split_part('joeuser@mydatabase','@',-2) AS "joeuser";
+ joeuser 
+---------
+ joeuser
+(1 row)
+
+select split_part('joeuser@mydatabase','@',-3) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
+select split_part('@joeuser@mydatabase@','@',-2) AS "mydatabase";
+ mydatabase 
+------------
+ mydatabase
+(1 row)
+
 --
--- test to_hex
+-- test to_bin, to_oct, and to_hex
 --
+select to_bin(-1234) AS "11111111111111111111101100101110";
+ 11111111111111111111101100101110 
+----------------------------------
+ 11111111111111111111101100101110
+(1 row)
+
+select to_bin(-1234::bigint);
+                              to_bin                              
+------------------------------------------------------------------
+ 1111111111111111111111111111111111111111111111111111101100101110
+(1 row)
+
+select to_bin(256*256*256 - 1) AS "111111111111111111111111";
+ 111111111111111111111111 
+--------------------------
+ 111111111111111111111111
+(1 row)
+
+select to_bin(256::bigint*256::bigint*256::bigint*256::bigint - 1) AS "11111111111111111111111111111111";
+ 11111111111111111111111111111111 
+----------------------------------
+ 11111111111111111111111111111111
+(1 row)
+
+select to_oct(-1234) AS "37777775456";
+ 37777775456 
+-------------
+ 37777775456
+(1 row)
+
+select to_oct(-1234::bigint) AS "1777777777777777775456";
+ 1777777777777777775456 
+------------------------
+ 1777777777777777775456
+(1 row)
+
+select to_oct(256*256*256 - 1) AS "77777777";
+ 77777777 
+----------
+ 77777777
+(1 row)
+
+select to_oct(256::bigint*256::bigint*256::bigint*256::bigint - 1) AS "37777777777";
+ 37777777777 
+-------------
+ 37777777777
+(1 row)
+
+select to_hex(-1234) AS "fffffb2e";
+ fffffb2e 
+----------
+ fffffb2e
+(1 row)
+
+select to_hex(-1234::bigint) AS "fffffffffffffb2e";
+ fffffffffffffb2e 
+------------------
+ fffffffffffffb2e
+(1 row)
+
 select to_hex(256*256*256 - 1) AS "ffffff";
  ffffff 
 --------
@@ -1591,94 +2201,6 @@ select to_hex(256::bigint*256::bigint*256::bigint*256::bigint - 1) AS "ffffffff"
  ffffffff 
 ----------
  ffffffff
-(1 row)
-
---
--- MD5 test suite - from IETF RFC 1321
--- (see: ftp://ftp.rfc-editor.org/in-notes/rfc1321.txt)
---
-select md5('') = 'd41d8cd98f00b204e9800998ecf8427e' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5('a') = '0cc175b9c0f1b6a831c399e269772661' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5('abc') = '900150983cd24fb0d6963f7d28e17f72' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5('message digest') = 'f96b697d7cb7938d525a2f31aaf161d0' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5('abcdefghijklmnopqrstuvwxyz') = 'c3fcd3d76192e4007dfb496cca67e13b' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789') = 'd174ab98d277d9f5a5611c2c9f419d9f' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5('12345678901234567890123456789012345678901234567890123456789012345678901234567890') = '57edf4a22be3c955ac49da2e2107b67a' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5(''::bytea) = 'd41d8cd98f00b204e9800998ecf8427e' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5('a'::bytea) = '0cc175b9c0f1b6a831c399e269772661' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5('abc'::bytea) = '900150983cd24fb0d6963f7d28e17f72' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5('message digest'::bytea) = 'f96b697d7cb7938d525a2f31aaf161d0' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5('abcdefghijklmnopqrstuvwxyz'::bytea) = 'c3fcd3d76192e4007dfb496cca67e13b' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'::bytea) = 'd174ab98d277d9f5a5611c2c9f419d9f' AS "TRUE";
- TRUE 
-------
- t
-(1 row)
-
-select md5('12345678901234567890123456789012345678901234567890123456789012345678901234567890'::bytea) = '57edf4a22be3c955ac49da2e2107b67a' AS "TRUE";
- TRUE 
-------
- t
 (1 row)
 
 --
@@ -1892,6 +2414,7 @@ select 'a\\bcd' as f1, 'a\\b\'cd' as f2, 'a\\b\'''cd' as f3, 'abcd\\'   as f4, '
  a\bcd | a\b'cd | a\b''cd | abcd\ | ab\'cd | \\
 (1 row)
 
+reset standard_conforming_strings;
 --
 -- Additional string functions
 --
@@ -1980,6 +2503,12 @@ SELECT translate('12345', '14', 'ax');
  a23x5
 (1 row)
 
+SELECT translate('12345', '134', 'a');
+ translate 
+-----------
+ a25
+(1 row)
+
 SELECT ascii('x');
  ascii 
 -------
@@ -2012,10 +2541,48 @@ SELECT repeat('Pg', -4);
  
 (1 row)
 
+SELECT SUBSTRING('1234567890'::bytea FROM 3) "34567890";
+ 34567890 
+----------
+ 34567890
+(1 row)
+
+SELECT SUBSTRING('1234567890'::bytea FROM 4 FOR 3) AS "456";
+ 456 
+-----
+ 456
+(1 row)
+
+SELECT SUBSTRING('string'::bytea FROM 2 FOR 2147483646) AS "tring";
+ tring 
+-------
+ tring
+(1 row)
+
+SELECT SUBSTRING('string'::bytea FROM -10 FOR 2147483646) AS "string";
+ string 
+--------
+ string
+(1 row)
+
+SELECT SUBSTRING('string'::bytea FROM -10 FOR -2147483646) AS "error";
+ERROR:  negative substring length not allowed
 SELECT trim(E'\\000'::bytea from E'\\000Tom\\000'::bytea);
  btrim 
 -------
  Tom
+(1 row)
+
+SELECT trim(leading E'\\000'::bytea from E'\\000Tom\\000'::bytea);
+  ltrim  
+---------
+ Tom\000
+(1 row)
+
+SELECT trim(trailing E'\\000'::bytea from E'\\000Tom\\000'::bytea);
+  rtrim  
+---------
+ \000Tom
 (1 row)
 
 SELECT btrim(E'\\000trim\\000'::bytea, E'\\000'::bytea);
@@ -2054,3 +2621,45 @@ SELECT encode(overlay(E'Th\\000omas'::bytea placing E'\\002\\003'::bytea from 5 
  Th\000o\x02\x03
 (1 row)
 
+SELECT bit_count('\x1234567890'::bytea);
+ bit_count 
+-----------
+        15
+(1 row)
+
+SELECT unistr('\0064at\+0000610');
+ unistr 
+--------
+ data0
+(1 row)
+
+SELECT unistr('d\u0061t\U000000610');
+ unistr 
+--------
+ data0
+(1 row)
+
+SELECT unistr('a\\b');
+ unistr 
+--------
+ a\b
+(1 row)
+
+-- errors:
+SELECT unistr('wrong: \db99');
+ERROR:  invalid Unicode surrogate pair
+SELECT unistr('wrong: \db99\0061');
+ERROR:  invalid Unicode surrogate pair
+SELECT unistr('wrong: \+00db99\+000061');
+ERROR:  invalid Unicode surrogate pair
+SELECT unistr('wrong: \+2FFFFF');
+ERROR:  invalid Unicode code point: 2FFFFF
+SELECT unistr('wrong: \udb99\u0061');
+ERROR:  invalid Unicode surrogate pair
+SELECT unistr('wrong: \U0000db99\U00000061');
+ERROR:  invalid Unicode surrogate pair
+SELECT unistr('wrong: \U002FFFFF');
+ERROR:  invalid Unicode code point: 2FFFFF
+SELECT unistr('wrong: \xyz');
+ERROR:  invalid Unicode escape
+HINT:  Unicode escapes must be \XXXX, \+XXXXXX, \uXXXX, or \UXXXXXXXX.

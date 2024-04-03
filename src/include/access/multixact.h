@@ -3,7 +3,7 @@
  *
  * PostgreSQL multi-transaction-log manager
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/multixact.h
@@ -13,6 +13,7 @@
 
 #include "access/xlogreader.h"
 #include "lib/stringinfo.h"
+#include "storage/sync.h"
 
 
 /*
@@ -28,10 +29,6 @@
 
 #define MaxMultiXactOffset	((MultiXactOffset) 0xFFFFFFFF)
 
-/* Number of SLRU buffers to use for multixact */
-#define NUM_MULTIXACTOFFSET_BUFFERS		8
-#define NUM_MULTIXACTMEMBER_BUFFERS		16
-
 /*
  * Possible multixact lock modes ("status").  The first four modes are for
  * tuple locks (FOR KEY SHARE, FOR SHARE, FOR NO KEY UPDATE, FOR UPDATE); the
@@ -46,7 +43,7 @@ typedef enum
 	/* an update that doesn't touch "key" columns */
 	MultiXactStatusNoKeyUpdate = 0x04,
 	/* other updates, and delete */
-	MultiXactStatusUpdate = 0x05
+	MultiXactStatusUpdate = 0x05,
 } MultiXactStatus;
 
 #define MaxMultiXactStatus MultiXactStatusUpdate
@@ -108,13 +105,17 @@ extern MultiXactId MultiXactIdCreateFromMembers(int nmembers,
 												MultiXactMember *members);
 
 extern MultiXactId ReadNextMultiXactId(void);
+extern void ReadMultiXactIdRange(MultiXactId *oldest, MultiXactId *next);
 extern bool MultiXactIdIsRunning(MultiXactId multi, bool isLockOnly);
 extern void MultiXactIdSetOldestMember(void);
-extern int	GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **xids,
-								  bool allow_old, bool isLockOnly);
+extern int	GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **members,
+								  bool from_pgupgrade, bool isLockOnly);
 extern bool MultiXactIdPrecedes(MultiXactId multi1, MultiXactId multi2);
 extern bool MultiXactIdPrecedesOrEquals(MultiXactId multi1,
 										MultiXactId multi2);
+
+extern int	multixactoffsetssyncfiletag(const FileTag *ftag, char *path);
+extern int	multixactmemberssyncfiletag(const FileTag *ftag, char *path);
 
 extern void AtEOXact_MultiXact(void);
 extern void AtPrepare_MultiXact(void);
@@ -125,7 +126,6 @@ extern void MultiXactShmemInit(void);
 extern void BootStrapMultiXact(void);
 extern void StartupMultiXact(void);
 extern void TrimMultiXact(void);
-extern void ShutdownMultiXact(void);
 extern void SetMultiXactIdLimit(MultiXactId oldest_datminmxid,
 								Oid oldest_datoid,
 								bool is_startup);
@@ -136,7 +136,8 @@ extern void MultiXactGetCheckptMulti(bool is_shutdown,
 									 Oid *oldestMultiDB);
 extern void CheckPointMultiXact(void);
 extern MultiXactId GetOldestMultiXactId(void);
-extern void TruncateMultiXact(MultiXactId oldestMulti, Oid oldestMultiDB);
+extern void TruncateMultiXact(MultiXactId newOldestMulti,
+							  Oid newOldestMultiDB);
 extern void MultiXactSetNextMXact(MultiXactId nextMulti,
 								  MultiXactOffset nextMultiOffset);
 extern void MultiXactAdvanceNextMXact(MultiXactId minMulti,

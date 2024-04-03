@@ -7,13 +7,13 @@
  * data types are shippable to a remote server for execution --- that is,
  * do they exist and have the same behavior remotely as they do locally?
  * Built-in objects are generally considered shippable.  Other objects can
- * be shipped if they are white-listed by the user.
+ * be shipped if they are declared as such by the user.
  *
  * Note: there are additional filter rules that prevent shipping mutable
  * functions or functions using nonportable collations.  Those considerations
  * need not be accounted for here.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/postgres_fdw/shippable.c
@@ -77,7 +77,7 @@ InvalidateShippableCacheCallback(Datum arg, int cacheid, uint32 hashvalue)
 	while ((entry = (ShippableCacheEntry *) hash_seq_search(&status)) != NULL)
 	{
 		if (hash_search(ShippableCacheHash,
-						(void *) &entry->key,
+						&entry->key,
 						HASH_REMOVE,
 						NULL) == NULL)
 			elog(ERROR, "hash table corrupted");
@@ -93,7 +93,6 @@ InitializeShippableCache(void)
 	HASHCTL		ctl;
 
 	/* Create the hash table. */
-	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(ShippableCacheKey);
 	ctl.entrysize = sizeof(ShippableCacheEntry);
 	ShippableCacheHash =
@@ -111,7 +110,7 @@ InitializeShippableCache(void)
  *
  * Right now "shippability" is exclusively a function of whether the object
  * belongs to an extension declared by the user.  In the future we could
- * additionally have a whitelist of functions/operators declared one at a time.
+ * additionally have a list of functions/operators declared one at a time.
  */
 static bool
 lookup_shippable(Oid objectId, Oid classId, PgFdwRelationInfo *fpinfo)
@@ -184,10 +183,7 @@ is_shippable(Oid objectId, Oid classId, PgFdwRelationInfo *fpinfo)
 
 	/* See if we already cached the result. */
 	entry = (ShippableCacheEntry *)
-		hash_search(ShippableCacheHash,
-					(void *) &key,
-					HASH_FIND,
-					NULL);
+		hash_search(ShippableCacheHash, &key, HASH_FIND, NULL);
 
 	if (!entry)
 	{
@@ -200,10 +196,7 @@ is_shippable(Oid objectId, Oid classId, PgFdwRelationInfo *fpinfo)
 		 * cache invalidation.
 		 */
 		entry = (ShippableCacheEntry *)
-			hash_search(ShippableCacheHash,
-						(void *) &key,
-						HASH_ENTER,
-						NULL);
+			hash_search(ShippableCacheHash, &key, HASH_ENTER, NULL);
 
 		entry->shippable = shippable;
 	}

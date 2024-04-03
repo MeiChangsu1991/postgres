@@ -3,7 +3,7 @@
  * amcmds.c
  *	  Routines for SQL commands that manipulate access methods.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -53,7 +53,7 @@ CreateAccessMethod(CreateAmStmt *stmt)
 
 	rel = table_open(AccessMethodRelationId, RowExclusiveLock);
 
-	/* Must be super user */
+	/* Must be superuser */
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -186,7 +186,7 @@ get_am_oid(const char *amname, bool missing_ok)
 }
 
 /*
- * get_am_name - given an access method OID name and type, look up its name.
+ * get_am_name - given an access method OID, look up its name.
  */
 char *
 get_am_name(Oid amOid)

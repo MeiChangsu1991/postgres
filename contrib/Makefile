@@ -5,10 +5,11 @@ top_builddir = ..
 include $(top_builddir)/src/Makefile.global
 
 SUBDIRS = \
-		adminpack	\
 		amcheck		\
 		auth_delay	\
 		auto_explain	\
+		basic_archive	\
+		basebackup_to_shell	\
 		bloom		\
 		btree_gin	\
 		btree_gist	\
@@ -32,13 +33,13 @@ SUBDIRS = \
 		pg_buffercache	\
 		pg_freespacemap \
 		pg_prewarm	\
-		pg_standby	\
 		pg_stat_statements \
+		pg_surgery	\
 		pg_trgm		\
-		pgcrypto	\
 		pgrowlocks	\
 		pgstattuple	\
 		pg_visibility	\
+		pg_walinspect	\
 		postgres_fdw	\
 		seg		\
 		spi		\
@@ -50,10 +51,10 @@ SUBDIRS = \
 		unaccent	\
 		vacuumlo
 
-ifeq ($(with_openssl),yes)
-SUBDIRS += sslinfo
+ifeq ($(with_ssl),openssl)
+SUBDIRS += pgcrypto sslinfo
 else
-ALWAYS_SUBDIRS += sslinfo
+ALWAYS_SUBDIRS += pgcrypto sslinfo
 endif
 
 ifneq ($(with_uuid),no)

@@ -3,7 +3,7 @@
  * nodeGather.c
  *	  Support routines for scanning a plan via multiple workers.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * A Gather executor launches parallel workers to run multiple copies of a
@@ -30,18 +30,13 @@
 
 #include "postgres.h"
 
-#include "access/relscan.h"
-#include "access/xact.h"
-#include "executor/execdebug.h"
 #include "executor/execParallel.h"
+#include "executor/executor.h"
 #include "executor/nodeGather.h"
-#include "executor/nodeSubplan.h"
 #include "executor/tqueue.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
-#include "pgstat.h"
-#include "utils/memutils.h"
-#include "utils/rel.h"
+#include "utils/wait_event.h"
 
 
 static TupleTableSlot *ExecGather(PlanState *pstate);
@@ -168,13 +163,13 @@ ExecGather(PlanState *pstate)
 
 			/* Initialize, or re-initialize, shared state needed by workers. */
 			if (!node->pei)
-				node->pei = ExecInitParallelPlan(node->ps.lefttree,
+				node->pei = ExecInitParallelPlan(outerPlanState(node),
 												 estate,
 												 gather->initParam,
 												 gather->num_workers,
 												 node->tuples_needed);
 			else
-				ExecParallelReinitialize(node->ps.lefttree,
+				ExecParallelReinitialize(outerPlanState(node),
 										 node->pei,
 										 gather->initParam);
 
@@ -250,9 +245,6 @@ ExecEndGather(GatherState *node)
 {
 	ExecEndNode(outerPlanState(node));	/* let children clean up first */
 	ExecShutdownGather(node);
-	ExecFreeExprContext(&node->ps);
-	if (node->ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ps.ps_ResultTupleSlot);
 }
 
 /*
@@ -266,7 +258,7 @@ gather_getnext(GatherState *gatherstate)
 	PlanState  *outerPlan = outerPlanState(gatherstate);
 	TupleTableSlot *outerTupleSlot;
 	TupleTableSlot *fslot = gatherstate->funnel_slot;
-	MinimalTuple	tup;
+	MinimalTuple tup;
 
 	while (gatherstate->nreaders > 0 || gatherstate->need_to_scan_locally)
 	{
@@ -278,7 +270,7 @@ gather_getnext(GatherState *gatherstate)
 
 			if (HeapTupleIsValid(tup))
 			{
-				ExecStoreMinimalTuple(tup, /* tuple to store */
+				ExecStoreMinimalTuple(tup,	/* tuple to store */
 									  fslot,	/* slot to store the tuple */
 									  false);	/* don't pfree tuple  */
 				return fslot;

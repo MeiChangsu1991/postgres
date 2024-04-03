@@ -3,7 +3,7 @@
  * heapam_handler.c
  *	  heap table access method code
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,6 +24,7 @@
 #include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
+#include "access/syncscan.h"
 #include "access/tableam.h"
 #include "access/tsmapi.h"
 #include "access/xact.h"
@@ -44,6 +45,11 @@
 #include "utils/builtins.h"
 #include "utils/rel.h"
 
+static TM_Result heapam_tuple_lock(Relation relation, ItemPointer tid,
+								   Snapshot snapshot, TupleTableSlot *slot,
+								   CommandId cid, LockTupleMode mode,
+								   LockWaitPolicy wait_policy, uint8 flags,
+								   TM_FailureData *tmfd);
 static void reform_and_rewrite_tuple(HeapTuple tuple,
 									 Relation OldHeap, Relation NewHeap,
 									 Datum *values, bool *isnull, RewriteState rwstate);
@@ -187,7 +193,7 @@ heapam_fetch_row_version(Relation relation,
 	Assert(TTS_IS_BUFFERTUPLE(slot));
 
 	bslot->base.tupdata.t_self = *tid;
-	if (heap_fetch(relation, snapshot, &bslot->base.tupdata, &buffer))
+	if (heap_fetch(relation, snapshot, &bslot->base.tupdata, &buffer, false))
 	{
 		/* store in slot, transferring existing pin */
 		ExecStorePinnedBufferHeapTuple(&bslot->base.tupdata, slot, buffer);
@@ -236,9 +242,9 @@ heapam_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
  * ----------------------------------------------------------------------------
  */
 
-static void
+static TupleTableSlot *
 heapam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
-					int options, BulkInsertState bistate)
+					int options, BulkInsertState bistate, bool *insert_indexes)
 {
 	bool		shouldFree = true;
 	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
@@ -253,6 +259,10 @@ heapam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 
 	if (shouldFree)
 		pfree(tuple);
+
+	*insert_indexes = true;
+
+	return slot;
 }
 
 static void
@@ -297,23 +307,55 @@ heapam_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
 
 static TM_Result
 heapam_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
-					Snapshot snapshot, Snapshot crosscheck, bool wait,
-					TM_FailureData *tmfd, bool changingPart)
+					Snapshot snapshot, Snapshot crosscheck, int options,
+					TM_FailureData *tmfd, bool changingPart,
+					TupleTableSlot *oldSlot)
 {
+	TM_Result	result;
+
 	/*
 	 * Currently Deleting of index tuples are handled at vacuum, in case if
 	 * the storage itself is cleaning the dead tuples by itself, it is the
 	 * time to call the index tuple deletion also.
 	 */
-	return heap_delete(relation, tid, cid, crosscheck, wait, tmfd, changingPart);
+	result = heap_delete(relation, tid, cid, crosscheck, options,
+						 tmfd, changingPart, oldSlot);
+
+	/*
+	 * If the tuple has been concurrently updated, then get the lock on it.
+	 * (Do only if caller asked for this by setting the
+	 * TABLE_MODIFY_LOCK_UPDATED option)  With the lock held retry of the
+	 * delete should succeed even if there are more concurrent update
+	 * attempts.
+	 */
+	if (result == TM_Updated && (options & TABLE_MODIFY_LOCK_UPDATED))
+	{
+		/*
+		 * heapam_tuple_lock() will take advantage of tuple loaded into
+		 * oldSlot by heap_delete().
+		 */
+		result = heapam_tuple_lock(relation, tid, snapshot,
+								   oldSlot, cid, LockTupleExclusive,
+								   (options & TABLE_MODIFY_WAIT) ?
+								   LockWaitBlock :
+								   LockWaitSkip,
+								   TUPLE_LOCK_FLAG_FIND_LAST_VERSION,
+								   tmfd);
+
+		if (result == TM_Ok)
+			return TM_Updated;
+	}
+
+	return result;
 }
 
 
 static TM_Result
 heapam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 					CommandId cid, Snapshot snapshot, Snapshot crosscheck,
-					bool wait, TM_FailureData *tmfd,
-					LockTupleMode *lockmode, bool *update_indexes)
+					int options, TM_FailureData *tmfd,
+					LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes,
+					TupleTableSlot *oldSlot)
 {
 	bool		shouldFree = true;
 	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
@@ -323,8 +365,8 @@ heapam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	slot->tts_tableOid = RelationGetRelid(relation);
 	tuple->t_tableOid = slot->tts_tableOid;
 
-	result = heap_update(relation, otid, tuple, cid, crosscheck, wait,
-						 tmfd, lockmode);
+	result = heap_update(relation, otid, tuple, cid, crosscheck, options,
+						 tmfd, lockmode, update_indexes, oldSlot);
 	ItemPointerCopy(&tuple->t_self, &slot->tts_tid);
 
 	/*
@@ -333,12 +375,48 @@ heapam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	 * Note: heap_update returns the tid (location) of the new tuple in the
 	 * t_self field.
 	 *
-	 * If it's a HOT update, we mustn't insert new index entries.
+	 * If the update is not HOT, we must update all indexes. If the update is
+	 * HOT, it could be that we updated summarized columns, so we either
+	 * update only summarized indexes, or none at all.
 	 */
-	*update_indexes = result == TM_Ok && !HeapTupleIsHeapOnly(tuple);
+	if (result != TM_Ok)
+	{
+		Assert(*update_indexes == TU_None);
+		*update_indexes = TU_None;
+	}
+	else if (!HeapTupleIsHeapOnly(tuple))
+		Assert(*update_indexes == TU_All);
+	else
+		Assert((*update_indexes == TU_Summarizing) ||
+			   (*update_indexes == TU_None));
 
 	if (shouldFree)
 		pfree(tuple);
+
+	/*
+	 * If the tuple has been concurrently updated, then get the lock on it.
+	 * (Do only if caller asked for this by setting the
+	 * TABLE_MODIFY_LOCK_UPDATED option)  With the lock held retry of the
+	 * update should succeed even if there are more concurrent update
+	 * attempts.
+	 */
+	if (result == TM_Updated && (options & TABLE_MODIFY_LOCK_UPDATED))
+	{
+		/*
+		 * heapam_tuple_lock() will take advantage of tuple loaded into
+		 * oldSlot by heap_update().
+		 */
+		result = heapam_tuple_lock(relation, otid, snapshot,
+								   oldSlot, cid, *lockmode,
+								   (options & TABLE_MODIFY_WAIT) ?
+								   LockWaitBlock :
+								   LockWaitSkip,
+								   TUPLE_LOCK_FLAG_FIND_LAST_VERSION,
+								   tmfd);
+
+		if (result == TM_Ok)
+			return TM_Updated;
+	}
 
 	return result;
 }
@@ -351,7 +429,6 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 {
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 	TM_Result	result;
-	Buffer		buffer;
 	HeapTuple	tuple = &bslot->base.tupdata;
 	bool		follow_updates;
 
@@ -361,17 +438,14 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 	Assert(TTS_IS_BUFFERTUPLE(slot));
 
 tuple_lock_retry:
-	tuple->t_self = *tid;
-	result = heap_lock_tuple(relation, tuple, cid, mode, wait_policy,
-							 follow_updates, &buffer, tmfd);
+	result = heap_lock_tuple(relation, tid, slot, cid, mode, wait_policy,
+							 follow_updates, tmfd);
 
 	if (result == TM_Updated &&
 		(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION))
 	{
 		/* Should not encounter speculative tuple on recheck */
 		Assert(!HeapTupleHeaderIsSpeculative(tuple->t_data));
-
-		ReleaseBuffer(buffer);
 
 		if (!ItemPointerEquals(&tmfd->ctid, &tuple->t_self))
 		{
@@ -394,13 +468,15 @@ tuple_lock_retry:
 			InitDirtySnapshot(SnapshotDirty);
 			for (;;)
 			{
+				Buffer		buffer = InvalidBuffer;
+
 				if (ItemPointerIndicatesMovedPartitions(tid))
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 							 errmsg("tuple to be locked was already moved to another partition due to concurrent update")));
 
 				tuple->t_self = *tid;
-				if (heap_fetch(relation, &SnapshotDirty, tuple, &buffer))
+				if (heap_fetch(relation, &SnapshotDirty, tuple, &buffer, true))
 				{
 					/*
 					 * If xmin isn't what we're expecting, the slot must have
@@ -423,7 +499,11 @@ tuple_lock_retry:
 					if (TransactionIdIsValid(SnapshotDirty.xmin))
 						ereport(ERROR,
 								(errcode(ERRCODE_DATA_CORRUPTED),
-								 errmsg_internal("t_xmin is uncommitted in tuple to be updated")));
+								 errmsg_internal("t_xmin %u is uncommitted in tuple (%u,%u) to be updated in table \"%s\"",
+												 SnapshotDirty.xmin,
+												 ItemPointerGetBlockNumber(&tuple->t_self),
+												 ItemPointerGetOffsetNumber(&tuple->t_self),
+												 RelationGetRelationName(relation))));
 
 					/*
 					 * If tuple is being updated by other transaction then we
@@ -484,7 +564,7 @@ tuple_lock_retry:
 					/*
 					 * This is a live tuple, so try to lock it again.
 					 */
-					ReleaseBuffer(buffer);
+					ExecStorePinnedBufferHeapTuple(tuple, slot, buffer);
 					goto tuple_lock_retry;
 				}
 
@@ -495,6 +575,7 @@ tuple_lock_retry:
 				 */
 				if (tuple->t_data == NULL)
 				{
+					ReleaseBuffer(buffer);
 					return TM_Deleted;
 				}
 
@@ -504,8 +585,7 @@ tuple_lock_retry:
 				if (!TransactionIdEquals(HeapTupleHeaderGetXmin(tuple->t_data),
 										 priorXmax))
 				{
-					if (BufferIsValid(buffer))
-						ReleaseBuffer(buffer);
+					ReleaseBuffer(buffer);
 					return TM_Deleted;
 				}
 
@@ -521,13 +601,12 @@ tuple_lock_retry:
 				 *
 				 * As above, it should be safe to examine xmax and t_ctid
 				 * without the buffer content lock, because they can't be
-				 * changing.
+				 * changing.  We'd better hold a buffer pin though.
 				 */
 				if (ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid))
 				{
 					/* deleted, so forget about it */
-					if (BufferIsValid(buffer))
-						ReleaseBuffer(buffer);
+					ReleaseBuffer(buffer);
 					return TM_Deleted;
 				}
 
@@ -535,8 +614,7 @@ tuple_lock_retry:
 				*tid = tuple->t_data->t_ctid;
 				/* updated row should have xmin matching this xmax */
 				priorXmax = HeapTupleHeaderGetUpdateXid(tuple->t_data);
-				if (BufferIsValid(buffer))
-					ReleaseBuffer(buffer);
+				ReleaseBuffer(buffer);
 				/* loop back to fetch next in chain */
 			}
 		}
@@ -550,9 +628,6 @@ tuple_lock_retry:
 	slot->tts_tableOid = RelationGetRelid(relation);
 	tuple->t_tableOid = slot->tts_tableOid;
 
-	/* store in slot, transferring existing pin */
-	ExecStorePinnedBufferHeapTuple(tuple, slot, buffer);
-
 	return result;
 }
 
@@ -563,11 +638,11 @@ tuple_lock_retry:
  */
 
 static void
-heapam_relation_set_new_filenode(Relation rel,
-								 const RelFileNode *newrnode,
-								 char persistence,
-								 TransactionId *freezeXid,
-								 MultiXactId *minmulti)
+heapam_relation_set_new_filelocator(Relation rel,
+									const RelFileLocator *newrlocator,
+									char persistence,
+									TransactionId *freezeXid,
+									MultiXactId *minmulti)
 {
 	SMgrRelation srel;
 
@@ -588,16 +663,13 @@ heapam_relation_set_new_filenode(Relation rel,
 	 */
 	*minmulti = GetOldestMultiXactId();
 
-	srel = RelationCreateStorage(*newrnode, persistence);
+	srel = RelationCreateStorage(*newrlocator, persistence, true);
 
 	/*
 	 * If required, set up an init fork for an unlogged table so that it can
-	 * be correctly reinitialized on restart.  An immediate sync is required
-	 * even if the page has been logged, because the write did not go through
-	 * shared_buffers and therefore a concurrent checkpoint may have moved the
-	 * redo pointer past our xlog record.  Recovery may as well remove it
-	 * while replaying, for example, XLOG_DBASE_CREATE or XLOG_TBLSPC_CREATE
-	 * record. Therefore, logging is necessary even if wal_level=minimal.
+	 * be correctly reinitialized on restart.  Recovery may remove it while
+	 * replaying, for example, an XLOG_DBASE_CREATE* or XLOG_TBLSPC_CREATE
+	 * record.  Therefore, logging is necessary even if wal_level=minimal.
 	 */
 	if (persistence == RELPERSISTENCE_UNLOGGED)
 	{
@@ -605,8 +677,7 @@ heapam_relation_set_new_filenode(Relation rel,
 			   rel->rd_rel->relkind == RELKIND_MATVIEW ||
 			   rel->rd_rel->relkind == RELKIND_TOASTVALUE);
 		smgrcreate(srel, INIT_FORKNUM, false);
-		log_smgrcreate(newrnode, INIT_FORKNUM);
-		smgrimmedsync(srel, INIT_FORKNUM);
+		log_smgrcreate(newrlocator, INIT_FORKNUM);
 	}
 
 	smgrclose(srel);
@@ -619,12 +690,9 @@ heapam_relation_nontransactional_truncate(Relation rel)
 }
 
 static void
-heapam_relation_copy_data(Relation rel, const RelFileNode *newrnode)
+heapam_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 {
 	SMgrRelation dstrel;
-
-	dstrel = smgropen(*newrnode, rel->rd_backend);
-	RelationOpenSmgr(rel);
 
 	/*
 	 * Since we copy the file directly without looking at the shared buffers,
@@ -638,20 +706,20 @@ heapam_relation_copy_data(Relation rel, const RelFileNode *newrnode)
 	 * Create and copy all forks of the relation, and schedule unlinking of
 	 * old physical files.
 	 *
-	 * NOTE: any conflict in relfilenode value will be caught in
+	 * NOTE: any conflict in relfilenumber value will be caught in
 	 * RelationCreateStorage().
 	 */
-	RelationCreateStorage(*newrnode, rel->rd_rel->relpersistence);
+	dstrel = RelationCreateStorage(*newrlocator, rel->rd_rel->relpersistence, true);
 
 	/* copy main fork */
-	RelationCopyStorage(rel->rd_smgr, dstrel, MAIN_FORKNUM,
+	RelationCopyStorage(RelationGetSmgr(rel), dstrel, MAIN_FORKNUM,
 						rel->rd_rel->relpersistence);
 
 	/* copy those extra forks that exist */
 	for (ForkNumber forkNum = MAIN_FORKNUM + 1;
 		 forkNum <= MAX_FORKNUM; forkNum++)
 	{
-		if (smgrexists(rel->rd_smgr, forkNum))
+		if (smgrexists(RelationGetSmgr(rel), forkNum))
 		{
 			smgrcreate(dstrel, forkNum, false);
 
@@ -659,11 +727,11 @@ heapam_relation_copy_data(Relation rel, const RelFileNode *newrnode)
 			 * WAL log creation if the relation is persistent, or this is the
 			 * init fork of an unlogged relation.
 			 */
-			if (rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT ||
+			if (RelationIsPermanent(rel) ||
 				(rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
 				 forkNum == INIT_FORKNUM))
-				log_smgrcreate(newrnode, forkNum);
-			RelationCopyStorage(rel->rd_smgr, dstrel, forkNum,
+				log_smgrcreate(newrlocator, forkNum);
+			RelationCopyStorage(RelationGetSmgr(rel), dstrel, forkNum,
 								rel->rd_rel->relpersistence);
 		}
 	}
@@ -697,6 +765,7 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	Datum	   *values;
 	bool	   *isnull;
 	BufferHeapTupleTableSlot *hslot;
+	BlockNumber prev_cblock = InvalidBlockNumber;
 
 	/* Remember if it's a system catalog */
 	is_system_catalog = IsSystemRelation(OldHeap);
@@ -721,7 +790,7 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	if (use_sort)
 		tuplesort = tuplesort_begin_cluster(oldTupDesc, OldIndex,
 											maintenance_work_mem,
-											NULL, false);
+											NULL, TUPLESORT_NONE);
 	else
 		tuplesort = NULL;
 
@@ -792,14 +861,38 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 		else
 		{
 			if (!table_scan_getnextslot(tableScan, ForwardScanDirection, slot))
+			{
+				/*
+				 * If the last pages of the scan were empty, we would go to
+				 * the next phase while heap_blks_scanned != heap_blks_total.
+				 * Instead, to ensure that heap_blks_scanned is equivalent to
+				 * heap_blks_total after the table scan phase, this parameter
+				 * is manually updated to the correct value when the table
+				 * scan finishes.
+				 */
+				pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_BLKS_SCANNED,
+											 heapScan->rs_nblocks);
 				break;
+			}
 
 			/*
 			 * In scan-and-sort mode and also VACUUM FULL, set heap blocks
 			 * scanned
+			 *
+			 * Note that heapScan may start at an offset and wrap around, i.e.
+			 * rs_startblock may be >0, and rs_cblock may end with a number
+			 * below rs_startblock. To prevent showing this wraparound to the
+			 * user, we offset rs_cblock by rs_startblock (modulo rs_nblocks).
 			 */
-			pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_BLKS_SCANNED,
-										 heapScan->rs_cblock + 1);
+			if (prev_cblock != heapScan->rs_cblock)
+			{
+				pgstat_progress_update_param(PROGRESS_CLUSTER_HEAP_BLKS_SCANNED,
+											 (heapScan->rs_cblock +
+											  heapScan->rs_nblocks -
+											  heapScan->rs_startblock
+											  ) % heapScan->rs_nblocks + 1);
+				prev_cblock = heapScan->rs_cblock;
+			}
 		}
 
 		tuple = ExecFetchSlotHeapTuple(slot, false, NULL);
@@ -960,7 +1053,15 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	pfree(isnull);
 }
 
-static bool
+/*
+ * Prepare to analyze block `blockno` of `scan`.  The scan has been started
+ * with SO_TYPE_ANALYZE option.
+ *
+ * This routine holds a buffer pin and lock on the heap page.  They are held
+ * until heapam_scan_analyze_next_tuple() returns false.  That is until all the
+ * items of the heap page are analyzed.
+ */
+void
 heapam_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
 							   BufferAccessStrategy bstrategy)
 {
@@ -980,12 +1081,19 @@ heapam_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
 	hscan->rs_cbuf = ReadBufferExtended(scan->rs_rd, MAIN_FORKNUM,
 										blockno, RBM_NORMAL, bstrategy);
 	LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_SHARE);
-
-	/* in heap all blocks can contain tuples, so always return true */
-	return true;
 }
 
-static bool
+/*
+ * Iterate over tuples in the block selected with
+ * heapam_scan_analyze_next_block().  If a tuple that's suitable for sampling
+ * is found, true is returned and a tuple is stored in `slot`.  When no more
+ * tuples for sampling, false is returned and the pin and lock acquired by
+ * heapam_scan_analyze_next_block() are released.
+ *
+ * *liverows and *deadrows are incremented according to the encountered
+ * tuples.
+ */
+bool
 heapam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 							   double *liverows, double *deadrows,
 							   TupleTableSlot *slot)
@@ -1060,8 +1168,8 @@ heapam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 				 * our own.  In this case we should count and sample the row,
 				 * to accommodate users who load a table and analyze it in one
 				 * transaction.  (pgstat_report_analyze has to adjust the
-				 * numbers we send to the stats collector to make this come
-				 * out right.)
+				 * numbers we report to the cumulative stats system to make
+				 * this come out right.)
 				 */
 				if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(targtuple->t_data)))
 				{
@@ -1202,7 +1310,7 @@ heapam_index_build_range_scan(Relation heapRelation,
 
 	/* okay to ignore lazy VACUUMs here */
 	if (!IsBootstrapProcessingMode() && !indexInfo->ii_Concurrent)
-		OldestXmin = GetOldestXmin(heapRelation, PROCARRAY_FLAGS_VACUUM);
+		OldestXmin = GetOldestNonRemovableTransactionId(heapRelation);
 
 	if (!scan)
 	{
@@ -1243,6 +1351,17 @@ heapam_index_build_range_scan(Relation heapRelation,
 
 	hscan = (HeapScanDesc) scan;
 
+	/*
+	 * Must have called GetOldestNonRemovableTransactionId() if using
+	 * SnapshotAny.  Shouldn't have for an MVCC snapshot. (It's especially
+	 * worth checking this for parallel builds, since ambuild routines that
+	 * support parallel builds must work these details out for themselves.)
+	 */
+	Assert(snapshot == SnapshotAny || IsMVCCSnapshot(snapshot));
+	Assert(snapshot == SnapshotAny ? TransactionIdIsValid(OldestXmin) :
+		   !TransactionIdIsValid(OldestXmin));
+	Assert(snapshot == SnapshotAny || !anyvisible);
+
 	/* Publish number of blocks to scan */
 	if (progress)
 	{
@@ -1261,17 +1380,6 @@ heapam_index_build_range_scan(Relation heapRelation,
 		pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_TOTAL,
 									 nblocks);
 	}
-
-	/*
-	 * Must call GetOldestXmin() with SnapshotAny.  Should never call
-	 * GetOldestXmin() with MVCC snapshot. (It's especially worth checking
-	 * this for parallel builds, since ambuild routines that support parallel
-	 * builds must work these details out for themselves.)
-	 */
-	Assert(snapshot == SnapshotAny || IsMVCCSnapshot(snapshot));
-	Assert(snapshot == SnapshotAny ? TransactionIdIsValid(OldestXmin) :
-		   !TransactionIdIsValid(OldestXmin));
-	Assert(snapshot == SnapshotAny || !anyvisible);
 
 	/* set our scan endpoints */
 	if (!allow_sync)
@@ -1322,6 +1430,12 @@ heapam_index_build_range_scan(Relation heapRelation,
 		 * ordinary insert/update/delete should occur; and we hold pin on the
 		 * buffer continuously while visiting the page, so no pruning
 		 * operation can occur either.
+		 *
+		 * In cases with only ShareUpdateExclusiveLock on the table, it's
+		 * possible for some HOT tuples to appear that we didn't know about
+		 * when we first read the page.  To handle that case, we re-obtain the
+		 * list of root offsets when a HOT tuple points to a root item that we
+		 * don't know about.
 		 *
 		 * Also, although our opinions about tuple liveness could change while
 		 * we scan the page (due to concurrent transaction commits/aborts),
@@ -1624,6 +1738,20 @@ heapam_index_build_range_scan(Relation heapRelation,
 
 			offnum = ItemPointerGetOffsetNumber(&heapTuple->t_self);
 
+			/*
+			 * If a HOT tuple points to a root that we don't know about,
+			 * obtain root items afresh.  If that still fails, report it as
+			 * corruption.
+			 */
+			if (root_offsets[offnum - 1] == InvalidOffsetNumber)
+			{
+				Page		page = BufferGetPage(hscan->rs_cbuf);
+
+				LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_SHARE);
+				heap_get_root_tuples(page, root_offsets);
+				LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_UNLOCK);
+			}
+
 			if (!OffsetNumberIsValid(root_offsets[offnum - 1]))
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_CORRUPTED),
@@ -1832,17 +1960,13 @@ heapam_index_validate_scan(Relation heapRelation,
 			}
 
 			tuplesort_empty = !tuplesort_getdatum(state->tuplesort, true,
-												  &ts_val, &ts_isnull, NULL);
+												  false, &ts_val, &ts_isnull,
+												  NULL);
 			Assert(tuplesort_empty || !ts_isnull);
 			if (!tuplesort_empty)
 			{
 				itemptr_decode(&decoded, DatumGetInt64(ts_val));
 				indexcursor = &decoded;
-
-				/* If int8 is pass-by-ref, free (encoded) TID Datum memory */
-#ifndef USE_FLOAT8_BYVAL
-				pfree(DatumGetPointer(ts_val));
-#endif
 			}
 			else
 			{
@@ -1910,6 +2034,7 @@ heapam_index_validate_scan(Relation heapRelation,
 						 heapRelation,
 						 indexInfo->ii_Unique ?
 						 UNIQUE_CHECK_YES : UNIQUE_CHECK_NO,
+						 false,
 						 indexInfo);
 
 			state->tups_inserted += 1;
@@ -2065,7 +2190,7 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 							  TBMIterateResult *tbmres)
 {
 	HeapScanDesc hscan = (HeapScanDesc) scan;
-	BlockNumber page = tbmres->blockno;
+	BlockNumber block = tbmres->blockno;
 	Buffer		buffer;
 	Snapshot	snapshot;
 	int			ntup;
@@ -2077,9 +2202,11 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 	 * Ignore any claimed entries past what we think is the end of the
 	 * relation. It may have been extended after the start of our scan (we
 	 * only hold an AccessShareLock, and it could be inserts from this
-	 * backend).
+	 * backend).  We don't take this optimization in SERIALIZABLE isolation
+	 * though, as we need to examine all invisible tuples reachable by the
+	 * index.
 	 */
-	if (page >= hscan->rs_nblocks)
+	if (!IsolationIsSerializable() && block >= hscan->rs_nblocks)
 		return false;
 
 	/*
@@ -2087,8 +2214,8 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 	 */
 	hscan->rs_cbuf = ReleaseAndReadBuffer(hscan->rs_cbuf,
 										  scan->rs_rd,
-										  page);
-	hscan->rs_cblock = page;
+										  block);
+	hscan->rs_cblock = block;
 	buffer = hscan->rs_cbuf;
 	snapshot = scan->rs_snapshot;
 
@@ -2124,7 +2251,7 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 			ItemPointerData tid;
 			HeapTupleData heapTuple;
 
-			ItemPointerSet(&tid, page, offnum);
+			ItemPointerSet(&tid, block, offnum);
 			if (heap_hot_search_buffer(&tid, scan->rs_rd, buffer, snapshot,
 									   &heapTuple, NULL, true))
 				hscan->rs_vistuples[ntup++] = ItemPointerGetOffsetNumber(&tid);
@@ -2136,8 +2263,8 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 		 * Bitmap is lossy, so we must examine each line pointer on the page.
 		 * But we can ignore HOT chains, since we'll check each tuple anyway.
 		 */
-		Page		dp = (Page) BufferGetPage(buffer);
-		OffsetNumber maxoff = PageGetMaxOffsetNumber(dp);
+		Page		page = BufferGetPage(buffer);
+		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
 		OffsetNumber offnum;
 
 		for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum = OffsetNumberNext(offnum))
@@ -2146,13 +2273,13 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 			HeapTupleData loctup;
 			bool		valid;
 
-			lp = PageGetItemId(dp, offnum);
+			lp = PageGetItemId(page, offnum);
 			if (!ItemIdIsNormal(lp))
 				continue;
-			loctup.t_data = (HeapTupleHeader) PageGetItem((Page) dp, lp);
+			loctup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 			loctup.t_len = ItemIdGetLength(lp);
 			loctup.t_tableOid = scan->rs_rd->rd_id;
-			ItemPointerSet(&loctup.t_self, page, offnum);
+			ItemPointerSet(&loctup.t_self, block, offnum);
 			valid = HeapTupleSatisfiesVisibility(&loctup, snapshot, buffer);
 			if (valid)
 			{
@@ -2180,7 +2307,7 @@ heapam_scan_bitmap_next_tuple(TableScanDesc scan,
 {
 	HeapScanDesc hscan = (HeapScanDesc) scan;
 	OffsetNumber targoffset;
-	Page		dp;
+	Page		page;
 	ItemId		lp;
 
 	/*
@@ -2190,11 +2317,11 @@ heapam_scan_bitmap_next_tuple(TableScanDesc scan,
 		return false;
 
 	targoffset = hscan->rs_vistuples[hscan->rs_cindex];
-	dp = (Page) BufferGetPage(hscan->rs_cbuf);
-	lp = PageGetItemId(dp, targoffset);
+	page = BufferGetPage(hscan->rs_cbuf);
+	lp = PageGetItemId(page, targoffset);
 	Assert(ItemIdIsNormal(lp));
 
-	hscan->rs_ctup.t_data = (HeapTupleHeader) PageGetItem((Page) dp, lp);
+	hscan->rs_ctup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 	hscan->rs_ctup.t_len = ItemIdGetLength(lp);
 	hscan->rs_ctup.t_tableOid = scan->rs_rd->rd_id;
 	ItemPointerSet(&hscan->rs_ctup.t_self, hscan->rs_cblock, targoffset);
@@ -2495,6 +2622,9 @@ static const TableAmRoutine heapam_methods = {
 	.scan_rescan = heap_rescan,
 	.scan_getnextslot = heap_getnextslot,
 
+	.scan_set_tidrange = heap_set_tidrange,
+	.scan_getnextslot_tidrange = heap_getnextslot_tidrange,
+
 	.parallelscan_estimate = table_block_parallelscan_estimate,
 	.parallelscan_initialize = table_block_parallelscan_initialize,
 	.parallelscan_reinitialize = table_block_parallelscan_reinitialize,
@@ -2516,18 +2646,18 @@ static const TableAmRoutine heapam_methods = {
 	.tuple_get_latest_tid = heap_get_latest_tid,
 	.tuple_tid_valid = heapam_tuple_tid_valid,
 	.tuple_satisfies_snapshot = heapam_tuple_satisfies_snapshot,
-	.compute_xid_horizon_for_tuples = heap_compute_xid_horizon_for_tuples,
+	.index_delete_tuples = heap_index_delete_tuples,
 
-	.relation_set_new_filenode = heapam_relation_set_new_filenode,
+	.relation_set_new_filelocator = heapam_relation_set_new_filelocator,
 	.relation_nontransactional_truncate = heapam_relation_nontransactional_truncate,
 	.relation_copy_data = heapam_relation_copy_data,
 	.relation_copy_for_cluster = heapam_relation_copy_for_cluster,
 	.relation_vacuum = heap_vacuum_rel,
-	.scan_analyze_next_block = heapam_scan_analyze_next_block,
-	.scan_analyze_next_tuple = heapam_scan_analyze_next_tuple,
 	.index_build_range_scan = heapam_index_build_range_scan,
 	.index_validate_scan = heapam_index_validate_scan,
+	.relation_analyze = heapam_analyze,
 
+	.free_rd_amcache = NULL,
 	.relation_size = table_block_relation_size,
 	.relation_needs_toast_table = heapam_relation_needs_toast_table,
 	.relation_toast_am = heapam_relation_toast_am,

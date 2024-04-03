@@ -41,19 +41,15 @@
 #include "utils/varlena.h"
 
 PG_FUNCTION_INFO_V1(bt_metap);
+PG_FUNCTION_INFO_V1(bt_page_items_1_9);
 PG_FUNCTION_INFO_V1(bt_page_items);
 PG_FUNCTION_INFO_V1(bt_page_items_bytea);
+PG_FUNCTION_INFO_V1(bt_page_stats_1_9);
 PG_FUNCTION_INFO_V1(bt_page_stats);
+PG_FUNCTION_INFO_V1(bt_multi_page_stats);
 
 #define IS_INDEX(r) ((r)->rd_rel->relkind == RELKIND_INDEX)
 #define IS_BTREE(r) ((r)->rd_rel->relam == BTREE_AM_OID)
-#define DatumGetItemPointer(X)	 ((ItemPointer) DatumGetPointer(X))
-#define ItemPointerGetDatum(X)	 PointerGetDatum(X)
-
-/* note: BlockNumber is unsigned, hence can't be negative */
-#define CHECK_RELATION_BLOCK_RANGE(rel, blkno) { \
-		if ( RelationGetNumberOfBlocks(rel) <= (BlockNumber) (blkno) ) \
-			 elog(ERROR, "block number out of range"); }
 
 /* ------------------------------------------------
  * structure for single btree page statistics
@@ -73,14 +69,33 @@ typedef struct BTPageStat
 	/* opaque data */
 	BlockNumber btpo_prev;
 	BlockNumber btpo_next;
-	union
-	{
-		uint32		level;
-		TransactionId xact;
-	}			btpo;
+	uint32		btpo_level;
 	uint16		btpo_flags;
 	BTCycleId	btpo_cycleid;
 } BTPageStat;
+
+/*
+ * cross-call data structure for SRF for page stats
+ */
+typedef struct ua_page_stats
+{
+	Oid			relid;
+	int64		blkno;
+	int64		blk_count;
+	bool		allpages;
+} ua_page_stats;
+
+/*
+ * cross-call data structure for SRF for page items
+ */
+typedef struct ua_page_items
+{
+	Page		page;
+	OffsetNumber offset;
+	bool		leafpage;
+	bool		rightmost;
+	TupleDesc	tupd;
+} ua_page_items;
 
 
 /* -------------------------------------------------
@@ -95,7 +110,7 @@ GetBTPageStatistics(BlockNumber blkno, Buffer buffer, BTPageStat *stat)
 	Page		page = BufferGetPage(buffer);
 	PageHeader	phdr = (PageHeader) page;
 	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
-	BTPageOpaque opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	BTPageOpaque opaque = BTPageGetOpaque(page);
 	int			item_size = 0;
 	int			off;
 
@@ -110,9 +125,33 @@ GetBTPageStatistics(BlockNumber blkno, Buffer buffer, BTPageStat *stat)
 	/* page type (flags) */
 	if (P_ISDELETED(opaque))
 	{
-		stat->type = 'd';
-		stat->btpo.xact = opaque->btpo.xact;
-		return;
+		/* We divide deleted pages into leaf ('d') or internal ('D') */
+		if (P_ISLEAF(opaque) || !P_HAS_FULLXID(opaque))
+			stat->type = 'd';
+		else
+			stat->type = 'D';
+
+		/*
+		 * Report safexid in a deleted page.
+		 *
+		 * Handle pg_upgrade'd deleted pages that used the previous safexid
+		 * representation in btpo_level field (this used to be a union type
+		 * called "bpto").
+		 */
+		if (P_HAS_FULLXID(opaque))
+		{
+			FullTransactionId safexid = BTPageGetDeleteXid(page);
+
+			elog(DEBUG2, "deleted page from block %u has safexid %u:%u",
+				 blkno, EpochFromFullTransactionId(safexid),
+				 XidFromFullTransactionId(safexid));
+		}
+		else
+			elog(DEBUG2, "deleted page from block %u has safexid %u",
+				 blkno, opaque->btpo_level);
+
+		/* Don't interpret BTDeletedPageData as index tuples */
+		maxoff = InvalidOffsetNumber;
 	}
 	else if (P_IGNORE(opaque))
 		stat->type = 'e';
@@ -126,7 +165,7 @@ GetBTPageStatistics(BlockNumber blkno, Buffer buffer, BTPageStat *stat)
 	/* btpage opaque data */
 	stat->btpo_prev = opaque->btpo_prev;
 	stat->btpo_next = opaque->btpo_next;
-	stat->btpo.level = opaque->btpo.level;
+	stat->btpo_level = opaque->btpo_level;
 	stat->btpo_flags = opaque->btpo_flags;
 	stat->btpo_cycleid = opaque->btpo_cycleid;
 
@@ -155,16 +194,74 @@ GetBTPageStatistics(BlockNumber blkno, Buffer buffer, BTPageStat *stat)
 }
 
 /* -----------------------------------------------
+ * check_relation_block_range()
+ *
+ * Verify that a block number (given as int64) is valid for the relation.
+ * -----------------------------------------------
+ */
+static void
+check_relation_block_range(Relation rel, int64 blkno)
+{
+	/* Ensure we can cast to BlockNumber */
+	if (blkno < 0 || blkno > MaxBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid block number %lld",
+						(long long) blkno)));
+
+	if ((BlockNumber) (blkno) >= RelationGetNumberOfBlocks(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("block number %lld is out of range",
+						(long long) blkno)));
+}
+
+/* -----------------------------------------------
+ * bt_index_block_validate()
+ *
+ * Validate index type is btree and block number
+ * is valid (and not the metapage).
+ * -----------------------------------------------
+ */
+static void
+bt_index_block_validate(Relation rel, int64 blkno)
+{
+	if (!IS_INDEX(rel) || !IS_BTREE(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a %s index",
+						RelationGetRelationName(rel), "btree")));
+
+	/*
+	 * Reject attempts to read non-local temporary relations; we would be
+	 * likely to get wrong data since we have no visibility into the owning
+	 * session's local buffers.
+	 */
+	if (RELATION_IS_OTHER_TEMP(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot access temporary tables of other sessions")));
+
+	if (blkno == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("block 0 is a meta page")));
+
+	check_relation_block_range(rel, blkno);
+}
+
+/* -----------------------------------------------
  * bt_page_stats()
  *
  * Usage: SELECT * FROM bt_page_stats('t1_pkey', 1);
+ * Arguments are index relation name and block number
  * -----------------------------------------------
  */
-Datum
-bt_page_stats(PG_FUNCTION_ARGS)
+static Datum
+bt_page_stats_internal(PG_FUNCTION_ARGS, enum pageinspect_version ext_version)
 {
 	text	   *relname = PG_GETARG_TEXT_PP(0);
-	uint32		blkno = PG_GETARG_UINT32(1);
+	int64		blkno = (ext_version == PAGEINSPECT_V1_8 ? PG_GETARG_UINT32(1) : PG_GETARG_INT64(1));
 	Buffer		buffer;
 	Relation	rel;
 	RangeVar   *relrv;
@@ -183,24 +280,7 @@ bt_page_stats(PG_FUNCTION_ARGS)
 	relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
 	rel = relation_openrv(relrv, AccessShareLock);
 
-	if (!IS_INDEX(rel) || !IS_BTREE(rel))
-		elog(ERROR, "relation \"%s\" is not a btree index",
-			 RelationGetRelationName(rel));
-
-	/*
-	 * Reject attempts to read non-local temporary relations; we would be
-	 * likely to get wrong data since we have no visibility into the owning
-	 * session's local buffers.
-	 */
-	if (RELATION_IS_OTHER_TEMP(rel))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot access temporary tables of other sessions")));
-
-	if (blkno == 0)
-		elog(ERROR, "block 0 is a meta page");
-
-	CHECK_RELATION_BLOCK_RANGE(rel, blkno);
+	bt_index_block_validate(rel, blkno);
 
 	buffer = ReadBuffer(rel, blkno);
 	LockBuffer(buffer, BUFFER_LOCK_SHARE);
@@ -219,16 +299,16 @@ bt_page_stats(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 
 	j = 0;
-	values[j++] = psprintf("%d", stat.blkno);
+	values[j++] = psprintf("%u", stat.blkno);
 	values[j++] = psprintf("%c", stat.type);
-	values[j++] = psprintf("%d", stat.live_items);
-	values[j++] = psprintf("%d", stat.dead_items);
-	values[j++] = psprintf("%d", stat.avg_item_size);
-	values[j++] = psprintf("%d", stat.page_size);
-	values[j++] = psprintf("%d", stat.free_size);
-	values[j++] = psprintf("%d", stat.btpo_prev);
-	values[j++] = psprintf("%d", stat.btpo_next);
-	values[j++] = psprintf("%d", (stat.type == 'd') ? stat.btpo.xact : stat.btpo.level);
+	values[j++] = psprintf("%u", stat.live_items);
+	values[j++] = psprintf("%u", stat.dead_items);
+	values[j++] = psprintf("%u", stat.avg_item_size);
+	values[j++] = psprintf("%u", stat.page_size);
+	values[j++] = psprintf("%u", stat.free_size);
+	values[j++] = psprintf("%u", stat.btpo_prev);
+	values[j++] = psprintf("%u", stat.btpo_next);
+	values[j++] = psprintf("%u", stat.btpo_level);
 	values[j++] = psprintf("%d", stat.btpo_flags);
 
 	tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(tupleDesc),
@@ -239,18 +319,158 @@ bt_page_stats(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(result);
 }
 
-
-/*
- * cross-call data structure for SRF
- */
-struct user_args
+Datum
+bt_page_stats_1_9(PG_FUNCTION_ARGS)
 {
-	Page		page;
-	OffsetNumber offset;
-	bool		leafpage;
-	bool		rightmost;
-	TupleDesc	tupd;
-};
+	return bt_page_stats_internal(fcinfo, PAGEINSPECT_V1_9);
+}
+
+/* entry point for old extension version */
+Datum
+bt_page_stats(PG_FUNCTION_ARGS)
+{
+	return bt_page_stats_internal(fcinfo, PAGEINSPECT_V1_8);
+}
+
+
+/* -----------------------------------------------
+ * bt_multi_page_stats()
+ *
+ * Usage: SELECT * FROM bt_page_stats('t1_pkey', 1, 2);
+ * Arguments are index relation name, first block number, number of blocks
+ * (but number of blocks can be negative to mean "read all the rest")
+ * -----------------------------------------------
+ */
+Datum
+bt_multi_page_stats(PG_FUNCTION_ARGS)
+{
+	Relation	rel;
+	ua_page_stats *uargs;
+	FuncCallContext *fctx;
+	MemoryContext mctx;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to use pageinspect functions")));
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		text	   *relname = PG_GETARG_TEXT_PP(0);
+		int64		blkno = PG_GETARG_INT64(1);
+		int64		blk_count = PG_GETARG_INT64(2);
+		RangeVar   *relrv;
+
+		fctx = SRF_FIRSTCALL_INIT();
+
+		relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
+		rel = relation_openrv(relrv, AccessShareLock);
+
+		/* Check that rel is a valid btree index and 1st block number is OK */
+		bt_index_block_validate(rel, blkno);
+
+		/*
+		 * Check if upper bound of the specified range is valid. If only one
+		 * page is requested, skip as we've already validated the page. (Also,
+		 * it's important to skip this if blk_count is negative.)
+		 */
+		if (blk_count > 1)
+			check_relation_block_range(rel, blkno + blk_count - 1);
+
+		/* Save arguments for reuse */
+		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
+
+		uargs = palloc(sizeof(ua_page_stats));
+
+		uargs->relid = RelationGetRelid(rel);
+		uargs->blkno = blkno;
+		uargs->blk_count = blk_count;
+		uargs->allpages = (blk_count < 0);
+
+		fctx->user_fctx = uargs;
+
+		MemoryContextSwitchTo(mctx);
+
+		/*
+		 * To avoid possibly leaking a relcache reference if the SRF isn't run
+		 * to completion, we close and re-open the index rel each time
+		 * through, using the index's OID for re-opens to ensure we get the
+		 * same rel.  Keep the AccessShareLock though, to ensure it doesn't go
+		 * away underneath us.
+		 */
+		relation_close(rel, NoLock);
+	}
+
+	fctx = SRF_PERCALL_SETUP();
+	uargs = fctx->user_fctx;
+
+	/* We should have lock already */
+	rel = relation_open(uargs->relid, NoLock);
+
+	/* In all-pages mode, recheck the index length each time */
+	if (uargs->allpages)
+		uargs->blk_count = RelationGetNumberOfBlocks(rel) - uargs->blkno;
+
+	if (uargs->blk_count > 0)
+	{
+		/* We need to fetch next block statistics */
+		Buffer		buffer;
+		Datum		result;
+		HeapTuple	tuple;
+		int			j;
+		char	   *values[11];
+		BTPageStat	stat;
+		TupleDesc	tupleDesc;
+
+		buffer = ReadBuffer(rel, uargs->blkno);
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+
+		/* keep compiler quiet */
+		stat.btpo_prev = stat.btpo_next = InvalidBlockNumber;
+		stat.btpo_flags = stat.free_size = stat.avg_item_size = 0;
+
+		GetBTPageStatistics(uargs->blkno, buffer, &stat);
+
+		UnlockReleaseBuffer(buffer);
+		relation_close(rel, NoLock);
+
+		/* Build a tuple descriptor for our result type */
+		if (get_call_result_type(fcinfo, NULL, &tupleDesc) != TYPEFUNC_COMPOSITE)
+			elog(ERROR, "return type must be a row type");
+
+		j = 0;
+		values[j++] = psprintf("%u", stat.blkno);
+		values[j++] = psprintf("%c", stat.type);
+		values[j++] = psprintf("%u", stat.live_items);
+		values[j++] = psprintf("%u", stat.dead_items);
+		values[j++] = psprintf("%u", stat.avg_item_size);
+		values[j++] = psprintf("%u", stat.page_size);
+		values[j++] = psprintf("%u", stat.free_size);
+		values[j++] = psprintf("%u", stat.btpo_prev);
+		values[j++] = psprintf("%u", stat.btpo_next);
+		values[j++] = psprintf("%u", stat.btpo_level);
+		values[j++] = psprintf("%d", stat.btpo_flags);
+
+		/* Construct tuple to be returned */
+		tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(tupleDesc),
+									   values);
+
+		result = HeapTupleGetDatum(tuple);
+
+		/*
+		 * Move to the next block number and decrement the number of blocks
+		 * still to be fetched
+		 */
+		uargs->blkno++;
+		uargs->blk_count--;
+
+		SRF_RETURN_NEXT(fctx, result);
+	}
+
+	/* Done, so finally we can release the index lock */
+	relation_close(rel, AccessShareLock);
+	SRF_RETURN_DONE(fctx);
+}
 
 /*-------------------------------------------------------
  * bt_page_print_tuples()
@@ -259,7 +479,7 @@ struct user_args
  * ------------------------------------------------------
  */
 static Datum
-bt_page_print_tuples(FuncCallContext *fctx, struct user_args *uargs)
+bt_page_print_tuples(ua_page_items *uargs)
 {
 	Page		page = uargs->page;
 	OffsetNumber offset = uargs->offset;
@@ -381,11 +601,7 @@ bt_page_print_tuples(FuncCallContext *fctx, struct user_args *uargs)
 		tids_datum = (Datum *) palloc(nposting * sizeof(Datum));
 		for (int i = 0; i < nposting; i++)
 			tids_datum[i] = ItemPointerGetDatum(&tids[i]);
-		values[j++] = PointerGetDatum(construct_array(tids_datum,
-													  nposting,
-													  TIDOID,
-													  sizeof(ItemPointerData),
-													  false, TYPALIGN_SHORT));
+		values[j++] = PointerGetDatum(construct_array_builtin(tids_datum, nposting, TIDOID));
 		pfree(tids_datum);
 	}
 	else
@@ -405,15 +621,15 @@ bt_page_print_tuples(FuncCallContext *fctx, struct user_args *uargs)
  * Usage: SELECT * FROM bt_page_items('t1_pkey', 1);
  *-------------------------------------------------------
  */
-Datum
-bt_page_items(PG_FUNCTION_ARGS)
+static Datum
+bt_page_items_internal(PG_FUNCTION_ARGS, enum pageinspect_version ext_version)
 {
 	text	   *relname = PG_GETARG_TEXT_PP(0);
-	uint32		blkno = PG_GETARG_UINT32(1);
+	int64		blkno = (ext_version == PAGEINSPECT_V1_8 ? PG_GETARG_UINT32(1) : PG_GETARG_INT64(1));
 	Datum		result;
 	FuncCallContext *fctx;
 	MemoryContext mctx;
-	struct user_args *uargs;
+	ua_page_items *uargs;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -433,24 +649,7 @@ bt_page_items(PG_FUNCTION_ARGS)
 		relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
 		rel = relation_openrv(relrv, AccessShareLock);
 
-		if (!IS_INDEX(rel) || !IS_BTREE(rel))
-			elog(ERROR, "relation \"%s\" is not a btree index",
-				 RelationGetRelationName(rel));
-
-		/*
-		 * Reject attempts to read non-local temporary relations; we would be
-		 * likely to get wrong data since we have no visibility into the
-		 * owning session's local buffers.
-		 */
-		if (RELATION_IS_OTHER_TEMP(rel))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot access temporary tables of other sessions")));
-
-		if (blkno == 0)
-			elog(ERROR, "block 0 is a meta page");
-
-		CHECK_RELATION_BLOCK_RANGE(rel, blkno);
+		bt_index_block_validate(rel, blkno);
 
 		buffer = ReadBuffer(rel, blkno);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
@@ -462,7 +661,7 @@ bt_page_items(PG_FUNCTION_ARGS)
 		 */
 		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
 
-		uargs = palloc(sizeof(struct user_args));
+		uargs = palloc(sizeof(ua_page_items));
 
 		uargs->page = palloc(BLCKSZ);
 		memcpy(uargs->page, BufferGetPage(buffer), BLCKSZ);
@@ -472,12 +671,16 @@ bt_page_items(PG_FUNCTION_ARGS)
 
 		uargs->offset = FirstOffsetNumber;
 
-		opaque = (BTPageOpaque) PageGetSpecialPointer(uargs->page);
+		opaque = BTPageGetOpaque(uargs->page);
 
-		if (P_ISDELETED(opaque))
-			elog(NOTICE, "page is deleted");
-
-		fctx->max_calls = PageGetMaxOffsetNumber(uargs->page);
+		if (!P_ISDELETED(opaque))
+			fctx->max_calls = PageGetMaxOffsetNumber(uargs->page);
+		else
+		{
+			/* Don't interpret BTDeletedPageData as index tuples */
+			elog(NOTICE, "page from block " INT64_FORMAT " is deleted", blkno);
+			fctx->max_calls = 0;
+		}
 		uargs->leafpage = P_ISLEAF(opaque);
 		uargs->rightmost = P_RIGHTMOST(opaque);
 
@@ -498,12 +701,25 @@ bt_page_items(PG_FUNCTION_ARGS)
 
 	if (fctx->call_cntr < fctx->max_calls)
 	{
-		result = bt_page_print_tuples(fctx, uargs);
+		result = bt_page_print_tuples(uargs);
 		uargs->offset++;
 		SRF_RETURN_NEXT(fctx, result);
 	}
 
 	SRF_RETURN_DONE(fctx);
+}
+
+Datum
+bt_page_items_1_9(PG_FUNCTION_ARGS)
+{
+	return bt_page_items_internal(fcinfo, PAGEINSPECT_V1_9);
+}
+
+/* entry point for old extension version */
+Datum
+bt_page_items(PG_FUNCTION_ARGS)
+{
+	return bt_page_items_internal(fcinfo, PAGEINSPECT_V1_8);
 }
 
 /*-------------------------------------------------------
@@ -521,8 +737,7 @@ bt_page_items_bytea(PG_FUNCTION_ARGS)
 	bytea	   *raw_page = PG_GETARG_BYTEA_P(0);
 	Datum		result;
 	FuncCallContext *fctx;
-	struct user_args *uargs;
-	int			raw_page_size;
+	ua_page_items *uargs;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -535,33 +750,53 @@ bt_page_items_bytea(PG_FUNCTION_ARGS)
 		MemoryContext mctx;
 		TupleDesc	tupleDesc;
 
-		raw_page_size = VARSIZE(raw_page) - VARHDRSZ;
-
-		if (raw_page_size < SizeOfPageHeaderData)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("input page too small (%d bytes)", raw_page_size)));
-
 		fctx = SRF_FIRSTCALL_INIT();
 		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
 
-		uargs = palloc(sizeof(struct user_args));
+		uargs = palloc(sizeof(ua_page_items));
 
-		uargs->page = VARDATA(raw_page);
+		uargs->page = get_page_from_raw(raw_page);
+
+		if (PageIsNew(uargs->page))
+		{
+			MemoryContextSwitchTo(mctx);
+			PG_RETURN_NULL();
+		}
 
 		uargs->offset = FirstOffsetNumber;
 
-		opaque = (BTPageOpaque) PageGetSpecialPointer(uargs->page);
+		/* verify the special space has the expected size */
+		if (PageGetSpecialSize(uargs->page) != MAXALIGN(sizeof(BTPageOpaqueData)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("input page is not a valid %s page", "btree"),
+					 errdetail("Expected special size %d, got %d.",
+							   (int) MAXALIGN(sizeof(BTPageOpaqueData)),
+							   (int) PageGetSpecialSize(uargs->page))));
+
+		opaque = BTPageGetOpaque(uargs->page);
 
 		if (P_ISMETA(opaque))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("block is a meta page")));
 
+		if (P_ISLEAF(opaque) && opaque->btpo_level != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("block is not a valid btree leaf page")));
+
 		if (P_ISDELETED(opaque))
 			elog(NOTICE, "page is deleted");
 
-		fctx->max_calls = PageGetMaxOffsetNumber(uargs->page);
+		if (!P_ISDELETED(opaque))
+			fctx->max_calls = PageGetMaxOffsetNumber(uargs->page);
+		else
+		{
+			/* Don't interpret BTDeletedPageData as index tuples */
+			elog(NOTICE, "page from block is deleted");
+			fctx->max_calls = 0;
+		}
 		uargs->leafpage = P_ISLEAF(opaque);
 		uargs->rightmost = P_RIGHTMOST(opaque);
 
@@ -582,7 +817,7 @@ bt_page_items_bytea(PG_FUNCTION_ARGS)
 
 	if (fctx->call_cntr < fctx->max_calls)
 	{
-		result = bt_page_print_tuples(fctx, uargs);
+		result = bt_page_print_tuples(uargs);
 		uargs->offset++;
 		SRF_RETURN_NEXT(fctx, result);
 	}
@@ -625,8 +860,10 @@ bt_metap(PG_FUNCTION_ARGS)
 	rel = relation_openrv(relrv, AccessShareLock);
 
 	if (!IS_INDEX(rel) || !IS_BTREE(rel))
-		elog(ERROR, "relation \"%s\" is not a btree index",
-			 RelationGetRelationName(rel));
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a %s index",
+						RelationGetRelationName(rel), "btree")));
 
 	/*
 	 * Reject attempts to read non-local temporary relations; we would be
@@ -650,10 +887,7 @@ bt_metap(PG_FUNCTION_ARGS)
 
 	/*
 	 * We need a kluge here to detect API versions prior to 1.8.  Earlier
-	 * versions incorrectly used int4 for certain columns.  This caused
-	 * various problems.  For example, an int4 version of the "oldest_xact"
-	 * column would not work with TransactionId values that happened to exceed
-	 * PG_INT32_MAX.
+	 * versions incorrectly used int4 for certain columns.
 	 *
 	 * There is no way to reliably avoid the problems created by the old
 	 * function definition at this point, so insist that the user update the
@@ -681,7 +915,8 @@ bt_metap(PG_FUNCTION_ARGS)
 	 */
 	if (metad->btm_version >= BTREE_NOVAC_VERSION)
 	{
-		values[j++] = psprintf("%u", metad->btm_oldest_btpo_xact);
+		values[j++] = psprintf(INT64_FORMAT,
+							   (int64) metad->btm_last_cleanup_num_delpages);
 		values[j++] = psprintf("%f", metad->btm_last_cleanup_num_heap_tuples);
 		values[j++] = metad->btm_allequalimage ? "t" : "f";
 	}

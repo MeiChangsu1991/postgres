@@ -13,9 +13,9 @@
    </para>
 
    <para>
-    Layout rules (brace positioning, etc) follow BSD conventions.  In
+    Layout rules (brace positioning, etc.) follow BSD conventions.  In
     particular, curly braces for the controlled blocks of <literal>if</literal>,
-    <literal>while</literal>, <literal>switch</literal>, etc go on their own lines.
+    <literal>while</literal>, <literal>switch</literal>, etc. go on their own lines.
    </para>
 
    <para>
@@ -62,11 +62,17 @@
    </para>
 
    <para>
-    The <filename>src/tools</filename> directory contains sample settings
-    files that can be used with the <productname>emacs</productname>,
+    The <filename>src/tools/editors</filename> directory contains sample settings
+    files that can be used with the <productname>Emacs</productname>,
     <productname>xemacs</productname> or <productname>vim</productname>
     editors to help ensure that they format code according to these
     conventions.
+   </para>
+
+   <para>
+    If you'd like to run <application>pgindent</application> locally
+    to help make your code match project style, see
+    the <filename>src/tools/pgindent</filename> directory.
    </para>
 
    <para>
@@ -99,11 +105,12 @@ less -x4
 
    <para>
     There are two required elements for every message: a severity level
-    (ranging from <literal>DEBUG</literal> to <literal>PANIC</literal>) and a primary
+    (ranging from <literal>DEBUG</literal> to <literal>PANIC</literal>, defined
+    in <filename>src/include/utils/elog.h</filename>) and a primary
     message text.  In addition there are optional elements, the most
     common of which is an error identifier code that follows the SQL spec's
     SQLSTATE conventions.
-    <function>ereport</function> itself is just a shell macro, that exists
+    <function>ereport</function> itself is just a shell macro that exists
     mainly for the syntactic convenience of making message generation
     look like a single function call in the C source code.  The only parameter
     accepted directly by <function>ereport</function> is the severity level.
@@ -284,6 +291,14 @@ ereport(ERROR,
    </listitem>
    <listitem>
     <para>
+     <function>errhint_plural(const char *fmt_singular, const char *fmt_plural,
+     unsigned long n, ...)</function> is like <function>errhint</function>, but with
+     support for various plural forms of the message.
+     For more information see <xref linkend="nls-guidelines"/>.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
      <function>errcontext(const char *msg, ...)</function> is not normally called
      directly from an <function>ereport</function> message site; rather it is used
      in <literal>error_context_stack</literal> callback functions to provide
@@ -373,7 +388,7 @@ ereport(ERROR,
      specify suppression of the <literal>CONTEXT:</literal> portion of a message in
      the postmaster log.  This should only be used for verbose debugging
      messages where the repeated inclusion of context would bloat the log
-     volume too much.
+     too much.
     </para>
    </listitem>
   </itemizedlist>
@@ -431,7 +446,7 @@ ereport(level, errmsg_internal("format string", ...));
     <productname>PostgreSQL</productname>.
    </para>
 
-  <simplesect>
+  <simplesect id="error-style-guide-what-goes-where">
    <title>What Goes Where</title>
 
    <para>
@@ -456,7 +471,7 @@ IpcMemoryCreate: shmget(key=%d, size=%u, 0%o) failed: %m
 <programlisting>
 Primary:    could not create shared memory segment: %m
 Detail:     Failed syscall was shmget(key=%d, size=%u, 0%o).
-Hint:       the addendum
+Hint:       The addendum, written as a complete sentence.
 </programlisting>
    </para>
 
@@ -472,7 +487,7 @@ Hint:       the addendum
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-formatting">
    <title>Formatting</title>
 
    <para>
@@ -493,7 +508,7 @@ Hint:       the addendum
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-quotation-marks">
    <title>Quotation Marks</title>
 
    <para>
@@ -514,13 +529,21 @@ Hint:       the addendum
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-quotes">
    <title>Use of Quotes</title>
 
    <para>
-    Use quotes always to delimit file names, user-supplied identifiers, and
+    Always use quotes to delimit file names, user-supplied identifiers, and
     other variables that might contain words.  Do not use them to mark up
     variables that will not contain words (for example, operator names).
+   </para>
+
+   <para>
+    In messages containing configuration variable names, do not include quotes
+    when the names are visibly not natural English words, such as when they
+    have underscores, are all-uppercase or have mixed case. Otherwise, quotes
+    must be added. Do include quotes in a message where an arbitrary variable
+    name is to be expanded.
    </para>
 
    <para>
@@ -538,7 +561,7 @@ Hint:       the addendum
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-grammar-punctuation">
    <title>Grammar and Punctuation</title>
 
    <para>
@@ -577,7 +600,7 @@ Hint:       the addendum
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-case">
    <title>Upper Case vs. Lower Case</title>
 
    <para>
@@ -593,7 +616,7 @@ Hint:       the addendum
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-passive-voice">
    <title>Avoid Passive Voice</title>
 
    <para>
@@ -609,7 +632,7 @@ Hint:       the addendum
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-tense">
    <title>Present vs. Past Tense</title>
 
    <para>
@@ -649,7 +672,7 @@ cannot open file "%s"
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-object-type">
    <title>Type of the Object</title>
 
    <para>
@@ -663,7 +686,7 @@ cannot open file "%s"
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-brackets">
    <title>Brackets</title>
 
    <para>
@@ -678,7 +701,7 @@ cannot open file "%s"
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-error-messages">
    <title>Assembling Error Messages</title>
 
    <para>
@@ -699,7 +722,7 @@ could not open file %s: %m
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-error-reasons">
    <title>Reasons for Errors</title>
 
    <para>
@@ -714,7 +737,7 @@ BETTER: could not open file %s (I/O failure)
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-function-names">
    <title>Function Names</title>
 
    <para>
@@ -746,7 +769,7 @@ BETTER: could not open file %s: %m
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-tricky-words">
    <title>Tricky Words to Avoid</title>
 
   <formalpara>
@@ -820,9 +843,19 @@ BETTER: unrecognized node type: 42
    </para>
   </formalpara>
 
+  <formalpara>
+    <title>Non-negative</title>
+   <para>
+    Avoid <quote>non-negative</quote> as it is ambiguous
+    about whether it accepts zero.  It's better to use
+    <quote>greater than zero</quote> or
+    <quote>greater than or equal to zero</quote>.
+   </para>
+  </formalpara>
+
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-spelling">
    <title>Proper Spelling</title>
 
    <para>
@@ -862,7 +895,7 @@ BETTER: unrecognized node type: 42
 
   </simplesect>
 
-  <simplesect>
+  <simplesect id="error-style-guide-localization">
    <title>Localization</title>
 
    <para>
@@ -877,7 +910,7 @@ BETTER: unrecognized node type: 42
   <sect1 id="source-conventions">
    <title>Miscellaneous Coding Conventions</title>
 
-   <simplesect>
+   <simplesect id="source-conventions-c-standard">
     <title>C Standard</title>
     <para>
      Code in <productname>PostgreSQL</productname> should only rely on language
@@ -908,12 +941,12 @@ BETTER: unrecognized node type: 42
     </para>
    </simplesect>
 
-   <simplesect>
+   <simplesect id="source-conventions-macros-inline">
     <title>Function-Like Macros and Inline Functions</title>
     <para>
-     Both, macros with arguments and <literal>static inline</literal>
-     functions, may be used. The latter are preferable if there are
-     multiple-evaluation hazards when written as a macro, as e.g. the
+     Both macros with arguments and <literal>static inline</literal>
+     functions may be used. The latter are preferable if there are
+     multiple-evaluation hazards when written as a macro, as e.g., the
      case with
 <programlisting>
 #define Max(x, y)       ((x) > (y) ? (x) : (y))
@@ -924,7 +957,7 @@ BETTER: unrecognized node type: 42
     </para>
     <para>
      When the definition of an inline function references symbols
-     (i.e. variables, functions) that are only available as part of the
+     (i.e., variables, functions) that are only available as part of the
      backend, the function may not be visible when included from frontend
      code.
 <programlisting>
@@ -947,7 +980,7 @@ MemoryContextSwitchTo(MemoryContext context)
     </para>
    </simplesect>
 
-   <simplesect>
+   <simplesect id="source-conventions-signal-handlers">
     <title>Writing Signal Handlers</title>
     <para>
      To be suitable to run inside a signal handler code has to be
@@ -974,22 +1007,14 @@ MemoryContextSwitchTo(MemoryContext context)
 static void
 handle_sighup(SIGNAL_ARGS)
 {
-    int         save_errno = errno;
-
     got_SIGHUP = true;
     SetLatch(MyLatch);
-
-    errno = save_errno;
 }
 </programlisting>
-     <varname>errno</varname> is saved and restored because
-     <function>SetLatch()</function> might change it. If that were not done
-     interrupted code that's currently inspecting <varname>errno</varname> might see the wrong
-     value.
     </para>
    </simplesect>
 
-   <simplesect>
+   <simplesect id="source-conventions-function-pointers">
     <title>Calling Function Pointers</title>
 
     <para>

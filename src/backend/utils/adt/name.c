@@ -9,7 +9,7 @@
  * always use NAMEDATALEN as the symbolic constant!   - jolly 8/21/95
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -38,7 +38,7 @@
 
 
 /*
- *		namein	- converts "..." to internal representation
+ *		namein	- converts cstring to internal representation
  *
  *		Note:
  *				[Old] Currently if strlen(s) < NAMEDATALEN, the extra chars are nulls
@@ -65,7 +65,7 @@ namein(PG_FUNCTION_ARGS)
 }
 
 /*
- *		nameout - converts internal representation to "..."
+ *		nameout - converts internal representation to cstring
  */
 Datum
 nameout(PG_FUNCTION_ARGS)
@@ -229,53 +229,13 @@ btnamesortsupport(PG_FUNCTION_ARGS)
  *	 MISCELLANEOUS PUBLIC ROUTINES											 *
  *****************************************************************************/
 
-int
-namecpy(Name n1, const NameData *n2)
-{
-	if (!n1 || !n2)
-		return -1;
-	StrNCpy(NameStr(*n1), NameStr(*n2), NAMEDATALEN);
-	return 0;
-}
-
-#ifdef NOT_USED
-int
-namecat(Name n1, Name n2)
-{
-	return namestrcat(n1, NameStr(*n2));	/* n2 can't be any longer than n1 */
-}
-#endif
-
-int
+void
 namestrcpy(Name name, const char *str)
 {
-	if (!name || !str)
-		return -1;
-	StrNCpy(NameStr(*name), str, NAMEDATALEN);
-	return 0;
+	/* NB: We need to zero-pad the destination. */
+	strncpy(NameStr(*name), str, NAMEDATALEN);
+	NameStr(*name)[NAMEDATALEN - 1] = '\0';
 }
-
-#ifdef NOT_USED
-int
-namestrcat(Name name, const char *str)
-{
-	int			i;
-	char	   *p,
-			   *q;
-
-	if (!name || !str)
-		return -1;
-	for (i = 0, p = NameStr(*name); i < NAMEDATALEN && *p; ++i, ++p)
-		;
-	for (q = str; i < NAMEDATALEN; ++i, ++p, ++q)
-	{
-		*p = *q;
-		if (!*q)
-			break;
-	}
-	return 0;
-}
-#endif
 
 /*
  * Compare a NAME to a C string
@@ -354,11 +314,7 @@ current_schemas(PG_FUNCTION_ARGS)
 	}
 	list_free(search_path);
 
-	array = construct_array(names, i,
-							NAMEOID,
-							NAMEDATALEN,	/* sizeof(Name) */
-							false,	/* Name is not by-val */
-							TYPALIGN_CHAR); /* alignment of Name */
+	array = construct_array_builtin(names, i, NAMEOID);
 
 	PG_RETURN_POINTER(array);
 }

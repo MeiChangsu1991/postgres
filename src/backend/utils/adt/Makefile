@@ -8,6 +8,8 @@ subdir = src/backend/utils/adt
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
+override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
+
 # keep this list arranged alphabetically or it gets to be a mess
 OBJS = \
 	acl.o \
@@ -17,12 +19,13 @@ OBJS = \
 	array_typanalyze.o \
 	array_userfuncs.o \
 	arrayfuncs.o \
+	arraysubs.o \
 	arrayutils.o \
 	ascii.o \
 	bool.o \
 	cash.o \
 	char.o \
-	cryptohashes.o \
+	cryptohashfuncs.o \
 	date.o \
 	datetime.o \
 	datum.o \
@@ -39,6 +42,7 @@ OBJS = \
 	geo_ops.o \
 	geo_selfuncs.o \
 	geo_spgist.o \
+	hbafuncs.o \
 	inet_cidr_ntop.o \
 	inet_net_pton.o \
 	int.o \
@@ -49,15 +53,20 @@ OBJS = \
 	jsonb_op.o \
 	jsonb_util.o \
 	jsonfuncs.o \
+	jsonbsubs.o \
 	jsonpath.o \
 	jsonpath_exec.o \
 	jsonpath_gram.o \
+	jsonpath_scan.o \
 	like.o \
 	like_support.o \
 	lockfuncs.o \
 	mac.o \
 	mac8.o \
+	mcxtfuncs.o \
 	misc.o \
+	multirangetypes.o \
+	multirangetypes_selfuncs.o \
 	name.o \
 	network.o \
 	network_gist.o \
@@ -73,6 +82,7 @@ OBJS = \
 	pg_lsn.o \
 	pg_upgrade_support.o \
 	pgstatfuncs.o \
+	pseudorandomfuncs.o \
 	pseudotypes.o \
 	quote.o \
 	rangetypes.o \
@@ -111,18 +121,26 @@ OBJS = \
 	xid8funcs.o \
 	xml.o
 
+# See notes in src/backend/parser/Makefile about the following two rules
+jsonpath_gram.h: jsonpath_gram.c
+	touch $@
+
+jsonpath_gram.c: BISONFLAGS += -d
+
 jsonpath_scan.c: FLEXFLAGS = -CF -p -p
 jsonpath_scan.c: FLEX_NO_BACKUP=yes
 
-# jsonpath_scan is compiled as part of jsonpath_gram
-jsonpath_gram.o: jsonpath_scan.c
+# Force these dependencies to be known even without dependency info built:
+jsonpath_gram.o jsonpath_scan.o: jsonpath_gram.h
 
-# jsonpath_gram.c and jsonpath_scan.c are in the distribution tarball,
-# so they are not cleaned here.
-clean distclean maintainer-clean:
+clean:
 	rm -f lex.backup
+	rm -f jsonpath_gram.c jsonpath_gram.h jsonpath_scan.c
 
 like.o: like.c like_match.c
+
+# Some code in numeric.c benefits from auto-vectorization
+numeric.o: CFLAGS += ${CFLAGS_VECTORIZE}
 
 varlena.o: varlena.c levenshtein.c
 

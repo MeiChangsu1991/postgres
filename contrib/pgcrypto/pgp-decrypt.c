@@ -211,7 +211,7 @@ pktreader_free(void *priv)
 	struct PktData *pkt = priv;
 
 	px_memset(pkt, 0, sizeof(*pkt));
-	px_free(pkt);
+	pfree(pkt);
 }
 
 static struct PullFilterOps pktreader_filter = {
@@ -224,13 +224,13 @@ pgp_create_pkt_reader(PullFilter **pf_p, PullFilter *src, int len,
 					  int pkttype, PGP_Context *ctx)
 {
 	int			res;
-	struct PktData *pkt = px_alloc(sizeof(*pkt));
+	struct PktData *pkt = palloc(sizeof(*pkt));
 
 	pkt->type = pkttype;
 	pkt->len = len;
 	res = pullf_create(pf_p, &pktreader_filter, pkt, src);
 	if (res < 0)
-		px_free(pkt);
+		pfree(pkt);
 	return res;
 }
 
@@ -250,7 +250,8 @@ prefix_init(void **priv_p, void *arg, PullFilter *src)
 	uint8		tmpbuf[PGP_MAX_BLOCK + 2];
 
 	len = pgp_get_cipher_block_size(ctx->cipher_algo);
-	if (len > sizeof(tmpbuf))
+	/* Make sure we have space for prefix */
+	if (len > PGP_MAX_BLOCK)
 		return PXE_BUG;
 
 	res = pullf_read_max(src, len + 2, &buf, tmpbuf);
@@ -447,8 +448,7 @@ mdcbuf_init(void **priv_p, void *arg, PullFilter *src)
 	PGP_Context *ctx = arg;
 	struct MDCBufData *st;
 
-	st = px_alloc(sizeof(*st));
-	memset(st, 0, sizeof(*st));
+	st = palloc0(sizeof(*st));
 	st->buflen = sizeof(st->buf);
 	st->ctx = ctx;
 	*priv_p = st;
@@ -576,7 +576,7 @@ mdcbuf_free(void *priv)
 	px_md_free(st->ctx->mdc_ctx);
 	st->ctx->mdc_ctx = NULL;
 	px_memset(st, 0, sizeof(*st));
-	px_free(st);
+	pfree(st);
 }
 
 static struct PullFilterOps mdcbuf_filter = {

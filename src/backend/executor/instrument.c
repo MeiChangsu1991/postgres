@@ -4,7 +4,7 @@
  *	 functions for instrumentation of plan execution
  *
  *
- * Copyright (c) 2001-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/executor/instrument.c
@@ -28,7 +28,7 @@ static void WalUsageAdd(WalUsage *dst, WalUsage *add);
 
 /* Allocate new instrumentation structure(s) */
 Instrumentation *
-InstrAlloc(int n, int instrument_options)
+InstrAlloc(int n, int instrument_options, bool async_mode)
 {
 	Instrumentation *instr;
 
@@ -46,6 +46,7 @@ InstrAlloc(int n, int instrument_options)
 			instr[i].need_bufusage = need_buffers;
 			instr[i].need_walusage = need_wal;
 			instr[i].need_timer = need_timer;
+			instr[i].async_mode = async_mode;
 		}
 	}
 
@@ -82,6 +83,7 @@ InstrStartNode(Instrumentation *instr)
 void
 InstrStopNode(Instrumentation *instr, double nTuples)
 {
+	double		save_tuplecount = instr->tuplecount;
 	instr_time	endtime;
 
 	/* count the returned tuples */
@@ -114,6 +116,23 @@ InstrStopNode(Instrumentation *instr, double nTuples)
 		instr->running = true;
 		instr->firsttuple = INSTR_TIME_GET_DOUBLE(instr->counter);
 	}
+	else
+	{
+		/*
+		 * In async mode, if the plan node hadn't emitted any tuples before,
+		 * this might be the first tuple
+		 */
+		if (instr->async_mode && save_tuplecount < 1.0)
+			instr->firsttuple = INSTR_TIME_GET_DOUBLE(instr->counter);
+	}
+}
+
+/* Update tuple count */
+void
+InstrUpdateTupleCount(Instrumentation *instr, double nTuples)
+{
+	/* count the returned tuples */
+	instr->tuplecount += nTuples;
 }
 
 /* Finish a run cycle for a plan node */
@@ -216,8 +235,12 @@ BufferUsageAdd(BufferUsage *dst, const BufferUsage *add)
 	dst->local_blks_written += add->local_blks_written;
 	dst->temp_blks_read += add->temp_blks_read;
 	dst->temp_blks_written += add->temp_blks_written;
-	INSTR_TIME_ADD(dst->blk_read_time, add->blk_read_time);
-	INSTR_TIME_ADD(dst->blk_write_time, add->blk_write_time);
+	INSTR_TIME_ADD(dst->shared_blk_read_time, add->shared_blk_read_time);
+	INSTR_TIME_ADD(dst->shared_blk_write_time, add->shared_blk_write_time);
+	INSTR_TIME_ADD(dst->local_blk_read_time, add->local_blk_read_time);
+	INSTR_TIME_ADD(dst->local_blk_write_time, add->local_blk_write_time);
+	INSTR_TIME_ADD(dst->temp_blk_read_time, add->temp_blk_read_time);
+	INSTR_TIME_ADD(dst->temp_blk_write_time, add->temp_blk_write_time);
 }
 
 /* dst += add - sub */
@@ -236,10 +259,18 @@ BufferUsageAccumDiff(BufferUsage *dst,
 	dst->local_blks_written += add->local_blks_written - sub->local_blks_written;
 	dst->temp_blks_read += add->temp_blks_read - sub->temp_blks_read;
 	dst->temp_blks_written += add->temp_blks_written - sub->temp_blks_written;
-	INSTR_TIME_ACCUM_DIFF(dst->blk_read_time,
-						  add->blk_read_time, sub->blk_read_time);
-	INSTR_TIME_ACCUM_DIFF(dst->blk_write_time,
-						  add->blk_write_time, sub->blk_write_time);
+	INSTR_TIME_ACCUM_DIFF(dst->shared_blk_read_time,
+						  add->shared_blk_read_time, sub->shared_blk_read_time);
+	INSTR_TIME_ACCUM_DIFF(dst->shared_blk_write_time,
+						  add->shared_blk_write_time, sub->shared_blk_write_time);
+	INSTR_TIME_ACCUM_DIFF(dst->local_blk_read_time,
+						  add->local_blk_read_time, sub->local_blk_read_time);
+	INSTR_TIME_ACCUM_DIFF(dst->local_blk_write_time,
+						  add->local_blk_write_time, sub->local_blk_write_time);
+	INSTR_TIME_ACCUM_DIFF(dst->temp_blk_read_time,
+						  add->temp_blk_read_time, sub->temp_blk_read_time);
+	INSTR_TIME_ACCUM_DIFF(dst->temp_blk_write_time,
+						  add->temp_blk_write_time, sub->temp_blk_write_time);
 }
 
 /* helper functions for WAL usage accumulation */

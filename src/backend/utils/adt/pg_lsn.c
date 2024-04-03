@@ -3,7 +3,7 @@
  * pg_lsn.c
  *	  Operations for the pg_lsn datatype.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -13,9 +13,8 @@
  */
 #include "postgres.h"
 
-#include "funcapi.h"
 #include "libpq/pqformat.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/numeric.h"
 #include "utils/pg_lsn.h"
 
@@ -69,7 +68,7 @@ pg_lsn_in(PG_FUNCTION_ARGS)
 
 	result = pg_lsn_in_internal(str, &have_error);
 	if (have_error)
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for type %s: \"%s\"",
 						"pg_lsn", str)));
@@ -83,14 +82,8 @@ pg_lsn_out(PG_FUNCTION_ARGS)
 	XLogRecPtr	lsn = PG_GETARG_LSN(0);
 	char		buf[MAXPG_LSNLEN + 1];
 	char	   *result;
-	uint32		id,
-				off;
 
-	/* Decode ID and offset */
-	id = (uint32) (lsn >> 32);
-	off = (uint32) lsn;
-
-	snprintf(buf, sizeof buf, "%X/%X", id, off);
+	snprintf(buf, sizeof buf, "%X/%X", LSN_FORMAT_ARGS(lsn));
 	result = pstrdup(buf);
 	PG_RETURN_CSTRING(result);
 }
@@ -277,7 +270,7 @@ pg_lsn_pli(PG_FUNCTION_ARGS)
 
 	/* Add two numerics */
 	res = DirectFunctionCall2(numeric_add,
-							  NumericGetDatum(num),
+							  num,
 							  NumericGetDatum(nbytes));
 
 	/* Convert to pg_lsn */
@@ -311,7 +304,7 @@ pg_lsn_mii(PG_FUNCTION_ARGS)
 
 	/* Subtract two numerics */
 	res = DirectFunctionCall2(numeric_sub,
-							  NumericGetDatum(num),
+							  num,
 							  NumericGetDatum(nbytes));
 
 	/* Convert to pg_lsn */

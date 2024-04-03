@@ -10,7 +10,7 @@
  * only here to simplify syncing this file with scan.l.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -56,8 +56,8 @@ static bool		include_next;
 
 #define startlit()	(literalbuf[0] = '\0', literallen = 0)
 static void addlit(char *ytext, int yleng);
-static void addlitchar(unsigned char);
-static int	process_integer_literal(const char *token, YYSTYPE *lval);
+static void addlitchar(unsigned char ychar);
+static int	process_integer_literal(const char *token, YYSTYPE *lval, int base);
 static void parse_include(void);
 static bool ecpg_isspace(char ch);
 static bool isdefine(void);
@@ -79,13 +79,29 @@ struct _yy_buffer
 
 static char *old;
 
+/*
+ * Vars for handling ifdef/elif/endif constructs.  preproc_tos is the current
+ * nesting depth of such constructs, and stacked_if_value[preproc_tos] is the
+ * state for the innermost level.  (For convenience, stacked_if_value[0] is
+ * initialized as though we are in the active branch of some outermost IF.)
+ * The active field is true if the current branch is active (being expanded).
+ * The saw_active field is true if we have found any successful branch,
+ * so that all subsequent branches of this level should be skipped.
+ * The else_branch field is true if we've found an 'else' (so that another
+ * 'else' or 'elif' at this level is an error.)
+ * For IFs nested within an inactive branch, all branches always have active
+ * set to false, but saw_active and else_branch are maintained normally.
+ * ifcond is valid only while evaluating an if-condition; it's true if we
+ * are doing ifdef, false if ifndef.
+ */
 #define MAX_NESTED_IF 128
 static short preproc_tos;
-static short ifcond;
+static bool ifcond;
 static struct _if_value
 {
-	short condition;
-	short else_branch;
+	bool		active;
+	bool		saw_active;
+	bool		else_branch;
 } stacked_if_value[MAX_NESTED_IF];
 
 %}
@@ -114,7 +130,7 @@ static struct _if_value
  *  <xc> extended C-style comments
  *  <xd> delimited identifiers (double-quoted identifiers)
  *  <xdc> double-quoted strings in C
- *  <xh> hexadecimal numeric string
+ *  <xh> hexadecimal byte string
  *  <xn> national character quoted strings
  *  <xq> standard quoted strings
  *  <xqs> quote stop (detect continued strings)
@@ -164,16 +180,16 @@ static struct _if_value
  * versions of Postgres failed to recognize -- as a comment if the input
  * did not end with a newline.
  *
- * XXX perhaps \f (formfeed) should be treated as a newline as well?
+ * non_newline_space tracks all space characters except newlines.
  *
  * XXX if you change the set of whitespace characters, fix ecpg_isspace()
  * to agree.
  */
 
-space			[ \t\n\r\f]
-horiz_space		[ \t\f]
-newline			[\n\r]
-non_newline		[^\n\r]
+space				[ \t\n\r\f\v]
+non_newline_space	[ \t\f\v]
+newline				[\n\r]
+non_newline			[^\n\r]
 
 comment			("--"{non_newline}*)
 
@@ -186,8 +202,8 @@ whitespace		({space}+|{comment})
  * it, whereas {whitespace} should generally have a * after it...
  */
 
-horiz_whitespace		({horiz_space}|{comment})
-whitespace_with_newline	({horiz_whitespace}*{newline}{whitespace}*)
+non_newline_whitespace	({non_newline_space}|{comment})
+whitespace_with_newline	({non_newline_whitespace}*{newline}{whitespace}*)
 
 quote			'
 /* If we see {quote} then {quotecontinue}, the quoted string continues */
@@ -207,7 +223,7 @@ quotecontinuefail	{whitespace}*"-"?
 xbstart			[bB]{quote}
 xbinside		[^']*
 
-/* Hexadecimal number */
+/* Hexadecimal byte string */
 xhstart			[xX]{quote}
 xhinside		[^']*
 
@@ -289,7 +305,6 @@ xcstart			\/\*{op_chars}*
 xcstop			\*+\/
 xcinside		[^*/]+
 
-digit			[0-9]
 ident_start		[A-Za-z\200-\377_]
 ident_cont		[A-Za-z\200-\377_0-9\$]
 
@@ -330,24 +345,46 @@ self			[,()\[\].;\:\+\-\*\/\%\^\<\>\=]
 op_chars		[\~\!\@\#\^\&\|\`\?\+\-\*\/\%\<\>\=]
 operator		{op_chars}+
 
-/* we no longer allow unary minus in numbers.
- * instead we pass it separately to parser. there it gets
- * coerced via doNegate() -- Leon aug 20 1999
+/*
+ * Numbers
  *
- * {decimalfail} is used because we would like "1..10" to lex as 1, dot_dot, 10.
+ * Unary minus is not part of a number here.  Instead we pass it separately to
+ * the parser, and there it gets coerced via doNegate().
  *
- * {realfail1} and {realfail2} are added to prevent the need for scanner
+ * {numericfail} is used because we would like "1..10" to lex as 1, dot_dot, 10.
+ *
+ * {realfail} is added to prevent the need for scanner
  * backup when the {real} rule fails to match completely.
  */
+decdigit		[0-9]
+hexdigit		[0-9A-Fa-f]
+octdigit		[0-7]
+bindigit		[0-1]
 
-integer			{digit}+
-decimal			(({digit}*\.{digit}+)|({digit}+\.{digit}*))
-decimalfail		{digit}+\.\.
-real			({integer}|{decimal})[Ee][-+]?{digit}+
-realfail1		({integer}|{decimal})[Ee]
-realfail2		({integer}|{decimal})[Ee][-+]
+decinteger		{decdigit}(_?{decdigit})*
+hexinteger		0[xX](_?{hexdigit})+
+octinteger		0[oO](_?{octdigit})+
+bininteger		0[bB](_?{bindigit})+
 
-param			\${integer}
+hexfail			0[xX]_?
+octfail			0[oO]_?
+binfail			0[bB]_?
+
+numeric			(({decinteger}\.{decinteger}?)|(\.{decinteger}))
+numericfail		{decdigit}+\.\.
+
+real			({decinteger}|{numeric})[Ee][-+]?{decinteger}
+realfail		({decinteger}|{numeric})[Ee][-+]
+
+decinteger_junk	{decinteger}{ident_start}
+hexinteger_junk	{hexinteger}{ident_start}
+octinteger_junk	{octinteger}{ident_start}
+bininteger_junk	{bininteger}{ident_start}
+numeric_junk	{numeric}{ident_start}
+real_junk		{real}{ident_start}
+
+param			\${decinteger}
+param_junk		\${decinteger}{ident_start}
 
 /* special characters for other dbms */
 /* we have to react differently in compat mode */
@@ -377,9 +414,6 @@ include_next	[iI][nN][cC][lL][uU][dD][eE]_[nN][eE][xX][tT]
 import			[iI][mM][pP][oO][rR][tT]
 undef			[uU][nN][dD][eE][fF]
 
-/* C version of hex number */
-xch				0[xX][0-9A-Fa-f]*
-
 ccomment		"//".*\n
 
 if				[iI][fF]
@@ -392,7 +426,7 @@ endif			[eE][nN][dD][iI][fF]
 struct			[sS][tT][rR][uU][cC][tT]
 
 exec_sql		{exec}{space}*{sql}{space}*
-ipdigit			({digit}|{digit}{digit}|{digit}{digit}{digit})
+ipdigit			({decdigit}|{decdigit}{decdigit}|{decdigit}{decdigit}{decdigit})
 ip				{ipdigit}\.{ipdigit}\.{ipdigit}\.{ipdigit}
 
 /* we might want to parse all cpp include files */
@@ -489,9 +523,9 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 <SQL>{
 {xbstart}		{
 					token_start = yytext;
+					state_before_str_start = YYSTATE;
 					BEGIN(xb);
 					startlit();
-					addlitchar('b');
 				}
 } /* <SQL> */
 
@@ -503,9 +537,9 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 
 <SQL>{xhstart}	{
 					token_start = yytext;
+					state_before_str_start = YYSTATE;
 					BEGIN(xh);
 					startlit();
-					addlitchar('x');
 				}
 <xh><<EOF>>		{ mmfatal(PARSE_ERROR, "unterminated hexadecimal string literal"); }
 
@@ -581,12 +615,14 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 					switch (state_before_str_stop)
 					{
 						case xb:
-							if (literalbuf[strspn(literalbuf, "01") + 1] != '\0')
+							if (literalbuf[strspn(literalbuf, "01")] != '\0')
 								mmerror(PARSE_ERROR, ET_ERROR, "invalid bit string literal");
-							base_yylval.str = mm_strdup(literalbuf);
+							base_yylval.str = psprintf("b'%s'", literalbuf);
 							return BCONST;
 						case xh:
-							base_yylval.str = mm_strdup(literalbuf);
+							if (literalbuf[strspn(literalbuf, "0123456789abcdefABCDEF")] != '\0')
+								mmerror(PARSE_ERROR, ET_ERROR, "invalid hexadecimal string literal");
+							base_yylval.str = psprintf("x'%s'", literalbuf);
 							return XCONST;
 						case xq:
 							/* fallthrough */
@@ -607,11 +643,8 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 					}
 				}
 
-<xq,xe,xn,xus>{xqdouble}	{ addlitchar('\''); }
-<xqc>{xqcquote}	{
-					addlitchar('\\');
-					addlitchar('\'');
-				}
+<xq,xe,xn,xus>{xqdouble}	{ addlit(yytext, yyleng); }
+<xqc>{xqcquote}				{ addlit(yytext, yyleng); }
 <xq,xqc,xn,xus>{xqinside}	{ addlit(yytext, yyleng); }
 <xe>{xeinside}  {
 					addlit(yytext, yyleng);
@@ -702,7 +735,14 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 					BEGIN(state_before_str_start);
 					if (literallen == 0)
 						mmerror(PARSE_ERROR, ET_ERROR, "zero-length delimited identifier");
-					/* The backend will truncate the identifier here. We do not as it does not change the result. */
+					/*
+					 * The server will truncate the identifier here.  We do
+					 * not, as (1) it does not change the result; (2) we don't
+					 * know what NAMEDATALEN the server might use; (3) this
+					 * code path is also taken for literal query strings in
+					 * PREPARE and EXECUTE IMMEDIATE, which can certainly be
+					 * longer than NAMEDATALEN.
+					 */
 					base_yylval.str = mm_strdup(literalbuf);
 					return CSTRING;
 				}
@@ -713,14 +753,14 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 				}
 <xui>{dquote}	{
 					BEGIN(state_before_str_start);
-					if (literallen == 2) /* "U&" */
+					if (literallen == 0)
 						mmerror(PARSE_ERROR, ET_ERROR, "zero-length delimited identifier");
 					/* The backend will truncate the identifier here. We do not as it does not change the result. */
 					base_yylval.str = psprintf("U&\"%s\"", literalbuf);
 					return UIDENT;
 				}
 <xd,xui>{xddouble}	{
-					addlitchar('"');
+					addlit(yytext, yyleng);
 				}
 <xd,xui>{xdinside}	{
 					addlit(yytext, yyleng);
@@ -893,6 +933,9 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 					base_yylval.ival = atol(yytext+1);
 					return PARAM;
 				}
+{param_junk}	{
+					mmfatal(PARSE_ERROR, "trailing junk after parameter");
+				}
 
 {ip}			{
 					base_yylval.str = mm_strdup(yytext);
@@ -901,38 +944,66 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 }  /* <SQL> */
 
 <C,SQL>{
-{integer}		{
-					return process_integer_literal(yytext, &base_yylval);
+{decinteger}	{
+					return process_integer_literal(yytext, &base_yylval, 10);
 				}
-{decimal}		{
+{hexinteger}	{
+					return process_integer_literal(yytext, &base_yylval, 16);
+				}
+{numeric}		{
 					base_yylval.str = mm_strdup(yytext);
 					return FCONST;
 				}
-{decimalfail}	{
+{numericfail}	{
 					/* throw back the .., and treat as integer */
 					yyless(yyleng - 2);
-					return process_integer_literal(yytext, &base_yylval);
+					return process_integer_literal(yytext, &base_yylval, 10);
 				}
 {real}			{
 					base_yylval.str = mm_strdup(yytext);
 					return FCONST;
 				}
-{realfail1}		{
+{realfail}		{
 					/*
-					 * throw back the [Ee], and figure out whether what
-					 * remains is an {integer} or {decimal}.
+					 * throw back the [Ee][+-], and figure out whether what
+					 * remains is an {decinteger} or {numeric}.
 					 */
-					yyless(yyleng - 1);
-					return process_integer_literal(yytext, &base_yylval);
-				}
-{realfail2}		{
-					/* throw back the [Ee][+-], and proceed as above */
 					yyless(yyleng - 2);
-					return process_integer_literal(yytext, &base_yylval);
+					return process_integer_literal(yytext, &base_yylval, 10);
 				}
 } /* <C,SQL> */
 
 <SQL>{
+{octinteger}	{
+					return process_integer_literal(yytext, &base_yylval, 8);
+				}
+{bininteger}	{
+					return process_integer_literal(yytext, &base_yylval, 2);
+				}
+
+	/*
+	 * Note that some trailing junk is valid in C (such as 100LL), so we
+	 * contain this to SQL mode.
+	 */
+{decinteger_junk}	{
+					mmfatal(PARSE_ERROR, "trailing junk after numeric literal");
+				}
+{hexinteger_junk}	{
+					mmfatal(PARSE_ERROR, "trailing junk after numeric literal");
+				}
+{octinteger_junk}	{
+					mmfatal(PARSE_ERROR, "trailing junk after numeric literal");
+				}
+{bininteger_junk}	{
+					mmfatal(PARSE_ERROR, "trailing junk after numeric literal");
+				}
+{numeric_junk}	{
+					mmfatal(PARSE_ERROR, "trailing junk after numeric literal");
+				}
+{real_junk}		{
+					mmfatal(PARSE_ERROR, "trailing junk after numeric literal");
+				}
+
 :{identifier}((("->"|\.){identifier})|(\[{array}\]))*	{
 					base_yylval.str = mm_strdup(yytext+1);
 					return CVARIABLE;
@@ -943,10 +1014,19 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 					{
 						int		kwvalue;
 
-						/* Is it an SQL/ECPG keyword? */
-						kwvalue = ScanECPGKeywordLookup(yytext);
-						if (kwvalue >= 0)
-							return kwvalue;
+						/*
+						 * User-defined typedefs override SQL keywords, but
+						 * not C keywords.  Currently, a typedef name is just
+						 * reported as IDENT, but someday we might need to
+						 * return a distinct token type.
+						 */
+						if (get_typedef(yytext, true) == NULL)
+						{
+							/* Is it an SQL/ECPG keyword? */
+							kwvalue = ScanECPGKeywordLookup(yytext);
+							if (kwvalue >= 0)
+								return kwvalue;
+						}
 
 						/* Is it a C keyword? */
 						kwvalue = ScanCKeywordLookup(yytext);
@@ -987,19 +1067,6 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 							return S_ANYTHING;
 					 }
 <C>{ccomment}		{ ECHO; }
-<C>{xch}			{
-						char* endptr;
-
-						errno = 0;
-						base_yylval.ival = strtoul((char *)yytext,&endptr,16);
-						if (*endptr != '\0' || errno == ERANGE)
-						{
-							errno = 0;
-							base_yylval.str = mm_strdup(yytext);
-							return SCONST;
-						}
-						return ICONST;
-					}
 <C>{cppinclude}		{
 						if (system_includes)
 						{
@@ -1126,7 +1193,7 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 					 */
 					for (i = strlen(yytext)-2;
 						 i > 0 && ecpg_isspace(yytext[i]);
-						 i-- )
+						 i--)
 						;
 					yytext[i+1] = '\0';
 
@@ -1165,11 +1232,26 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 						  return S_ANYTHING;
 					  }
 					}
-<C,xskip>{exec_sql}{ifdef}{space}*	{ ifcond = true; BEGIN(xcond); }
+<C,xskip>{exec_sql}{ifdef}{space}* {
+					  if (preproc_tos >= MAX_NESTED_IF-1)
+						  mmfatal(PARSE_ERROR, "too many nested EXEC SQL IFDEF conditions");
+					  preproc_tos++;
+					  stacked_if_value[preproc_tos].active = false;
+					  stacked_if_value[preproc_tos].saw_active = false;
+					  stacked_if_value[preproc_tos].else_branch = false;
+					  ifcond = true;
+					  BEGIN(xcond);
+					}
 <C,xskip>{informix_special}{ifdef}{space}* {
 					  /* are we simulating Informix? */
 					  if (INFORMIX_MODE)
 					  {
+						  if (preproc_tos >= MAX_NESTED_IF-1)
+							  mmfatal(PARSE_ERROR, "too many nested EXEC SQL IFDEF conditions");
+						  preproc_tos++;
+						  stacked_if_value[preproc_tos].active = false;
+						  stacked_if_value[preproc_tos].saw_active = false;
+						  stacked_if_value[preproc_tos].else_branch = false;
 						  ifcond = true;
 						  BEGIN(xcond);
 					  }
@@ -1179,11 +1261,26 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 						  return S_ANYTHING;
 					  }
 					}
-<C,xskip>{exec_sql}{ifndef}{space}* { ifcond = false; BEGIN(xcond); }
+<C,xskip>{exec_sql}{ifndef}{space}* {
+					  if (preproc_tos >= MAX_NESTED_IF-1)
+						  mmfatal(PARSE_ERROR, "too many nested EXEC SQL IFDEF conditions");
+					  preproc_tos++;
+					  stacked_if_value[preproc_tos].active = false;
+					  stacked_if_value[preproc_tos].saw_active = false;
+					  stacked_if_value[preproc_tos].else_branch = false;
+					  ifcond = false;
+					  BEGIN(xcond);
+					}
 <C,xskip>{informix_special}{ifndef}{space}* {
 					  /* are we simulating Informix? */
 					  if (INFORMIX_MODE)
 					  {
+						  if (preproc_tos >= MAX_NESTED_IF-1)
+							  mmfatal(PARSE_ERROR, "too many nested EXEC SQL IFDEF conditions");
+						  preproc_tos++;
+						  stacked_if_value[preproc_tos].active = false;
+						  stacked_if_value[preproc_tos].saw_active = false;
+						  stacked_if_value[preproc_tos].else_branch = false;
 						  ifcond = false;
 						  BEGIN(xcond);
 					  }
@@ -1193,16 +1290,13 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 						  return S_ANYTHING;
 					  }
 					}
-<C,xskip>{exec_sql}{elif}{space}*	{	/* pop stack */
-						if ( preproc_tos == 0 ) {
+<C,xskip>{exec_sql}{elif}{space}*	{
+						if (preproc_tos == 0)
 							mmfatal(PARSE_ERROR, "missing matching \"EXEC SQL IFDEF\" / \"EXEC SQL IFNDEF\"");
-						}
-						else if ( stacked_if_value[preproc_tos].else_branch )
+						if (stacked_if_value[preproc_tos].else_branch)
 							mmfatal(PARSE_ERROR, "missing \"EXEC SQL ENDIF;\"");
-						else
-							preproc_tos--;
-
-						ifcond = true; BEGIN(xcond);
+						ifcond = true;
+						BEGIN(xcond);
 					}
 <C,xskip>{informix_special}{elif}{space}* {
 					/* are we simulating Informix? */
@@ -1210,11 +1304,8 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 					{
 						if (preproc_tos == 0)
 							mmfatal(PARSE_ERROR, "missing matching \"EXEC SQL IFDEF\" / \"EXEC SQL IFNDEF\"");
-						else if (stacked_if_value[preproc_tos].else_branch)
+						if (stacked_if_value[preproc_tos].else_branch)
 							mmfatal(PARSE_ERROR, "missing \"EXEC SQL ENDIF;\"");
-						else
-							preproc_tos--;
-
 						ifcond = true;
 						BEGIN(xcond);
 					}
@@ -1226,16 +1317,19 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 				}
 
 <C,xskip>{exec_sql}{else}{space}*";" {	/* only exec sql endif pops the stack, so take care of duplicated 'else' */
-					if (stacked_if_value[preproc_tos].else_branch)
+					if (preproc_tos == 0)
+						mmfatal(PARSE_ERROR, "missing matching \"EXEC SQL IFDEF\" / \"EXEC SQL IFNDEF\"");
+					else if (stacked_if_value[preproc_tos].else_branch)
 						mmfatal(PARSE_ERROR, "more than one EXEC SQL ELSE");
 					else
 					{
 						stacked_if_value[preproc_tos].else_branch = true;
-						stacked_if_value[preproc_tos].condition =
-							(stacked_if_value[preproc_tos-1].condition &&
-							 !stacked_if_value[preproc_tos].condition);
+						stacked_if_value[preproc_tos].active =
+							(stacked_if_value[preproc_tos-1].active &&
+							 !stacked_if_value[preproc_tos].saw_active);
+						stacked_if_value[preproc_tos].saw_active = true;
 
-						if (stacked_if_value[preproc_tos].condition)
+						if (stacked_if_value[preproc_tos].active)
 							BEGIN(C);
 						else
 							BEGIN(xskip);
@@ -1245,16 +1339,19 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 					/* are we simulating Informix? */
 					if (INFORMIX_MODE)
 					{
-						if (stacked_if_value[preproc_tos].else_branch)
+						if (preproc_tos == 0)
+							mmfatal(PARSE_ERROR, "missing matching \"EXEC SQL IFDEF\" / \"EXEC SQL IFNDEF\"");
+						else if (stacked_if_value[preproc_tos].else_branch)
 							mmfatal(PARSE_ERROR, "more than one EXEC SQL ELSE");
 						else
 						{
 							stacked_if_value[preproc_tos].else_branch = true;
-							stacked_if_value[preproc_tos].condition =
-							(stacked_if_value[preproc_tos-1].condition &&
-							 !stacked_if_value[preproc_tos].condition);
+							stacked_if_value[preproc_tos].active =
+								(stacked_if_value[preproc_tos-1].active &&
+								 !stacked_if_value[preproc_tos].saw_active);
+							stacked_if_value[preproc_tos].saw_active = true;
 
-							if (stacked_if_value[preproc_tos].condition)
+							if (stacked_if_value[preproc_tos].active)
 								BEGIN(C);
 							else
 								BEGIN(xskip);
@@ -1272,7 +1369,7 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 					else
 						preproc_tos--;
 
-					if (stacked_if_value[preproc_tos].condition)
+					if (stacked_if_value[preproc_tos].active)
 					   BEGIN(C);
 					else
 					   BEGIN(xskip);
@@ -1286,7 +1383,7 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 						else
 							preproc_tos--;
 
-						if (stacked_if_value[preproc_tos].condition)
+						if (stacked_if_value[preproc_tos].active)
 							BEGIN(C);
 						else
 							BEGIN(xskip);
@@ -1301,12 +1398,10 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 <xskip>{other}		{ /* ignore */ }
 
 <xcond>{identifier}{space}*";" {
-					if (preproc_tos >= MAX_NESTED_IF-1)
-						mmfatal(PARSE_ERROR, "too many nested EXEC SQL IFDEF conditions");
-					else
 					{
 						struct _defines *defptr;
 						unsigned int i;
+						bool this_active;
 
 						/*
 						 *	Skip the ";" and trailing whitespace. Note that yytext
@@ -1314,7 +1409,7 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 						 */
 						for (i = strlen(yytext)-2;
 							 i > 0 && ecpg_isspace(yytext[i]);
-							 i-- )
+							 i--)
 							;
 						yytext[i+1] = '\0';
 
@@ -1324,13 +1419,15 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 							 defptr = defptr->next)
 							/* skip */ ;
 
-						preproc_tos++;
-						stacked_if_value[preproc_tos].else_branch = false;
-						stacked_if_value[preproc_tos].condition =
-						(defptr ? ifcond : !ifcond) && stacked_if_value[preproc_tos-1].condition;
+						this_active = (defptr ? ifcond : !ifcond);
+						stacked_if_value[preproc_tos].active =
+							(stacked_if_value[preproc_tos-1].active &&
+							 !stacked_if_value[preproc_tos].saw_active &&
+							 this_active);
+						stacked_if_value[preproc_tos].saw_active |= this_active;
 					}
 
-					if (stacked_if_value[preproc_tos].condition)
+					if (stacked_if_value[preproc_tos].active)
 						BEGIN(C);
 					else
 						BEGIN(xskip);
@@ -1386,7 +1483,7 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 <<EOF>>				{
 					if (yy_buffer == NULL)
 					{
-						if ( preproc_tos > 0 )
+						if (preproc_tos > 0)
 						{
 							preproc_tos = 0;
 							mmfatal(PARSE_ERROR, "missing \"EXEC SQL ENDIF;\"");
@@ -1409,7 +1506,7 @@ cppline			{space}*#([^i][A-Za-z]*|{if}|{ifdef}|{ifndef}|{import})((\/\*[^*/]*\*+
 						if (yyin != NULL)
 							fclose(yyin);
 
-						yy_delete_buffer( YY_CURRENT_BUFFER );
+						yy_delete_buffer(YY_CURRENT_BUFFER);
 						yy_switch_to_buffer(yy_buffer->buffer);
 
 						yylineno = yy_buffer->lineno;
@@ -1442,10 +1539,12 @@ lex_init(void)
 	parenths_open = 0;
 	current_function = NULL;
 
-	preproc_tos = 0;
 	yylineno = 1;
-	ifcond = true;
-	stacked_if_value[preproc_tos].condition = ifcond;
+
+	/* initialize state for if/else/endif */
+	preproc_tos = 0;
+	stacked_if_value[preproc_tos].active = true;
+	stacked_if_value[preproc_tos].saw_active = true;
 	stacked_if_value[preproc_tos].else_branch = false;
 
 	/* initialize literal buffer to a reasonable but expansible size */
@@ -1492,17 +1591,17 @@ addlitchar(unsigned char ychar)
 }
 
 /*
- * Process {integer}.  Note this will also do the right thing with {decimal},
- * ie digits and a decimal point.
+ * Process {decinteger}, {hexinteger}, etc.  Note this will also do the right
+ * thing with {numeric}, ie digits and a decimal point.
  */
 static int
-process_integer_literal(const char *token, YYSTYPE *lval)
+process_integer_literal(const char *token, YYSTYPE *lval, int base)
 {
 	int			val;
 	char	   *endptr;
 
 	errno = 0;
-	val = strtoint(token, &endptr, 10);
+	val = strtoint(base == 10 ? token : token + 2, &endptr, base);
 	if (*endptr != '\0' || errno == ERANGE)
 	{
 		/* integer too large (or contains decimal pt), treat it as a float */
@@ -1589,7 +1688,7 @@ parse_include(void)
 				if (strcmp(inc_file + strlen(inc_file) - 2, ".h") != 0)
 				{
 					strcat(inc_file, ".h");
-					yyin = fopen( inc_file, "r" );
+					yyin = fopen(inc_file, "r");
 				}
 			}
 			/* if the command was "include_next" we have to disregard the first hit */
@@ -1605,7 +1704,7 @@ parse_include(void)
 		mmfatal(NO_INCLUDE_FILE, "could not open include file \"%s\" on line %d", yytext, yylineno);
 
 	input_filename = mm_strdup(inc_file);
-	yy_switch_to_buffer(yy_create_buffer(yyin,YY_BUF_SIZE ));
+	yy_switch_to_buffer(yy_create_buffer(yyin,YY_BUF_SIZE));
 	yylineno = 1;
 	output_line_number();
 
@@ -1622,7 +1721,8 @@ ecpg_isspace(char ch)
 		ch == '\t' ||
 		ch == '\n' ||
 		ch == '\r' ||
-		ch == '\f')
+		ch == '\f' ||
+		ch == '\v')
 		return true;
 	return false;
 }

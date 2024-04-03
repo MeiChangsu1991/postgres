@@ -2,7 +2,7 @@
 #
 # Makefile for src/interfaces/ecpg/preproc
 #
-# Copyright (c) 1998-2020, PostgreSQL Global Development Group
+# Copyright (c) 1998-2024, PostgreSQL Global Development Group
 #
 # src/interfaces/ecpg/preproc/Makefile
 #
@@ -64,9 +64,9 @@ preproc.h: preproc.c
 
 preproc.c: BISONFLAGS += -d
 
-preproc.y: ../../../backend/parser/gram.y parse.pl ecpg.addons ecpg.header ecpg.tokens ecpg.trailer ecpg.type
-	$(PERL) $(srcdir)/parse.pl $(srcdir) < $< > $@
-	$(PERL) $(srcdir)/check_rules.pl $(srcdir) $<
+preproc.y: ../../../backend/parser/gram.y parse.pl check_rules.pl ecpg.addons ecpg.header ecpg.tokens ecpg.trailer ecpg.type
+	$(PERL) $(srcdir)/check_rules.pl --srcdir $(srcdir) --parser $<
+	$(PERL) $(srcdir)/parse.pl --srcdir $(srcdir) --parser $< --output $@
 
 # generate keyword headers
 c_kwlist_d.h: c_kwlist.h $(GEN_KEYWORDLIST_DEPS)
@@ -81,8 +81,6 @@ ecpg_keywords.o: ecpg_kwlist_d.h
 c_keywords.o: c_kwlist_d.h
 keywords.o: $(top_srcdir)/src/include/parser/kwlist.h
 
-distprep: preproc.y preproc.c preproc.h pgc.c c_kwlist_d.h ecpg_kwlist_d.h
-
 install: all installdirs
 	$(INSTALL_PROGRAM) ecpg$(X) '$(DESTDIR)$(bindir)'
 
@@ -92,11 +90,7 @@ installdirs:
 uninstall:
 	rm -f '$(DESTDIR)$(bindir)/ecpg$(X)'
 
-# preproc.y, preproc.c, preproc.h, pgc.c, c_kwlist_d.h, and ecpg_kwlist_d.h
-# are in the distribution tarball, so they are not cleaned here.
 clean distclean:
 	rm -f *.o ecpg$(X)
 	rm -f typename.c
-
-maintainer-clean: distclean
 	rm -f preproc.y preproc.c preproc.h pgc.c c_kwlist_d.h ecpg_kwlist_d.h

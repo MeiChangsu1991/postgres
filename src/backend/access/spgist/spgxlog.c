@@ -4,7 +4,7 @@
  *	  WAL replay logic for SP-GiST
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,8 +17,6 @@
 #include "access/bufmask.h"
 #include "access/spgist_private.h"
 #include "access/spgxlog.h"
-#include "access/transam.h"
-#include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "storage/standby.h"
 #include "utils/memutils.h"
@@ -122,8 +120,8 @@ spgRedoAddLeaf(XLogReaderState *record)
 
 				head = (SpGistLeafTuple) PageGetItem(page,
 													 PageGetItemId(page, xldata->offnumHeadLeaf));
-				Assert(head->nextOffset == leafTupleHdr.nextOffset);
-				head->nextOffset = xldata->offnumLeaf;
+				Assert(SGLT_GET_NEXTOFFSET(head) == SGLT_GET_NEXTOFFSET(&leafTupleHdr));
+				SGLT_SET_NEXTOFFSET(head, xldata->offnumLeaf);
 			}
 		}
 		else
@@ -822,7 +820,7 @@ spgRedoVacuumLeaf(XLogReaderState *record)
 			lt = (SpGistLeafTuple) PageGetItem(page,
 											   PageGetItemId(page, chainSrc[i]));
 			Assert(lt->tupstate == SPGIST_LIVE);
-			lt->nextOffset = chainDest[i];
+			SGLT_SET_NEXTOFFSET(lt, chainDest[i]);
 		}
 
 		PageSetLSN(page, lsn);
@@ -875,14 +873,12 @@ spgRedoVacuumRedirect(XLogReaderState *record)
 	 */
 	if (InHotStandby)
 	{
-		if (TransactionIdIsValid(xldata->newestRedirectXid))
-		{
-			RelFileNode node;
+		RelFileLocator locator;
 
-			XLogRecGetBlockTag(record, 0, &node, NULL, NULL);
-			ResolveRecoveryConflictWithSnapshot(xldata->newestRedirectXid,
-												node);
-		}
+		XLogRecGetBlockTag(record, 0, &locator, NULL, NULL);
+		ResolveRecoveryConflictWithSnapshot(xldata->snapshotConflictHorizon,
+											xldata->isCatalogRel,
+											locator);
 	}
 
 	if (XLogReadBufferForRedo(record, 0, &buffer) == BLK_NEEDS_REDO)

@@ -23,6 +23,8 @@
 #ifndef PG_BACKUP_H
 #define PG_BACKUP_H
 
+#include "common/compression.h"
+#include "common/file_utils.h"
 #include "fe_utils/simple_list.h"
 #include "libpq-fe.h"
 
@@ -31,7 +33,7 @@ typedef enum trivalue
 {
 	TRI_DEFAULT,
 	TRI_NO,
-	TRI_YES
+	TRI_YES,
 } trivalue;
 
 typedef enum _archiveFormat
@@ -40,28 +42,60 @@ typedef enum _archiveFormat
 	archCustom = 1,
 	archTar = 3,
 	archNull = 4,
-	archDirectory = 5
+	archDirectory = 5,
 } ArchiveFormat;
 
 typedef enum _archiveMode
 {
 	archModeAppend,
 	archModeWrite,
-	archModeRead
+	archModeRead,
 } ArchiveMode;
 
 typedef enum _teSection
 {
-	SECTION_NONE = 1,			/* COMMENTs, ACLs, etc; can be anywhere */
+	SECTION_NONE = 1,			/* comments, ACLs, etc; can be anywhere */
 	SECTION_PRE_DATA,			/* stuff to be processed before data */
-	SECTION_DATA,				/* TABLE DATA, BLOBS, BLOB COMMENTS */
-	SECTION_POST_DATA			/* stuff to be processed after data */
+	SECTION_DATA,				/* table data, large objects, LO comments */
+	SECTION_POST_DATA,			/* stuff to be processed after data */
 } teSection;
+
+/* We need one enum entry per prepared query in pg_dump */
+enum _dumpPreparedQueries
+{
+	PREPQUERY_DUMPAGG,
+	PREPQUERY_DUMPBASETYPE,
+	PREPQUERY_DUMPCOMPOSITETYPE,
+	PREPQUERY_DUMPDOMAIN,
+	PREPQUERY_DUMPENUMTYPE,
+	PREPQUERY_DUMPFUNC,
+	PREPQUERY_DUMPOPR,
+	PREPQUERY_DUMPRANGETYPE,
+	PREPQUERY_DUMPTABLEATTACH,
+	PREPQUERY_GETCOLUMNACLS,
+	PREPQUERY_GETDOMAINCONSTRAINTS,
+	NUM_PREP_QUERIES			/* must be last */
+};
+
+/* Parameters needed by ConnectDatabase; same for dump and restore */
+typedef struct _connParams
+{
+	/* These fields record the actual command line parameters */
+	char	   *dbname;			/* this may be a connstring! */
+	char	   *pgport;
+	char	   *pghost;
+	char	   *username;
+	trivalue	promptPassword;
+	/* If not NULL, this overrides the dbname obtained from command line */
+	/* (but *only* the DB name, not anything else in the connstring) */
+	char	   *override_dbname;
+} ConnParams;
 
 typedef struct _restoreOptions
 {
 	int			createDB;		/* Issue commands to create the database */
 	int			noOwner;		/* Don't try to match original object owner */
+	int			noTableAm;		/* Don't issue table-AM-related commands */
 	int			noTablespace;	/* Don't issue tablespace-related commands */
 	int			disable_triggers;	/* disable triggers during data-only
 									 * restore */
@@ -107,17 +141,17 @@ typedef struct _restoreOptions
 	SimpleStringList tableNames;
 
 	int			useDB;
-	char	   *dbname;			/* subject to expand_dbname */
-	char	   *pgport;
-	char	   *pghost;
-	char	   *username;
+	ConnParams	cparams;		/* parameters to use if useDB */
+
 	int			noDataForFailedTables;
-	trivalue	promptPassword;
 	int			exit_on_error;
-	int			compression;
+	pg_compress_specification compression_spec; /* Specification for
+												 * compression */
 	int			suppressDumpWarnings;	/* Suppress output of WARNING entries
 										 * to stderr */
-	bool		single_txn;
+
+	bool		single_txn;		/* restore all TOCs in one transaction */
+	int			txn_size;		/* restore this many TOCs per txn, if > 0 */
 
 	bool	   *idWanted;		/* array showing which dump IDs to emit */
 	int			enable_row_security;
@@ -127,10 +161,7 @@ typedef struct _restoreOptions
 
 typedef struct _dumpOptions
 {
-	const char *dbname;			/* subject to expand_dbname */
-	const char *pghost;
-	const char *pgport;
-	const char *username;
+	ConnParams	cparams;
 
 	int			binary_upgrade;
 
@@ -150,10 +181,11 @@ typedef struct _dumpOptions
 	int			no_security_labels;
 	int			no_publications;
 	int			no_subscriptions;
-	int			no_synchronized_snapshots;
+	int			no_toast_compression;
 	int			no_unlogged_table_data;
 	int			serializable_deferrable;
 	int			disable_triggers;
+	int			outputNoTableAm;
 	int			outputNoTablespaces;
 	int			use_setsessauth;
 	int			enable_row_security;
@@ -164,8 +196,8 @@ typedef struct _dumpOptions
 
 	int			outputClean;
 	int			outputCreateDB;
-	bool		outputBlobs;
-	bool		dontOutputBlobs;
+	bool		outputLOs;
+	bool		dontOutputLOs;
 	int			outputNoOwner;
 	char	   *outputSuperuser;
 
@@ -205,6 +237,9 @@ typedef struct Archive
 	bool		exit_on_error;	/* whether to exit on SQL errors... */
 	int			n_errors;		/* number of errors (if no die) */
 
+	/* prepared-query status */
+	bool	   *is_prepared;	/* indexed by enum _dumpPreparedQueries */
+
 	/* The rest is private */
 } Archive;
 
@@ -227,6 +262,7 @@ typedef struct Archive
 
 typedef struct
 {
+	/* Note: this struct must not contain any unused bytes */
 	Oid			tableoid;
 	Oid			oid;
 } CatalogId;
@@ -239,7 +275,7 @@ typedef int DumpId;
  * Function pointer prototypes for assorted callback methods.
  */
 
-typedef int (*DataDumperPtr) (Archive *AH, void *userArg);
+typedef int (*DataDumperPtr) (Archive *AH, const void *userArg);
 
 typedef void (*SetupWorkerPtrType) (Archive *AH);
 
@@ -247,39 +283,38 @@ typedef void (*SetupWorkerPtrType) (Archive *AH);
  * Main archiver interface.
  */
 
-extern void ConnectDatabase(Archive *AH,
-							const char *dbname,
-							const char *pghost,
-							const char *pgport,
-							const char *username,
-							trivalue prompt_password);
+extern void ConnectDatabase(Archive *AHX,
+							const ConnParams *cparams,
+							bool isReconnect);
 extern void DisconnectDatabase(Archive *AHX);
 extern PGconn *GetConnection(Archive *AHX);
 
 /* Called to write *data* to the archive */
-extern void WriteData(Archive *AH, const void *data, size_t dLen);
+extern void WriteData(Archive *AHX, const void *data, size_t dLen);
 
-extern int	StartBlob(Archive *AH, Oid oid);
-extern int	EndBlob(Archive *AH, Oid oid);
+extern int	StartLO(Archive *AHX, Oid oid);
+extern int	EndLO(Archive *AHX, Oid oid);
 
-extern void CloseArchive(Archive *AH);
+extern void CloseArchive(Archive *AHX);
 
 extern void SetArchiveOptions(Archive *AH, DumpOptions *dopt, RestoreOptions *ropt);
 
-extern void ProcessArchiveRestoreOptions(Archive *AH);
+extern void ProcessArchiveRestoreOptions(Archive *AHX);
 
-extern void RestoreArchive(Archive *AH);
+extern void RestoreArchive(Archive *AHX);
 
 /* Open an existing archive */
 extern Archive *OpenArchive(const char *FileSpec, const ArchiveFormat fmt);
 
 /* Create a new archive */
 extern Archive *CreateArchive(const char *FileSpec, const ArchiveFormat fmt,
-							  const int compression, bool dosync, ArchiveMode mode,
-							  SetupWorkerPtrType setupDumpWorker);
+							  const pg_compress_specification compression_spec,
+							  bool dosync, ArchiveMode mode,
+							  SetupWorkerPtrType setupDumpWorker,
+							  DataDirSyncMethod sync_method);
 
 /* The --list option */
-extern void PrintTOCSummary(Archive *AH);
+extern void PrintTOCSummary(Archive *AHX);
 
 extern RestoreOptions *NewRestoreOptions(void);
 

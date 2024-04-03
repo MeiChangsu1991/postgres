@@ -2,7 +2,7 @@
  *
  * reindexdb
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * src/bin/scripts/reindexdb.c
  *
@@ -11,14 +11,18 @@
 
 #include "postgres_fe.h"
 
+#include <limits.h>
+
 #include "catalog/pg_class_d.h"
 #include "common.h"
+#include "common/connect.h"
 #include "common/logging.h"
 #include "fe_utils/cancel.h"
-#include "fe_utils/connect.h"
+#include "fe_utils/option_utils.h"
+#include "fe_utils/parallel_slot.h"
+#include "fe_utils/query_utils.h"
 #include "fe_utils/simple_list.h"
 #include "fe_utils/string_utils.h"
-#include "scripts_parallel.h"
 
 typedef enum ReindexType
 {
@@ -26,7 +30,7 @@ typedef enum ReindexType
 	REINDEX_INDEX,
 	REINDEX_SCHEMA,
 	REINDEX_SYSTEM,
-	REINDEX_TABLE
+	REINDEX_TABLE,
 } ReindexType;
 
 
@@ -34,21 +38,22 @@ static SimpleStringList *get_parallel_object_list(PGconn *conn,
 												  ReindexType type,
 												  SimpleStringList *user_list,
 												  bool echo);
-static void reindex_one_database(const char *dbname, ReindexType type,
-								 SimpleStringList *user_list, const char *host,
-								 const char *port, const char *username,
-								 enum trivalue prompt_password, const char *progname,
+static void reindex_one_database(ConnParams *cparams, ReindexType type,
+								 SimpleStringList *user_list,
+								 const char *progname,
 								 bool echo, bool verbose, bool concurrently,
-								 int concurrentCons);
-static void reindex_all_databases(const char *maintenance_db,
-								  const char *host, const char *port,
-								  const char *username, enum trivalue prompt_password,
+								 int concurrentCons, const char *tablespace);
+static void reindex_all_databases(ConnParams *cparams,
 								  const char *progname, bool echo,
 								  bool quiet, bool verbose, bool concurrently,
-								  int concurrentCons);
+								  int concurrentCons, const char *tablespace,
+								  bool syscatalog, SimpleStringList *schemas,
+								  SimpleStringList *tables,
+								  SimpleStringList *indexes);
 static void run_reindex_command(PGconn *conn, ReindexType type,
 								const char *name, bool echo, bool verbose,
-								bool concurrently, bool async);
+								bool concurrently, bool async,
+								const char *tablespace);
 
 static void help(const char *progname);
 
@@ -73,6 +78,7 @@ main(int argc, char *argv[])
 		{"verbose", no_argument, NULL, 'v'},
 		{"concurrently", no_argument, NULL, 1},
 		{"maintenance-db", required_argument, NULL, 2},
+		{"tablespace", required_argument, NULL, 3},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -85,7 +91,9 @@ main(int argc, char *argv[])
 	const char *host = NULL;
 	const char *port = NULL;
 	const char *username = NULL;
+	const char *tablespace = NULL;
 	enum trivalue prompt_password = TRI_DEFAULT;
+	ConnParams	cparams;
 	bool		syscatalog = false;
 	bool		alldb = false;
 	bool		echo = false;
@@ -104,18 +112,50 @@ main(int argc, char *argv[])
 	handle_help_version_opts(argc, argv, "reindexdb", help);
 
 	/* process command-line options */
-	while ((c = getopt_long(argc, argv, "h:p:U:wWeqS:d:ast:i:j:v", long_options, &optindex)) != -1)
+	while ((c = getopt_long(argc, argv, "ad:eh:i:j:qp:sS:t:U:vwW", long_options, &optindex)) != -1)
 	{
 		switch (c)
 		{
+			case 'a':
+				alldb = true;
+				break;
+			case 'd':
+				dbname = pg_strdup(optarg);
+				break;
+			case 'e':
+				echo = true;
+				break;
 			case 'h':
 				host = pg_strdup(optarg);
+				break;
+			case 'i':
+				simple_string_list_append(&indexes, optarg);
+				break;
+			case 'j':
+				if (!option_parse_int(optarg, "-j/--jobs", 1, INT_MAX,
+									  &concurrentCons))
+					exit(1);
+				break;
+			case 'q':
+				quiet = true;
 				break;
 			case 'p':
 				port = pg_strdup(optarg);
 				break;
+			case 's':
+				syscatalog = true;
+				break;
+			case 'S':
+				simple_string_list_append(&schemas, optarg);
+				break;
+			case 't':
+				simple_string_list_append(&tables, optarg);
+				break;
 			case 'U':
 				username = pg_strdup(optarg);
+				break;
+			case 'v':
+				verbose = true;
 				break;
 			case 'w':
 				prompt_password = TRI_NO;
@@ -123,49 +163,18 @@ main(int argc, char *argv[])
 			case 'W':
 				prompt_password = TRI_YES;
 				break;
-			case 'e':
-				echo = true;
-				break;
-			case 'q':
-				quiet = true;
-				break;
-			case 'S':
-				simple_string_list_append(&schemas, optarg);
-				break;
-			case 'd':
-				dbname = pg_strdup(optarg);
-				break;
-			case 'a':
-				alldb = true;
-				break;
-			case 's':
-				syscatalog = true;
-				break;
-			case 't':
-				simple_string_list_append(&tables, optarg);
-				break;
-			case 'i':
-				simple_string_list_append(&indexes, optarg);
-				break;
-			case 'j':
-				concurrentCons = atoi(optarg);
-				if (concurrentCons <= 0)
-				{
-					pg_log_error("number of parallel jobs must be at least 1");
-					exit(1);
-				}
-				break;
-			case 'v':
-				verbose = true;
-				break;
 			case 1:
 				concurrently = true;
 				break;
 			case 2:
 				maintenance_db = pg_strdup(optarg);
 				break;
+			case 3:
+				tablespace = pg_strdup(optarg);
+				break;
 			default:
-				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+				/* getopt_long already emitted a complaint */
+				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 				exit(1);
 		}
 	}
@@ -184,95 +193,35 @@ main(int argc, char *argv[])
 	{
 		pg_log_error("too many command-line arguments (first is \"%s\")",
 					 argv[optind]);
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
 	}
 
+	/* fill cparams except for dbname, which is set below */
+	cparams.pghost = host;
+	cparams.pgport = port;
+	cparams.pguser = username;
+	cparams.prompt_password = prompt_password;
+	cparams.override_dbname = NULL;
+
 	setup_cancel_handler(NULL);
+
+	if (concurrentCons > 1 && syscatalog)
+		pg_fatal("cannot use multiple jobs to reindex system catalogs");
 
 	if (alldb)
 	{
 		if (dbname)
-		{
-			pg_log_error("cannot reindex all databases and a specific one at the same time");
-			exit(1);
-		}
-		if (syscatalog)
-		{
-			pg_log_error("cannot reindex all databases and system catalogs at the same time");
-			exit(1);
-		}
-		if (schemas.head != NULL)
-		{
-			pg_log_error("cannot reindex specific schema(s) in all databases");
-			exit(1);
-		}
-		if (tables.head != NULL)
-		{
-			pg_log_error("cannot reindex specific table(s) in all databases");
-			exit(1);
-		}
-		if (indexes.head != NULL)
-		{
-			pg_log_error("cannot reindex specific index(es) in all databases");
-			exit(1);
-		}
+			pg_fatal("cannot reindex all databases and a specific one at the same time");
 
-		reindex_all_databases(maintenance_db, host, port, username,
-							  prompt_password, progname, echo, quiet, verbose,
-							  concurrently, concurrentCons);
-	}
-	else if (syscatalog)
-	{
-		if (schemas.head != NULL)
-		{
-			pg_log_error("cannot reindex specific schema(s) and system catalogs at the same time");
-			exit(1);
-		}
-		if (tables.head != NULL)
-		{
-			pg_log_error("cannot reindex specific table(s) and system catalogs at the same time");
-			exit(1);
-		}
-		if (indexes.head != NULL)
-		{
-			pg_log_error("cannot reindex specific index(es) and system catalogs at the same time");
-			exit(1);
-		}
+		cparams.dbname = maintenance_db;
 
-		if (concurrentCons > 1)
-		{
-			pg_log_error("cannot use multiple jobs to reindex system catalogs");
-			exit(1);
-		}
-
-		if (dbname == NULL)
-		{
-			if (getenv("PGDATABASE"))
-				dbname = getenv("PGDATABASE");
-			else if (getenv("PGUSER"))
-				dbname = getenv("PGUSER");
-			else
-				dbname = get_user_name_or_exit(progname);
-		}
-
-		reindex_one_database(dbname, REINDEX_SYSTEM, NULL, host,
-							 port, username, prompt_password, progname,
-							 echo, verbose, concurrently, 1);
+		reindex_all_databases(&cparams, progname, echo, quiet, verbose,
+							  concurrently, concurrentCons, tablespace,
+							  syscatalog, &schemas, &tables, &indexes);
 	}
 	else
 	{
-		/*
-		 * Index-level REINDEX is not supported with multiple jobs as we
-		 * cannot control the concurrent processing of multiple indexes
-		 * depending on the same relation.
-		 */
-		if (concurrentCons > 1 && indexes.head != NULL)
-		{
-			pg_log_error("cannot use multiple jobs to reindex indexes");
-			exit(1);
-		}
-
 		if (dbname == NULL)
 		{
 			if (getenv("PGDATABASE"))
@@ -283,60 +232,76 @@ main(int argc, char *argv[])
 				dbname = get_user_name_or_exit(progname);
 		}
 
+		cparams.dbname = dbname;
+
+		if (syscatalog)
+			reindex_one_database(&cparams, REINDEX_SYSTEM, NULL,
+								 progname, echo, verbose,
+								 concurrently, 1, tablespace);
+
 		if (schemas.head != NULL)
-			reindex_one_database(dbname, REINDEX_SCHEMA, &schemas, host,
-								 port, username, prompt_password, progname,
-								 echo, verbose, concurrently, concurrentCons);
+			reindex_one_database(&cparams, REINDEX_SCHEMA, &schemas,
+								 progname, echo, verbose,
+								 concurrently, concurrentCons, tablespace);
 
 		if (indexes.head != NULL)
-			reindex_one_database(dbname, REINDEX_INDEX, &indexes, host,
-								 port, username, prompt_password, progname,
-								 echo, verbose, concurrently, 1);
+			reindex_one_database(&cparams, REINDEX_INDEX, &indexes,
+								 progname, echo, verbose,
+								 concurrently, concurrentCons, tablespace);
 
 		if (tables.head != NULL)
-			reindex_one_database(dbname, REINDEX_TABLE, &tables, host,
-								 port, username, prompt_password, progname,
-								 echo, verbose, concurrently,
-								 concurrentCons);
+			reindex_one_database(&cparams, REINDEX_TABLE, &tables,
+								 progname, echo, verbose,
+								 concurrently, concurrentCons, tablespace);
 
 		/*
-		 * reindex database only if neither index nor table nor schema is
-		 * specified
+		 * reindex database only if neither index nor table nor schema nor
+		 * system catalogs is specified
 		 */
-		if (indexes.head == NULL && tables.head == NULL && schemas.head == NULL)
-			reindex_one_database(dbname, REINDEX_DATABASE, NULL, host,
-								 port, username, prompt_password, progname,
-								 echo, verbose, concurrently, concurrentCons);
+		if (!syscatalog && indexes.head == NULL &&
+			tables.head == NULL && schemas.head == NULL)
+			reindex_one_database(&cparams, REINDEX_DATABASE, NULL,
+								 progname, echo, verbose,
+								 concurrently, concurrentCons, tablespace);
 	}
 
 	exit(0);
 }
 
 static void
-reindex_one_database(const char *dbname, ReindexType type,
-					 SimpleStringList *user_list, const char *host,
-					 const char *port, const char *username,
-					 enum trivalue prompt_password, const char *progname, bool echo,
-					 bool verbose, bool concurrently, int concurrentCons)
+reindex_one_database(ConnParams *cparams, ReindexType type,
+					 SimpleStringList *user_list,
+					 const char *progname, bool echo,
+					 bool verbose, bool concurrently, int concurrentCons,
+					 const char *tablespace)
 {
 	PGconn	   *conn;
 	SimpleStringListCell *cell;
+	SimpleStringListCell *indices_tables_cell = NULL;
 	bool		parallel = concurrentCons > 1;
 	SimpleStringList *process_list = user_list;
+	SimpleStringList *indices_tables_list = NULL;
 	ReindexType process_type = type;
-	ParallelSlot *slots;
+	ParallelSlotArray *sa;
 	bool		failed = false;
 	int			items_count = 0;
+	char	   *prev_index_table_name = NULL;
+	ParallelSlot *free_slot = NULL;
 
-	conn = connectDatabase(dbname, host, port, username, prompt_password,
-						   progname, echo, false, false);
+	conn = connectDatabase(cparams, progname, echo, false, true);
 
 	if (concurrently && PQserverVersion(conn) < 120000)
 	{
 		PQfinish(conn);
-		pg_log_error("cannot use the \"%s\" option on server versions older than PostgreSQL %s",
-					 "concurrently", "12");
-		exit(1);
+		pg_fatal("cannot use the \"%s\" option on server versions older than PostgreSQL %s",
+				 "concurrently", "12");
+	}
+
+	if (tablespace && PQserverVersion(conn) < 140000)
+	{
+		PQfinish(conn);
+		pg_fatal("cannot use the \"%s\" option on server versions older than PostgreSQL %s",
+				 "tablespace", "14");
 	}
 
 	if (!parallel)
@@ -368,17 +333,6 @@ reindex_one_database(const char *dbname, ReindexType type,
 		{
 			case REINDEX_DATABASE:
 
-				/*
-				 * Database-wide parallel reindex requires special processing.
-				 * If multiple jobs were asked, we have to reindex system
-				 * catalogs first as they cannot be processed in parallel.
-				 */
-				if (concurrently)
-					pg_log_warning("cannot reindex system catalogs concurrently, skipping all");
-				else
-					run_reindex_command(conn, REINDEX_SYSTEM, PQdb(conn), echo,
-										verbose, concurrently, false);
-
 				/* Build a list of relations from the database */
 				process_list = get_parallel_object_list(conn, process_type,
 														user_list, echo);
@@ -402,8 +356,33 @@ reindex_one_database(const char *dbname, ReindexType type,
 					return;
 				break;
 
-			case REINDEX_SYSTEM:
 			case REINDEX_INDEX:
+				Assert(user_list != NULL);
+
+				/*
+				 * Build a list of relations from the indices.  This will
+				 * accordingly reorder the list of indices too.
+				 */
+				indices_tables_list = get_parallel_object_list(conn, process_type,
+															   user_list, echo);
+
+				/*
+				 * Bail out if nothing to process.  'user_list' was modified
+				 * in-place, so check if it has at least one cell.
+				 */
+				if (user_list->head == NULL)
+					return;
+
+				/*
+				 * Assuming 'user_list' is not empty, 'indices_tables_list'
+				 * shouldn't be empty as well.
+				 */
+				Assert(indices_tables_list != NULL);
+				indices_tables_cell = indices_tables_list->head;
+
+				break;
+
+			case REINDEX_SYSTEM:
 				/* not supported */
 				Assert(false);
 				break;
@@ -436,14 +415,14 @@ reindex_one_database(const char *dbname, ReindexType type,
 
 	Assert(process_list != NULL);
 
-	slots = ParallelSlotsSetup(dbname, host, port, username, prompt_password,
-							   progname, echo, conn, concurrentCons);
+	sa = ParallelSlotsSetup(concurrentCons, cparams, progname, echo, NULL);
+	ParallelSlotsAdoptConn(sa, conn);
 
 	cell = process_list->head;
 	do
 	{
 		const char *objname = cell->val;
-		ParallelSlot *free_slot = NULL;
+		bool		need_new_slot = true;
 
 		if (CancelRequested)
 		{
@@ -451,20 +430,40 @@ reindex_one_database(const char *dbname, ReindexType type,
 			goto finish;
 		}
 
-		free_slot = ParallelSlotsGetIdle(slots, concurrentCons);
-		if (!free_slot)
+		/*
+		 * For parallel index-level REINDEX, the indices of the same table are
+		 * ordered together and they are to be processed by the same job.  So,
+		 * we don't switch the job as soon as the index belongs to the same
+		 * table as the previous one.
+		 */
+		if (parallel && process_type == REINDEX_INDEX)
 		{
-			failed = true;
-			goto finish;
+			if (prev_index_table_name != NULL &&
+				strcmp(prev_index_table_name, indices_tables_cell->val) == 0)
+				need_new_slot = false;
+			prev_index_table_name = indices_tables_cell->val;
+			indices_tables_cell = indices_tables_cell->next;
+		}
+
+		if (need_new_slot)
+		{
+			free_slot = ParallelSlotsGetIdle(sa, NULL);
+			if (!free_slot)
+			{
+				failed = true;
+				goto finish;
+			}
+
+			ParallelSlotSetHandler(free_slot, TableCommandResultHandler, NULL);
 		}
 
 		run_reindex_command(free_slot->connection, process_type, objname,
-							echo, verbose, concurrently, true);
+							echo, verbose, concurrently, true, tablespace);
 
 		cell = cell->next;
 	} while (cell != NULL);
 
-	if (!ParallelSlotsWaitCompletion(slots, concurrentCons))
+	if (!ParallelSlotsWaitCompletion(sa))
 		failed = true;
 
 finish:
@@ -474,8 +473,14 @@ finish:
 		pg_free(process_list);
 	}
 
-	ParallelSlotsTerminate(slots, concurrentCons);
-	pfree(slots);
+	if (indices_tables_list)
+	{
+		simple_string_list_destroy(indices_tables_list);
+		pg_free(indices_tables_list);
+	}
+
+	ParallelSlotsTerminate(sa);
+	pfree(sa);
 
 	if (failed)
 		exit(1);
@@ -483,8 +488,12 @@ finish:
 
 static void
 run_reindex_command(PGconn *conn, ReindexType type, const char *name,
-					bool echo, bool verbose, bool concurrently, bool async)
+					bool echo, bool verbose, bool concurrently, bool async,
+					const char *tablespace)
 {
+	const char *paren = "(";
+	const char *comma = ", ";
+	const char *sep = paren;
 	PQExpBufferData sql;
 	bool		status;
 
@@ -496,7 +505,19 @@ run_reindex_command(PGconn *conn, ReindexType type, const char *name,
 	appendPQExpBufferStr(&sql, "REINDEX ");
 
 	if (verbose)
-		appendPQExpBufferStr(&sql, "(VERBOSE) ");
+	{
+		appendPQExpBuffer(&sql, "%sVERBOSE", sep);
+		sep = comma;
+	}
+
+	if (tablespace)
+	{
+		appendPQExpBuffer(&sql, "%sTABLESPACE %s", sep, fmtId(tablespace));
+		sep = comma;
+	}
+
+	if (sep != paren)
+		appendPQExpBufferStr(&sql, ") ");
 
 	/* object type */
 	switch (type)
@@ -518,6 +539,11 @@ run_reindex_command(PGconn *conn, ReindexType type, const char *name,
 			break;
 	}
 
+	/*
+	 * Parenthesized grammar is only supported for CONCURRENTLY since
+	 * PostgreSQL 14.  Since 12, CONCURRENTLY can be specified after the
+	 * object type.
+	 */
 	if (concurrently)
 		appendPQExpBufferStr(&sql, "CONCURRENTLY ");
 
@@ -614,16 +640,16 @@ get_parallel_object_list(PGconn *conn, ReindexType type,
 	{
 		case REINDEX_DATABASE:
 			Assert(user_list == NULL);
-			appendPQExpBuffer(&catalog_query,
-							  "SELECT c.relname, ns.nspname\n"
-							  " FROM pg_catalog.pg_class c\n"
-							  " JOIN pg_catalog.pg_namespace ns"
-							  " ON c.relnamespace = ns.oid\n"
-							  " WHERE ns.nspname != 'pg_catalog'\n"
-							  "   AND c.relkind IN ("
-							  CppAsString2(RELKIND_RELATION) ", "
-							  CppAsString2(RELKIND_MATVIEW) ")\n"
-							  " ORDER BY c.relpages DESC;");
+			appendPQExpBufferStr(&catalog_query,
+								 "SELECT c.relname, ns.nspname\n"
+								 " FROM pg_catalog.pg_class c\n"
+								 " JOIN pg_catalog.pg_namespace ns"
+								 " ON c.relnamespace = ns.oid\n"
+								 " WHERE ns.nspname != 'pg_catalog'\n"
+								 "   AND c.relkind IN ("
+								 CppAsString2(RELKIND_RELATION) ", "
+								 CppAsString2(RELKIND_MATVIEW) ")\n"
+								 " ORDER BY c.relpages DESC;");
 			break;
 
 		case REINDEX_SCHEMA:
@@ -637,35 +663,88 @@ get_parallel_object_list(PGconn *conn, ReindexType type,
 				 * All the tables from all the listed schemas are grabbed at
 				 * once.
 				 */
-				appendPQExpBuffer(&catalog_query,
-								  "SELECT c.relname, ns.nspname\n"
-								  " FROM pg_catalog.pg_class c\n"
-								  " JOIN pg_catalog.pg_namespace ns"
-								  " ON c.relnamespace = ns.oid\n"
-								  " WHERE c.relkind IN ("
-								  CppAsString2(RELKIND_RELATION) ", "
-								  CppAsString2(RELKIND_MATVIEW) ")\n"
-								  " AND ns.nspname IN (");
+				appendPQExpBufferStr(&catalog_query,
+									 "SELECT c.relname, ns.nspname\n"
+									 " FROM pg_catalog.pg_class c\n"
+									 " JOIN pg_catalog.pg_namespace ns"
+									 " ON c.relnamespace = ns.oid\n"
+									 " WHERE c.relkind IN ("
+									 CppAsString2(RELKIND_RELATION) ", "
+									 CppAsString2(RELKIND_MATVIEW) ")\n"
+									 " AND ns.nspname IN (");
 
 				for (cell = user_list->head; cell; cell = cell->next)
 				{
 					const char *nspname = cell->val;
 
 					if (nsp_listed)
-						appendPQExpBuffer(&catalog_query, ", ");
+						appendPQExpBufferStr(&catalog_query, ", ");
 					else
 						nsp_listed = true;
 
 					appendStringLiteralConn(&catalog_query, nspname, conn);
 				}
 
-				appendPQExpBuffer(&catalog_query, ")\n"
-								  " ORDER BY c.relpages DESC;");
+				appendPQExpBufferStr(&catalog_query, ")\n"
+									 " ORDER BY c.relpages DESC;");
+			}
+			break;
+
+		case REINDEX_INDEX:
+			{
+				SimpleStringListCell *cell;
+
+				Assert(user_list != NULL);
+
+				/*
+				 * Straight-forward index-level REINDEX is not supported with
+				 * multiple jobs as we cannot control the concurrent
+				 * processing of multiple indexes depending on the same
+				 * relation.  But we can extract the appropriate table name
+				 * for the index and put REINDEX INDEX commands into different
+				 * jobs, according to the parent tables.
+				 *
+				 * We will order the results to group the same tables
+				 * together. We fetch index names as well to build a new list
+				 * of them with matching order.
+				 */
+				appendPQExpBufferStr(&catalog_query,
+									 "SELECT t.relname, n.nspname, i.relname\n"
+									 "FROM pg_catalog.pg_index x\n"
+									 "JOIN pg_catalog.pg_class t ON t.oid = x.indrelid\n"
+									 "JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid\n"
+									 "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace\n"
+									 "WHERE x.indexrelid OPERATOR(pg_catalog.=) ANY(ARRAY['");
+
+				for (cell = user_list->head; cell; cell = cell->next)
+				{
+					if (cell != user_list->head)
+						appendPQExpBufferStr(&catalog_query, "', '");
+
+					appendQualifiedRelation(&catalog_query, cell->val, conn, echo);
+				}
+
+				/*
+				 * Order tables by the size of its greatest index.  Within the
+				 * table, order indexes by their sizes.
+				 */
+				appendPQExpBufferStr(&catalog_query,
+									 "']::pg_catalog.regclass[])\n"
+									 "ORDER BY max(i.relpages) OVER \n"
+									 "    (PARTITION BY n.nspname, t.relname),\n"
+									 "  n.nspname, t.relname, i.relpages;\n");
+
+				/*
+				 * We're going to re-order the user_list to match the order of
+				 * tables.  So, empty the user_list to fill it from the query
+				 * result.
+				 */
+				simple_string_list_destroy(user_list);
+				user_list->head = user_list->tail = NULL;
 			}
 			break;
 
 		case REINDEX_SYSTEM:
-		case REINDEX_INDEX:
 		case REINDEX_TABLE:
 			Assert(false);
 			break;
@@ -697,6 +776,20 @@ get_parallel_object_list(PGconn *conn, ReindexType type,
 
 		simple_string_list_append(tables, buf.data);
 		resetPQExpBuffer(&buf);
+
+		if (type == REINDEX_INDEX)
+		{
+			/*
+			 * For index-level REINDEX, rebuild the list of indexes to match
+			 * the order of tables list.
+			 */
+			appendPQExpBufferStr(&buf,
+								 fmtQualifiedId(PQgetvalue(res, i, 1),
+												PQgetvalue(res, i, 2)));
+
+			simple_string_list_append(user_list, buf.data);
+			resetPQExpBuffer(&buf);
+		}
 	}
 	termPQExpBuffer(&buf);
 	PQclear(res);
@@ -705,23 +798,23 @@ get_parallel_object_list(PGconn *conn, ReindexType type,
 }
 
 static void
-reindex_all_databases(const char *maintenance_db,
-					  const char *host, const char *port,
-					  const char *username, enum trivalue prompt_password,
+reindex_all_databases(ConnParams *cparams,
 					  const char *progname, bool echo, bool quiet, bool verbose,
-					  bool concurrently, int concurrentCons)
+					  bool concurrently, int concurrentCons,
+					  const char *tablespace, bool syscatalog,
+					  SimpleStringList *schemas, SimpleStringList *tables,
+					  SimpleStringList *indexes)
 {
 	PGconn	   *conn;
 	PGresult   *result;
-	PQExpBufferData connstr;
 	int			i;
 
-	conn = connectMaintenanceDatabase(maintenance_db, host, port, username,
-									  prompt_password, progname, echo);
-	result = executeQuery(conn, "SELECT datname FROM pg_database WHERE datallowconn ORDER BY 1;", echo);
+	conn = connectMaintenanceDatabase(cparams, progname, echo);
+	result = executeQuery(conn,
+						  "SELECT datname FROM pg_database WHERE datallowconn AND datconnlimit <> -2 ORDER BY 1;",
+						  echo);
 	PQfinish(conn);
 
-	initPQExpBuffer(&connstr);
 	for (i = 0; i < PQntuples(result); i++)
 	{
 		char	   *dbname = PQgetvalue(result, i, 0);
@@ -732,16 +825,38 @@ reindex_all_databases(const char *maintenance_db,
 			fflush(stdout);
 		}
 
-		resetPQExpBuffer(&connstr);
-		appendPQExpBufferStr(&connstr, "dbname=");
-		appendConnStrVal(&connstr, dbname);
+		cparams->override_dbname = dbname;
 
-		reindex_one_database(connstr.data, REINDEX_DATABASE, NULL, host,
-							 port, username, prompt_password,
-							 progname, echo, verbose, concurrently,
-							 concurrentCons);
+		if (syscatalog)
+			reindex_one_database(cparams, REINDEX_SYSTEM, NULL,
+								 progname, echo, verbose,
+								 concurrently, 1, tablespace);
+
+		if (schemas->head != NULL)
+			reindex_one_database(cparams, REINDEX_SCHEMA, schemas,
+								 progname, echo, verbose,
+								 concurrently, concurrentCons, tablespace);
+
+		if (indexes->head != NULL)
+			reindex_one_database(cparams, REINDEX_INDEX, indexes,
+								 progname, echo, verbose,
+								 concurrently, 1, tablespace);
+
+		if (tables->head != NULL)
+			reindex_one_database(cparams, REINDEX_TABLE, tables,
+								 progname, echo, verbose,
+								 concurrently, concurrentCons, tablespace);
+
+		/*
+		 * reindex database only if neither index nor table nor schema nor
+		 * system catalogs is specified
+		 */
+		if (!syscatalog && indexes->head == NULL &&
+			tables->head == NULL && schemas->head == NULL)
+			reindex_one_database(cparams, REINDEX_DATABASE, NULL,
+								 progname, echo, verbose,
+								 concurrently, concurrentCons, tablespace);
 	}
-	termPQExpBuffer(&connstr);
 
 	PQclear(result);
 }
@@ -753,26 +868,27 @@ help(const char *progname)
 	printf(_("Usage:\n"));
 	printf(_("  %s [OPTION]... [DBNAME]\n"), progname);
 	printf(_("\nOptions:\n"));
-	printf(_("  -a, --all                 reindex all databases\n"));
-	printf(_("      --concurrently        reindex concurrently\n"));
-	printf(_("  -d, --dbname=DBNAME       database to reindex\n"));
-	printf(_("  -e, --echo                show the commands being sent to the server\n"));
-	printf(_("  -i, --index=INDEX         recreate specific index(es) only\n"));
-	printf(_("  -j, --jobs=NUM            use this many concurrent connections to reindex\n"));
-	printf(_("  -q, --quiet               don't write any messages\n"));
-	printf(_("  -s, --system              reindex system catalogs\n"));
-	printf(_("  -S, --schema=SCHEMA       reindex specific schema(s) only\n"));
-	printf(_("  -t, --table=TABLE         reindex specific table(s) only\n"));
-	printf(_("  -v, --verbose             write a lot of output\n"));
-	printf(_("  -V, --version             output version information, then exit\n"));
-	printf(_("  -?, --help                show this help, then exit\n"));
+	printf(_("  -a, --all                    reindex all databases\n"));
+	printf(_("      --concurrently           reindex concurrently\n"));
+	printf(_("  -d, --dbname=DBNAME          database to reindex\n"));
+	printf(_("  -e, --echo                   show the commands being sent to the server\n"));
+	printf(_("  -i, --index=INDEX            recreate specific index(es) only\n"));
+	printf(_("  -j, --jobs=NUM               use this many concurrent connections to reindex\n"));
+	printf(_("  -q, --quiet                  don't write any messages\n"));
+	printf(_("  -s, --system                 reindex system catalogs only\n"));
+	printf(_("  -S, --schema=SCHEMA          reindex specific schema(s) only\n"));
+	printf(_("  -t, --table=TABLE            reindex specific table(s) only\n"));
+	printf(_("      --tablespace=TABLESPACE  tablespace where indexes are rebuilt\n"));
+	printf(_("  -v, --verbose                write a lot of output\n"));
+	printf(_("  -V, --version                output version information, then exit\n"));
+	printf(_("  -?, --help                   show this help, then exit\n"));
 	printf(_("\nConnection options:\n"));
-	printf(_("  -h, --host=HOSTNAME       database server host or socket directory\n"));
-	printf(_("  -p, --port=PORT           database server port\n"));
-	printf(_("  -U, --username=USERNAME   user name to connect as\n"));
-	printf(_("  -w, --no-password         never prompt for password\n"));
-	printf(_("  -W, --password            force password prompt\n"));
-	printf(_("  --maintenance-db=DBNAME   alternate maintenance database\n"));
+	printf(_("  -h, --host=HOSTNAME          database server host or socket directory\n"));
+	printf(_("  -p, --port=PORT              database server port\n"));
+	printf(_("  -U, --username=USERNAME      user name to connect as\n"));
+	printf(_("  -w, --no-password            never prompt for password\n"));
+	printf(_("  -W, --password               force password prompt\n"));
+	printf(_("  --maintenance-db=DBNAME      alternate maintenance database\n"));
 	printf(_("\nRead the description of the SQL command REINDEX for details.\n"));
 	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
 	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);

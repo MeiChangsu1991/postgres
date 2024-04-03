@@ -3,7 +3,7 @@
  * socket.c
  *	  Microsoft Windows Win32 Socket Functions
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/port/win32/socket.c
@@ -47,8 +47,8 @@ int			pgwin32_noblock = 0;
  *
  * Note: where there is a direct correspondence between a WSAxxx error code
  * and a Berkeley error symbol, this mapping is actually a no-op, because
- * in win32.h we redefine the network-related Berkeley error symbols to have
- * the values of their WSAxxx counterparts.  The point of the switch is
+ * in win32_port.h we redefine the network-related Berkeley error symbols to
+ * have the values of their WSAxxx counterparts.  The point of the switch is
  * mostly to translate near-miss error codes into something that's sensible
  * in the Berkeley universe.
  */
@@ -120,23 +120,36 @@ TranslateSocketError(void)
 		case WSAEADDRNOTAVAIL:
 			errno = EADDRNOTAVAIL;
 			break;
-		case WSAEHOSTUNREACH:
 		case WSAEHOSTDOWN:
+			errno = EHOSTDOWN;
+			break;
+		case WSAEHOSTUNREACH:
 		case WSAHOST_NOT_FOUND:
-		case WSAENETDOWN:
-		case WSAENETUNREACH:
-		case WSAENETRESET:
 			errno = EHOSTUNREACH;
+			break;
+		case WSAENETDOWN:
+			errno = ENETDOWN;
+			break;
+		case WSAENETUNREACH:
+			errno = ENETUNREACH;
+			break;
+		case WSAENETRESET:
+			errno = ENETRESET;
 			break;
 		case WSAENOTCONN:
 		case WSAESHUTDOWN:
 		case WSAEDISCON:
 			errno = ENOTCONN;
 			break;
+		case WSAETIMEDOUT:
+			errno = ETIMEDOUT;
+			break;
 		default:
 			ereport(NOTICE,
-					(errmsg_internal("unrecognized win32 socket error code: %d", WSAGetLastError())));
+					(errmsg_internal("unrecognized win32 socket error code: %d",
+									 WSAGetLastError())));
 			errno = EINVAL;
+			break;
 	}
 }
 
@@ -290,6 +303,7 @@ pgwin32_socket(int af, int type, int protocol)
 	if (ioctlsocket(s, FIONBIO, &on))
 	{
 		TranslateSocketError();
+		closesocket(s);
 		return INVALID_SOCKET;
 	}
 	errno = 0;
@@ -482,7 +496,7 @@ pgwin32_send(SOCKET s, const void *buf, int len, int flags)
 			return -1;
 		}
 
-		/* No error, zero bytes (win2000+) or error+WSAEWOULDBLOCK (<=nt4) */
+		/* No error, zero bytes */
 
 		if (pgwin32_waitforsinglesocket(s, FD_WRITE | FD_CLOSE, INFINITE) == 0)
 			return -1;
@@ -627,7 +641,7 @@ pgwin32_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, c
 		{
 			ZeroMemory(&resEvents, sizeof(resEvents));
 			if (WSAEnumNetworkEvents(sockets[i], events[i], &resEvents) != 0)
-				elog(ERROR, "failed to enumerate network events: error code %u",
+				elog(ERROR, "failed to enumerate network events: error code %d",
 					 WSAGetLastError());
 			/* Read activity? */
 			if (readfds && FD_ISSET(sockets[i], readfds))

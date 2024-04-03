@@ -11,7 +11,7 @@
  * we do better?)
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,9 +23,7 @@
 #include "postgres.h"
 
 #include "libpq/pqformat.h"
-#include "utils/array.h"
-#include "utils/builtins.h"
-#include "utils/rangetypes.h"
+#include "utils/fmgrprotos.h"
 
 
 /*
@@ -225,6 +223,32 @@ Datum
 anycompatiblerange_out(PG_FUNCTION_ARGS)
 {
 	return range_out(fcinfo);
+}
+
+/*
+ * anymultirange
+ *
+ * We may as well allow output, since multirange_out will in fact work.
+ */
+PSEUDOTYPE_DUMMY_INPUT_FUNC(anymultirange);
+
+Datum
+anymultirange_out(PG_FUNCTION_ARGS)
+{
+	return multirange_out(fcinfo);
+}
+
+/*
+ * anycompatiblemultirange
+ *
+ * We may as well allow output, since multirange_out will in fact work.
+ */
+PSEUDOTYPE_DUMMY_INPUT_FUNC(anycompatiblemultirange);
+
+Datum
+anycompatiblemultirange_out(PG_FUNCTION_ARGS)
+{
+	return multirange_out(fcinfo);
 }
 
 /*

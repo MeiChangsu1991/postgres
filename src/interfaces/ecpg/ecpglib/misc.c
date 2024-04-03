@@ -55,42 +55,11 @@ static struct sqlca_t sqlca_init =
 	}
 };
 
-#ifdef ENABLE_THREAD_SAFETY
 static pthread_key_t sqlca_key;
 static pthread_once_t sqlca_key_once = PTHREAD_ONCE_INIT;
-#else
-static struct sqlca_t sqlca =
-{
-	{
-		'S', 'Q', 'L', 'C', 'A', ' ', ' ', ' '
-	},
-	sizeof(struct sqlca_t),
-	0,
-	{
-		0,
-		{
-			0
-		}
-	},
-	{
-		'N', 'O', 'T', ' ', 'S', 'E', 'T', ' '
-	},
-	{
-		0, 0, 0, 0, 0, 0
-	},
-	{
-		0, 0, 0, 0, 0, 0, 0, 0
-	},
-	{
-		'0', '0', '0', '0', '0'
-	}
-};
-#endif
 
-#ifdef ENABLE_THREAD_SAFETY
 static pthread_mutex_t debug_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t debug_init_mutex = PTHREAD_MUTEX_INITIALIZER;
-#endif
 static int	simple_debug = 0;
 static FILE *debugstream = NULL;
 
@@ -123,7 +92,6 @@ ecpg_init(const struct connection *con, const char *connection_name, const int l
 	return true;
 }
 
-#ifdef ENABLE_THREAD_SAFETY
 static void
 ecpg_sqlca_key_destructor(void *arg)
 {
@@ -135,12 +103,10 @@ ecpg_sqlca_key_init(void)
 {
 	pthread_key_create(&sqlca_key, ecpg_sqlca_key_destructor);
 }
-#endif
 
 struct sqlca_t *
 ECPGget_sqlca(void)
 {
-#ifdef ENABLE_THREAD_SAFETY
 	struct sqlca_t *sqlca;
 
 	pthread_once(&sqlca_key_once, ecpg_sqlca_key_init);
@@ -155,9 +121,6 @@ ECPGget_sqlca(void)
 		pthread_setspecific(sqlca_key, sqlca);
 	}
 	return sqlca;
-#else
-	return &sqlca;
-#endif
 }
 
 bool
@@ -191,7 +154,6 @@ ECPGtransactionStatus(const char *connection_name)
 	}
 
 	return PQtransactionStatus(con->connection);
-
 }
 
 bool
@@ -241,9 +203,7 @@ ECPGtrans(int lineno, const char *connection_name, const char *transaction)
 void
 ECPGdebug(int n, FILE *dbgs)
 {
-#ifdef ENABLE_THREAD_SAFETY
 	pthread_mutex_lock(&debug_init_mutex);
-#endif
 
 	if (n > 100)
 	{
@@ -257,9 +217,7 @@ ECPGdebug(int n, FILE *dbgs)
 
 	ecpg_log("ECPGdebug: set to %d\n", simple_debug);
 
-#ifdef ENABLE_THREAD_SAFETY
 	pthread_mutex_unlock(&debug_init_mutex);
-#endif
 }
 
 void
@@ -291,9 +249,7 @@ ecpg_log(const char *format,...)
 	else
 		snprintf(fmt, bufsize, "[%d]: %s", (int) getpid(), intl_format);
 
-#ifdef ENABLE_THREAD_SAFETY
 	pthread_mutex_lock(&debug_mutex);
-#endif
 
 	va_start(ap, format);
 	vfprintf(debugstream, fmt, ap);
@@ -308,9 +264,7 @@ ecpg_log(const char *format,...)
 
 	fflush(debugstream);
 
-#ifdef ENABLE_THREAD_SAFETY
 	pthread_mutex_unlock(&debug_mutex);
-#endif
 
 	free(fmt);
 }
@@ -452,19 +406,39 @@ ECPGis_noind_null(enum ECPGttype type, const void *ptr)
 }
 
 #ifdef WIN32
-#ifdef ENABLE_THREAD_SAFETY
 
-void
-win32_pthread_mutex(volatile pthread_mutex_t *mutex)
+int
+pthread_mutex_init(pthread_mutex_t *mp, void *attr)
 {
-	if (mutex->handle == NULL)
+	mp->initstate = 0;
+	return 0;
+}
+
+int
+pthread_mutex_lock(pthread_mutex_t *mp)
+{
+	/* Initialize the csection if not already done */
+	if (mp->initstate != 1)
 	{
-		while (InterlockedExchange((LONG *) &mutex->initlock, 1) == 1)
-			Sleep(0);
-		if (mutex->handle == NULL)
-			mutex->handle = CreateMutex(NULL, FALSE, NULL);
-		InterlockedExchange((LONG *) &mutex->initlock, 0);
+		LONG		istate;
+
+		while ((istate = InterlockedExchange(&mp->initstate, 2)) == 2)
+			Sleep(0);			/* wait, another thread is doing this */
+		if (istate != 1)
+			InitializeCriticalSection(&mp->csection);
+		InterlockedExchange(&mp->initstate, 1);
 	}
+	EnterCriticalSection(&mp->csection);
+	return 0;
+}
+
+int
+pthread_mutex_unlock(pthread_mutex_t *mp)
+{
+	if (mp->initstate != 1)
+		return EINVAL;
+	LeaveCriticalSection(&mp->csection);
+	return 0;
 }
 
 static pthread_mutex_t win32_pthread_once_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -477,13 +451,12 @@ win32_pthread_once(volatile pthread_once_t *once, void (*fn) (void))
 		pthread_mutex_lock(&win32_pthread_once_lock);
 		if (!*once)
 		{
-			*once = true;
 			fn();
+			*once = true;
 		}
 		pthread_mutex_unlock(&win32_pthread_once_lock);
 	}
 }
-#endif							/* ENABLE_THREAD_SAFETY */
 #endif							/* WIN32 */
 
 #ifdef ENABLE_NLS
@@ -491,7 +464,15 @@ win32_pthread_once(volatile pthread_once_t *once, void (*fn) (void))
 char *
 ecpg_gettext(const char *msgid)
 {
-	static bool already_bound = false;
+	/*
+	 * At least on Windows, there are gettext implementations that fail if
+	 * multiple threads call bindtextdomain() concurrently.  Use a mutex and
+	 * flag variable to ensure that we call it just once per process.  It is
+	 * not known that similar bugs exist on non-Windows platforms, but we
+	 * might as well do it the same way everywhere.
+	 */
+	static volatile bool already_bound = false;
+	static pthread_mutex_t binddomain_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 	if (!already_bound)
 	{
@@ -501,14 +482,26 @@ ecpg_gettext(const char *msgid)
 #else
 		int			save_errno = errno;
 #endif
-		const char *ldir;
 
-		already_bound = true;
-		/* No relocatable lookup here because the binary could be anywhere */
-		ldir = getenv("PGLOCALEDIR");
-		if (!ldir)
-			ldir = LOCALEDIR;
-		bindtextdomain(PG_TEXTDOMAIN("ecpglib"), ldir);
+		(void) pthread_mutex_lock(&binddomain_mutex);
+
+		if (!already_bound)
+		{
+			const char *ldir;
+
+			/*
+			 * No relocatable lookup here because the calling executable could
+			 * be anywhere
+			 */
+			ldir = getenv("PGLOCALEDIR");
+			if (!ldir)
+				ldir = LOCALEDIR;
+			bindtextdomain(PG_TEXTDOMAIN("ecpglib"), ldir);
+			already_bound = true;
+		}
+
+		(void) pthread_mutex_unlock(&binddomain_mutex);
+
 #ifdef WIN32
 		SetLastError(save_errno);
 #else
@@ -552,7 +545,7 @@ ECPGset_var(int number, void *pointer, int lineno)
 	ptr = (struct var_list *) calloc(1L, sizeof(struct var_list));
 	if (!ptr)
 	{
-		struct sqlca_t *sqlca = ECPGget_sqlca();
+		sqlca = ECPGget_sqlca();
 
 		if (sqlca == NULL)
 		{

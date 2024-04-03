@@ -3,7 +3,7 @@
  * xlogdesc.c
  *	  rmgr descriptor routines for access/transam/xlog.c
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -49,12 +49,12 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 						 "oldest xid %u in DB %u; oldest multi %u in DB %u; "
 						 "oldest/newest commit timestamp xid: %u/%u; "
 						 "oldest running xid %u; %s",
-						 (uint32) (checkpoint->redo >> 32), (uint32) checkpoint->redo,
+						 LSN_FORMAT_ARGS(checkpoint->redo),
 						 checkpoint->ThisTimeLineID,
 						 checkpoint->PrevTimeLineID,
 						 checkpoint->fullPageWrites ? "true" : "false",
-						 EpochFromFullTransactionId(checkpoint->nextFullXid),
-						 XidFromFullTransactionId(checkpoint->nextFullXid),
+						 EpochFromFullTransactionId(checkpoint->nextXid),
+						 XidFromFullTransactionId(checkpoint->nextXid),
 						 checkpoint->nextOid,
 						 checkpoint->nextMulti,
 						 checkpoint->nextMultiOffset,
@@ -89,8 +89,7 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 		XLogRecPtr	startpoint;
 
 		memcpy(&startpoint, rec, sizeof(XLogRecPtr));
-		appendStringInfo(buf, "%X/%X",
-						 (uint32) (startpoint >> 32), (uint32) startpoint);
+		appendStringInfo(buf, "%X/%X", LSN_FORMAT_ARGS(startpoint));
 	}
 	else if (info == XLOG_PARAMETER_CHANGE)
 	{
@@ -140,6 +139,19 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 						 xlrec.ThisTimeLineID, xlrec.PrevTimeLineID,
 						 timestamptz_to_str(xlrec.end_time));
 	}
+	else if (info == XLOG_OVERWRITE_CONTRECORD)
+	{
+		xl_overwrite_contrecord xlrec;
+
+		memcpy(&xlrec, rec, sizeof(xl_overwrite_contrecord));
+		appendStringInfo(buf, "lsn %X/%X; time %s",
+						 LSN_FORMAT_ARGS(xlrec.overwritten_lsn),
+						 timestamptz_to_str(xlrec.overwrite_time));
+	}
+	else if (info == XLOG_CHECKPOINT_REDO)
+	{
+		/* No details to write out */
+	}
 }
 
 const char *
@@ -179,13 +191,148 @@ xlog_identify(uint8 info)
 		case XLOG_END_OF_RECOVERY:
 			id = "END_OF_RECOVERY";
 			break;
+		case XLOG_OVERWRITE_CONTRECORD:
+			id = "OVERWRITE_CONTRECORD";
+			break;
 		case XLOG_FPI:
 			id = "FPI";
 			break;
 		case XLOG_FPI_FOR_HINT:
 			id = "FPI_FOR_HINT";
 			break;
+		case XLOG_CHECKPOINT_REDO:
+			id = "CHECKPOINT_REDO";
+			break;
 	}
 
 	return id;
+}
+
+/*
+ * Returns a string giving information about all the blocks in an
+ * XLogRecord.
+ */
+void
+XLogRecGetBlockRefInfo(XLogReaderState *record, bool pretty,
+					   bool detailed_format, StringInfo buf,
+					   uint32 *fpi_len)
+{
+	int			block_id;
+
+	Assert(record != NULL);
+
+	if (detailed_format && pretty)
+		appendStringInfoChar(buf, '\n');
+
+	for (block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++)
+	{
+		RelFileLocator rlocator;
+		ForkNumber	forknum;
+		BlockNumber blk;
+
+		if (!XLogRecGetBlockTagExtended(record, block_id,
+										&rlocator, &forknum, &blk, NULL))
+			continue;
+
+		if (detailed_format)
+		{
+			/* Get block references in detailed format. */
+
+			if (pretty)
+				appendStringInfoChar(buf, '\t');
+			else if (block_id > 0)
+				appendStringInfoChar(buf, ' ');
+
+			appendStringInfo(buf,
+							 "blkref #%d: rel %u/%u/%u fork %s blk %u",
+							 block_id,
+							 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
+							 forkNames[forknum],
+							 blk);
+
+			if (XLogRecHasBlockImage(record, block_id))
+			{
+				uint8		bimg_info = XLogRecGetBlock(record, block_id)->bimg_info;
+
+				/* Calculate the amount of FPI data in the record. */
+				if (fpi_len)
+					*fpi_len += XLogRecGetBlock(record, block_id)->bimg_len;
+
+				if (BKPIMAGE_COMPRESSED(bimg_info))
+				{
+					const char *method;
+
+					if ((bimg_info & BKPIMAGE_COMPRESS_PGLZ) != 0)
+						method = "pglz";
+					else if ((bimg_info & BKPIMAGE_COMPRESS_LZ4) != 0)
+						method = "lz4";
+					else if ((bimg_info & BKPIMAGE_COMPRESS_ZSTD) != 0)
+						method = "zstd";
+					else
+						method = "unknown";
+
+					appendStringInfo(buf,
+									 " (FPW%s); hole: offset: %u, length: %u, "
+									 "compression saved: %u, method: %s",
+									 XLogRecBlockImageApply(record, block_id) ?
+									 "" : " for WAL verification",
+									 XLogRecGetBlock(record, block_id)->hole_offset,
+									 XLogRecGetBlock(record, block_id)->hole_length,
+									 BLCKSZ -
+									 XLogRecGetBlock(record, block_id)->hole_length -
+									 XLogRecGetBlock(record, block_id)->bimg_len,
+									 method);
+				}
+				else
+				{
+					appendStringInfo(buf,
+									 " (FPW%s); hole: offset: %u, length: %u",
+									 XLogRecBlockImageApply(record, block_id) ?
+									 "" : " for WAL verification",
+									 XLogRecGetBlock(record, block_id)->hole_offset,
+									 XLogRecGetBlock(record, block_id)->hole_length);
+				}
+			}
+
+			if (pretty)
+				appendStringInfoChar(buf, '\n');
+		}
+		else
+		{
+			/* Get block references in short format. */
+
+			if (forknum != MAIN_FORKNUM)
+			{
+				appendStringInfo(buf,
+								 ", blkref #%d: rel %u/%u/%u fork %s blk %u",
+								 block_id,
+								 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
+								 forkNames[forknum],
+								 blk);
+			}
+			else
+			{
+				appendStringInfo(buf,
+								 ", blkref #%d: rel %u/%u/%u blk %u",
+								 block_id,
+								 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
+								 blk);
+			}
+
+			if (XLogRecHasBlockImage(record, block_id))
+			{
+				/* Calculate the amount of FPI data in the record. */
+				if (fpi_len)
+					*fpi_len += XLogRecGetBlock(record, block_id)->bimg_len;
+
+				if (XLogRecBlockImageApply(record, block_id))
+					appendStringInfoString(buf, " FPW");
+				else
+					appendStringInfoString(buf, " FPW for WAL verification");
+			}
+		}
+	}
+
+	if (!detailed_format && pretty)
+		appendStringInfoChar(buf, '\n');
 }

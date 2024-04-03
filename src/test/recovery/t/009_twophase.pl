@@ -1,16 +1,21 @@
+
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
+
 # Tests dedicated to two-phase commit in recovery
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
-use PostgresNode;
-use TestLib;
-use Test::More tests => 24;
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
 
 my $psql_out = '';
-my $psql_rc  = '';
+my $psql_rc = '';
 
 sub configure_and_reload
 {
+	local $Test::Builder::Level = $Test::Builder::Level + 1;
+
 	my ($node, $parameter) = @_;
 	my $name = $node->name;
 
@@ -26,7 +31,7 @@ sub configure_and_reload
 # Set up two nodes, which will alternately be primary and replication standby.
 
 # Setup london node
-my $node_london = get_new_node("london");
+my $node_london = PostgreSQL::Test::Cluster->new("london");
 $node_london->init(allows_streaming => 1);
 $node_london->append_conf(
 	'postgresql.conf', qq(
@@ -37,14 +42,18 @@ $node_london->start;
 $node_london->backup('london_backup');
 
 # Setup paris node
-my $node_paris = get_new_node('paris');
+my $node_paris = PostgreSQL::Test::Cluster->new('paris');
 $node_paris->init_from_backup($node_london, 'london_backup',
 	has_streaming => 1);
+$node_paris->append_conf(
+	'postgresql.conf', qq(
+	subtransaction_buffers = 32
+));
 $node_paris->start;
 
 # Switch to synchronous replication in both directions
 configure_and_reload($node_london, "synchronous_standby_names = 'paris'");
-configure_and_reload($node_paris,  "synchronous_standby_names = 'london'");
+configure_and_reload($node_paris, "synchronous_standby_names = 'london'");
 
 # Set up nonce names for current primary and standby nodes
 note "Initially, london is primary and paris is standby";
@@ -475,3 +484,43 @@ $cur_standby->psql(
 is( $psql_out,
 	qq{27|issued to paris},
 	"Check expected t_009_tbl2 data on standby");
+
+
+# Exercise the 2PC recovery code in StartupSUBTRANS, which is concerned with
+# ensuring that enough pg_subtrans pages exist on disk to cover the range of
+# prepared transactions at server start time.  There's not much we can verify
+# directly, but let's at least get the code to run.
+$cur_standby->stop();
+configure_and_reload($cur_primary, "synchronous_standby_names = ''");
+
+$cur_primary->safe_psql('postgres', "CHECKPOINT");
+
+my $start_lsn =
+  $cur_primary->safe_psql('postgres', 'select pg_current_wal_insert_lsn()');
+$cur_primary->safe_psql('postgres',
+	"CREATE TABLE test(); BEGIN; CREATE TABLE test1(); PREPARE TRANSACTION 'foo';"
+);
+my $osubtrans = $cur_primary->safe_psql('postgres',
+	"select 'pg_subtrans/'||f, s.size from pg_ls_dir('pg_subtrans') f, pg_stat_file('pg_subtrans/'||f) s"
+);
+$cur_primary->pgbench(
+	'--no-vacuum --client=5 --transactions=1000',
+	0,
+	[],
+	[],
+	'pgbench run to cause pg_subtrans traffic',
+	{
+		'009_twophase.pgb' => 'insert into test default values'
+	});
+# StartupSUBTRANS is exercised with a wide range of visible XIDs in this
+# stop/start sequence, because we left a prepared transaction open above.
+# Also, setting subtransaction_buffers to 32 above causes to switch SLRU
+# bank, for additional code coverage.
+$cur_primary->stop;
+$cur_primary->start;
+my $nsubtrans = $cur_primary->safe_psql('postgres',
+	"select 'pg_subtrans/'||f, s.size from pg_ls_dir('pg_subtrans') f, pg_stat_file('pg_subtrans/'||f) s"
+);
+isnt($osubtrans, $nsubtrans, "contents of pg_subtrans/ have changed");
+
+done_testing();

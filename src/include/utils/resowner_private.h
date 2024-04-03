@@ -6,7 +6,7 @@
  * See utils/resowner/README for more info.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/resowner_private.h
@@ -29,6 +29,11 @@
 extern void ResourceOwnerEnlargeBuffers(ResourceOwner owner);
 extern void ResourceOwnerRememberBuffer(ResourceOwner owner, Buffer buffer);
 extern void ResourceOwnerForgetBuffer(ResourceOwner owner, Buffer buffer);
+
+/* support for IO-in-progress management */
+extern void ResourceOwnerEnlargeBufferIOs(ResourceOwner owner);
+extern void ResourceOwnerRememberBufferIO(ResourceOwner owner, Buffer buffer);
+extern void ResourceOwnerForgetBufferIO(ResourceOwner owner, Buffer buffer);
 
 /* support for local lock management */
 extern void ResourceOwnerRememberLock(ResourceOwner owner, LOCALLOCK *locallock);
@@ -94,5 +99,19 @@ extern void ResourceOwnerRememberJIT(ResourceOwner owner,
 									 Datum handle);
 extern void ResourceOwnerForgetJIT(ResourceOwner owner,
 								   Datum handle);
+
+/* support for cryptohash context management */
+extern void ResourceOwnerEnlargeCryptoHash(ResourceOwner owner);
+extern void ResourceOwnerRememberCryptoHash(ResourceOwner owner,
+											Datum handle);
+extern void ResourceOwnerForgetCryptoHash(ResourceOwner owner,
+										  Datum handle);
+
+/* support for HMAC context management */
+extern void ResourceOwnerEnlargeHMAC(ResourceOwner owner);
+extern void ResourceOwnerRememberHMAC(ResourceOwner owner,
+									  Datum handle);
+extern void ResourceOwnerForgetHMAC(ResourceOwner owner,
+									Datum handle);
 
 #endif							/* RESOWNER_PRIVATE_H */

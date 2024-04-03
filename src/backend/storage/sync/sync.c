@@ -3,7 +3,7 @@
  * sync.c
  *	  File synchronization management code.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,21 +18,19 @@
 #include <fcntl.h>
 #include <sys/file.h>
 
+#include "access/clog.h"
+#include "access/commit_ts.h"
+#include "access/multixact.h"
 #include "access/xlog.h"
-#include "access/xlogutils.h"
-#include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "portability/instr_time.h"
 #include "postmaster/bgwriter.h"
-#include "storage/bufmgr.h"
-#include "storage/ipc.h"
+#include "storage/fd.h"
+#include "storage/latch.h"
 #include "storage/md.h"
 #include "utils/hsearch.h"
-#include "utils/inval.h"
 #include "utils/memutils.h"
-
-static MemoryContext pendingOpsCxt; /* context for the pending ops state  */
 
 /*
  * In some contexts (currently, standalone backends and the checkpointer)
@@ -66,6 +64,7 @@ typedef struct
 {
 	FileTag		tag;			/* identifies handler and file */
 	CycleCtr	cycle_ctr;		/* checkpoint_cycle_ctr when request was made */
+	bool		canceled;		/* true if request has been canceled */
 } PendingUnlinkEntry;
 
 static HTAB *pendingOps = NULL;
@@ -90,12 +89,31 @@ typedef struct SyncOps
 										const FileTag *candidate);
 } SyncOps;
 
+/*
+ * These indexes must correspond to the values of the SyncRequestHandler enum.
+ */
 static const SyncOps syncsw[] = {
 	/* magnetic disk */
-	{
+	[SYNC_HANDLER_MD] = {
 		.sync_syncfiletag = mdsyncfiletag,
 		.sync_unlinkfiletag = mdunlinkfiletag,
 		.sync_filetagmatches = mdfiletagmatches
+	},
+	/* pg_xact */
+	[SYNC_HANDLER_CLOG] = {
+		.sync_syncfiletag = clogsyncfiletag
+	},
+	/* pg_commit_ts */
+	[SYNC_HANDLER_COMMIT_TS] = {
+		.sync_syncfiletag = committssyncfiletag
+	},
+	/* pg_multixact/offsets */
+	[SYNC_HANDLER_MULTIXACT_OFFSET] = {
+		.sync_syncfiletag = multixactoffsetssyncfiletag
+	},
+	/* pg_multixact/members */
+	[SYNC_HANDLER_MULTIXACT_MEMBER] = {
+		.sync_syncfiletag = multixactmemberssyncfiletag
 	}
 };
 
@@ -107,10 +125,10 @@ InitSync(void)
 {
 	/*
 	 * Create pending-operations hashtable if we need it.  Currently, we need
-	 * it if we are standalone (not under a postmaster) or if we are a startup
-	 * or checkpointer auxiliary process.
+	 * it if we are standalone (not under a postmaster) or if we are a
+	 * checkpointer auxiliary process.
 	 */
-	if (!IsUnderPostmaster || AmStartupProcess() || AmCheckpointerProcess())
+	if (!IsUnderPostmaster || AmCheckpointerProcess())
 	{
 		HASHCTL		hash_ctl;
 
@@ -128,7 +146,6 @@ InitSync(void)
 											  ALLOCSET_DEFAULT_SIZES);
 		MemoryContextAllowInCriticalSection(pendingOpsCxt, true);
 
-		MemSet(&hash_ctl, 0, sizeof(hash_ctl));
 		hash_ctl.keysize = sizeof(FileTag);
 		hash_ctl.entrysize = sizeof(PendingFsyncEntry);
 		hash_ctl.hcxt = pendingOpsCxt;
@@ -138,7 +155,6 @@ InitSync(void)
 								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 		pendingUnlinks = NIL;
 	}
-
 }
 
 /*
@@ -150,7 +166,9 @@ InitSync(void)
  * counter is incremented here.
  *
  * This must be called *before* the checkpoint REDO point is determined.
- * That ensures that we won't delete files too soon.
+ * That ensures that we won't delete files too soon.  Since this calls
+ * AbsorbSyncRequests(), which performs memory allocations, it cannot be
+ * called within a critical section.
  *
  * Note that we can't do anything here that depends on the assumption
  * that the checkpoint will be completed.
@@ -158,6 +176,16 @@ InitSync(void)
 void
 SyncPreCheckpoint(void)
 {
+	/*
+	 * Operations such as DROP TABLESPACE assume that the next checkpoint will
+	 * process all recently forwarded unlink requests, but if they aren't
+	 * absorbed prior to advancing the cycle counter, they won't be processed
+	 * until a future checkpoint.  The following absorb ensures that any
+	 * unlink requests forwarded before the checkpoint began will be processed
+	 * in the current checkpoint.
+	 */
+	AbsorbSyncRequests();
+
 	/*
 	 * Any unlink requests arriving after this point will be assigned the next
 	 * cycle counter, and won't be unlinked until next checkpoint.
@@ -174,12 +202,17 @@ void
 SyncPostCheckpoint(void)
 {
 	int			absorb_counter;
+	ListCell   *lc;
 
 	absorb_counter = UNLINKS_PER_ABSORB;
-	while (pendingUnlinks != NIL)
+	foreach(lc, pendingUnlinks)
 	{
-		PendingUnlinkEntry *entry = (PendingUnlinkEntry *) linitial(pendingUnlinks);
+		PendingUnlinkEntry *entry = (PendingUnlinkEntry *) lfirst(lc);
 		char		path[MAXPGPATH];
+
+		/* Skip over any canceled entries */
+		if (entry->canceled)
+			continue;
 
 		/*
 		 * New entries are appended to the end, so if the entry is new we've
@@ -210,15 +243,13 @@ SyncPostCheckpoint(void)
 						 errmsg("could not remove file \"%s\": %m", path)));
 		}
 
-		/* And remove the list entry */
-		pendingUnlinks = list_delete_first(pendingUnlinks);
-		pfree(entry);
+		/* Mark the list entry as canceled, just in case */
+		entry->canceled = true;
 
 		/*
 		 * As in ProcessSyncRequests, we don't want to stop absorbing fsync
 		 * requests for a long time when there are many deletions to be done.
-		 * We can safely call AbsorbSyncRequests() at this point in the loop
-		 * (note it might try to delete list entries).
+		 * We can safely call AbsorbSyncRequests() at this point in the loop.
 		 */
 		if (--absorb_counter <= 0)
 		{
@@ -226,10 +257,29 @@ SyncPostCheckpoint(void)
 			absorb_counter = UNLINKS_PER_ABSORB;
 		}
 	}
+
+	/*
+	 * If we reached the end of the list, we can just remove the whole list
+	 * (remembering to pfree all the PendingUnlinkEntry objects).  Otherwise,
+	 * we must keep the entries at or after "lc".
+	 */
+	if (lc == NULL)
+	{
+		list_free_deep(pendingUnlinks);
+		pendingUnlinks = NIL;
+	}
+	else
+	{
+		int			ntodelete = list_cell_number(pendingUnlinks, lc);
+
+		for (int i = 0; i < ntodelete; i++)
+			pfree(list_nth(pendingUnlinks, i));
+
+		pendingUnlinks = list_delete_first_n(pendingUnlinks, ntodelete);
+	}
 }
 
 /*
-
  *	ProcessSyncRequests() -- Process queued fsync requests.
  */
 void
@@ -398,8 +448,8 @@ ProcessSyncRequests(void)
 				else
 					ereport(DEBUG1,
 							(errcode_for_file_access(),
-							 errmsg("could not fsync file \"%s\" but retrying: %m",
-									path)));
+							 errmsg_internal("could not fsync file \"%s\" but retrying: %m",
+											 path)));
 
 				/*
 				 * Absorb incoming requests and check to see if a cancel
@@ -444,7 +494,7 @@ RememberSyncRequest(const FileTag *ftag, SyncRequestType type)
 
 		/* Cancel previously entered request */
 		entry = (PendingFsyncEntry *) hash_search(pendingOps,
-												  (void *) ftag,
+												  ftag,
 												  HASH_FIND,
 												  NULL);
 		if (entry != NULL)
@@ -453,29 +503,26 @@ RememberSyncRequest(const FileTag *ftag, SyncRequestType type)
 	else if (type == SYNC_FILTER_REQUEST)
 	{
 		HASH_SEQ_STATUS hstat;
-		PendingFsyncEntry *entry;
+		PendingFsyncEntry *pfe;
 		ListCell   *cell;
 
 		/* Cancel matching fsync requests */
 		hash_seq_init(&hstat, pendingOps);
-		while ((entry = (PendingFsyncEntry *) hash_seq_search(&hstat)) != NULL)
+		while ((pfe = (PendingFsyncEntry *) hash_seq_search(&hstat)) != NULL)
 		{
-			if (entry->tag.handler == ftag->handler &&
-				syncsw[ftag->handler].sync_filetagmatches(ftag, &entry->tag))
-				entry->canceled = true;
+			if (pfe->tag.handler == ftag->handler &&
+				syncsw[ftag->handler].sync_filetagmatches(ftag, &pfe->tag))
+				pfe->canceled = true;
 		}
 
-		/* Remove matching unlink requests */
+		/* Cancel matching unlink requests */
 		foreach(cell, pendingUnlinks)
 		{
-			PendingUnlinkEntry *entry = (PendingUnlinkEntry *) lfirst(cell);
+			PendingUnlinkEntry *pue = (PendingUnlinkEntry *) lfirst(cell);
 
-			if (entry->tag.handler == ftag->handler &&
-				syncsw[ftag->handler].sync_filetagmatches(ftag, &entry->tag))
-			{
-				pendingUnlinks = foreach_delete_current(pendingUnlinks, cell);
-				pfree(entry);
-			}
+			if (pue->tag.handler == ftag->handler &&
+				syncsw[ftag->handler].sync_filetagmatches(ftag, &pue->tag))
+				pue->canceled = true;
 		}
 	}
 	else if (type == SYNC_UNLINK_REQUEST)
@@ -487,6 +534,7 @@ RememberSyncRequest(const FileTag *ftag, SyncRequestType type)
 		entry = palloc(sizeof(PendingUnlinkEntry));
 		entry->tag = *ftag;
 		entry->cycle_ctr = checkpoint_cycle_ctr;
+		entry->canceled = false;
 
 		pendingUnlinks = lappend(pendingUnlinks, entry);
 
@@ -502,11 +550,11 @@ RememberSyncRequest(const FileTag *ftag, SyncRequestType type)
 		Assert(type == SYNC_REQUEST);
 
 		entry = (PendingFsyncEntry *) hash_search(pendingOps,
-												  (void *) ftag,
+												  ftag,
 												  HASH_ENTER,
 												  &found);
-		/* if new entry, initialize it */
-		if (!found)
+		/* if new entry, or was previously canceled, initialize it */
+		if (!found || entry->canceled)
 		{
 			entry->cycle_ctr = sync_cycle_ctr;
 			entry->canceled = false;
@@ -563,32 +611,9 @@ RegisterSyncRequest(const FileTag *ftag, SyncRequestType type,
 		if (ret || (!ret && !retryOnError))
 			break;
 
-		pg_usleep(10000L);
+		WaitLatch(NULL, WL_EXIT_ON_PM_DEATH | WL_TIMEOUT, 10,
+				  WAIT_EVENT_REGISTER_SYNC_REQUEST);
 	}
 
 	return ret;
-}
-
-/*
- * In archive recovery, we rely on checkpointer to do fsyncs, but we will have
- * already created the pendingOps during initialization of the startup
- * process.  Calling this function drops the local pendingOps so that
- * subsequent requests will be forwarded to checkpointer.
- */
-void
-EnableSyncRequestForwarding(void)
-{
-	/* Perform any pending fsyncs we may have queued up, then drop table */
-	if (pendingOps)
-	{
-		ProcessSyncRequests();
-		hash_destroy(pendingOps);
-	}
-	pendingOps = NULL;
-
-	/*
-	 * We should not have any pending unlink requests, since mdunlink doesn't
-	 * queue unlink requests when isRedo.
-	 */
-	Assert(pendingUnlinks == NIL);
 }

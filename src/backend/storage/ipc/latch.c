@@ -3,26 +3,27 @@
  * latch.c
  *	  Routines for inter-process latches
  *
- * The Unix implementation uses the so-called self-pipe trick to overcome the
- * race condition involved with poll() (or epoll_wait() on linux) and setting
- * a global flag in the signal handler. When a latch is set and the current
- * process is waiting for it, the signal handler wakes up the poll() in
- * WaitLatch by writing a byte to a pipe. A signal by itself doesn't interrupt
- * poll() on all platforms, and even on platforms where it does, a signal that
- * arrives just before the poll() call does not prevent poll() from entering
- * sleep. An incoming byte on a pipe however reliably interrupts the sleep,
- * and causes poll() to return immediately even if the signal arrives before
- * poll() begins.
+ * The poll() implementation uses the so-called self-pipe trick to overcome the
+ * race condition involved with poll() and setting a global flag in the signal
+ * handler. When a latch is set and the current process is waiting for it, the
+ * signal handler wakes up the poll() in WaitLatch by writing a byte to a pipe.
+ * A signal by itself doesn't interrupt poll() on all platforms, and even on
+ * platforms where it does, a signal that arrives just before the poll() call
+ * does not prevent poll() from entering sleep. An incoming byte on a pipe
+ * however reliably interrupts the sleep, and causes poll() to return
+ * immediately even if the signal arrives before poll() begins.
  *
- * When SetLatch is called from the same process that owns the latch,
- * SetLatch writes the byte directly to the pipe. If it's owned by another
- * process, SIGUSR1 is sent and the signal handler in the waiting process
- * writes the byte to the pipe on behalf of the signaling process.
+ * The epoll() implementation overcomes the race with a different technique: it
+ * keeps SIGURG blocked and consumes from a signalfd() descriptor instead.  We
+ * don't need to register a signal handler or create our own self-pipe.  We
+ * assume that any system that has Linux epoll() also has Linux signalfd().
+ *
+ * The kqueue() implementation waits for SIGURG with EVFILT_SIGNAL.
  *
  * The Windows implementation uses Windows events that are inherited by all
  * postmaster child processes. There's no need for the self-pipe trick there.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -42,10 +43,14 @@
 #ifdef HAVE_SYS_EVENT_H
 #include <sys/event.h>
 #endif
+#ifdef HAVE_SYS_SIGNALFD_H
+#include <sys/signalfd.h>
+#endif
 #ifdef HAVE_POLL_H
 #include <poll.h>
 #endif
 
+#include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "port/atomics.h"
@@ -55,7 +60,8 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/pmsignal.h"
-#include "storage/shmem.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
 
 /*
  * Select the fd readiness primitive to use. Normally the "most modern"
@@ -78,9 +84,25 @@
 #error "no wait set implementation available"
 #endif
 
+/*
+ * By default, we use a self-pipe with poll() and a signalfd with epoll(), if
+ * available.  For testing the choice can also be manually specified.
+ */
+#if defined(WAIT_USE_POLL) || defined(WAIT_USE_EPOLL)
+#if defined(WAIT_USE_SELF_PIPE) || defined(WAIT_USE_SIGNALFD)
+/* don't overwrite manual choice */
+#elif defined(WAIT_USE_EPOLL) && defined(HAVE_SYS_SIGNALFD_H)
+#define WAIT_USE_SIGNALFD
+#else
+#define WAIT_USE_SELF_PIPE
+#endif
+#endif
+
 /* typedef in latch.h */
 struct WaitEventSet
 {
+	ResourceOwner owner;
+
 	int			nevents;		/* number of registered events */
 	int			nevents_space;	/* maximum number of events in this set */
 
@@ -129,10 +151,23 @@ struct WaitEventSet
 #endif
 };
 
+/* A common WaitEventSet used to implement WaitLatch() */
+static WaitEventSet *LatchWaitSet;
+
+/* The position of the latch in LatchWaitSet. */
+#define LatchWaitSetLatchPos 0
+
 #ifndef WIN32
 /* Are we currently in WaitLatch? The signal handler would like to know. */
 static volatile sig_atomic_t waiting = false;
+#endif
 
+#ifdef WAIT_USE_SIGNALFD
+/* On Linux, we'll receive SIGURG via a signalfd file descriptor. */
+static int	signal_fd = -1;
+#endif
+
+#ifdef WAIT_USE_SELF_PIPE
 /* Read and write ends of the self-pipe */
 static int	selfpipe_readfd = -1;
 static int	selfpipe_writefd = -1;
@@ -141,9 +176,13 @@ static int	selfpipe_writefd = -1;
 static int	selfpipe_owner_pid = 0;
 
 /* Private function prototypes */
+static void latch_sigurg_handler(SIGNAL_ARGS);
 static void sendSelfPipeByte(void);
-static void drainSelfPipe(void);
-#endif							/* WIN32 */
+#endif
+
+#if defined(WAIT_USE_SELF_PIPE) || defined(WAIT_USE_SIGNALFD)
+static void drain(void);
+#endif
 
 #if defined(WAIT_USE_EPOLL)
 static void WaitEventAdjustEpoll(WaitEventSet *set, WaitEvent *event, int action);
@@ -158,6 +197,31 @@ static void WaitEventAdjustWin32(WaitEventSet *set, WaitEvent *event);
 static inline int WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 										WaitEvent *occurred_events, int nevents);
 
+/* ResourceOwner support to hold WaitEventSets */
+static void ResOwnerReleaseWaitEventSet(Datum res);
+
+static const ResourceOwnerDesc wait_event_set_resowner_desc =
+{
+	.name = "WaitEventSet",
+	.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
+	.release_priority = RELEASE_PRIO_WAITEVENTSETS,
+	.ReleaseResource = ResOwnerReleaseWaitEventSet,
+	.DebugPrint = NULL
+};
+
+/* Convenience wrappers over ResourceOwnerRemember/Forget */
+static inline void
+ResourceOwnerRememberWaitEventSet(ResourceOwner owner, WaitEventSet *set)
+{
+	ResourceOwnerRemember(owner, PointerGetDatum(set), &wait_event_set_resowner_desc);
+}
+static inline void
+ResourceOwnerForgetWaitEventSet(ResourceOwner owner, WaitEventSet *set)
+{
+	ResourceOwnerForget(owner, PointerGetDatum(set), &wait_event_set_resowner_desc);
+}
+
+
 /*
  * Initialize the process-local latch infrastructure.
  *
@@ -167,7 +231,7 @@ static inline int WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 void
 InitializeLatchSupport(void)
 {
-#ifndef WIN32
+#if defined(WAIT_USE_SELF_PIPE)
 	int			pipefd[2];
 
 	if (IsUnderPostmaster)
@@ -237,8 +301,89 @@ InitializeLatchSupport(void)
 	/* Tell fd.c about these two long-lived FDs */
 	ReserveExternalFD();
 	ReserveExternalFD();
-#else
-	/* currently, nothing to do here for Windows */
+
+	pqsignal(SIGURG, latch_sigurg_handler);
+#endif
+
+#ifdef WAIT_USE_SIGNALFD
+	sigset_t	signalfd_mask;
+
+	if (IsUnderPostmaster)
+	{
+		/*
+		 * It would probably be safe to re-use the inherited signalfd since
+		 * signalfds only see the current process's pending signals, but it
+		 * seems less surprising to close it and create our own.
+		 */
+		if (signal_fd != -1)
+		{
+			/* Release postmaster's signal FD; ignore any error */
+			(void) close(signal_fd);
+			signal_fd = -1;
+			ReleaseExternalFD();
+		}
+	}
+
+	/* Block SIGURG, because we'll receive it through a signalfd. */
+	sigaddset(&UnBlockSig, SIGURG);
+
+	/* Set up the signalfd to receive SIGURG notifications. */
+	sigemptyset(&signalfd_mask);
+	sigaddset(&signalfd_mask, SIGURG);
+	signal_fd = signalfd(-1, &signalfd_mask, SFD_NONBLOCK | SFD_CLOEXEC);
+	if (signal_fd < 0)
+		elog(FATAL, "signalfd() failed");
+	ReserveExternalFD();
+#endif
+
+#ifdef WAIT_USE_KQUEUE
+	/* Ignore SIGURG, because we'll receive it via kqueue. */
+	pqsignal(SIGURG, SIG_IGN);
+#endif
+}
+
+void
+InitializeLatchWaitSet(void)
+{
+	int			latch_pos PG_USED_FOR_ASSERTS_ONLY;
+
+	Assert(LatchWaitSet == NULL);
+
+	/* Set up the WaitEventSet used by WaitLatch(). */
+	LatchWaitSet = CreateWaitEventSet(NULL, 2);
+	latch_pos = AddWaitEventToSet(LatchWaitSet, WL_LATCH_SET, PGINVALID_SOCKET,
+								  MyLatch, NULL);
+	if (IsUnderPostmaster)
+		AddWaitEventToSet(LatchWaitSet, WL_EXIT_ON_PM_DEATH,
+						  PGINVALID_SOCKET, NULL, NULL);
+
+	Assert(latch_pos == LatchWaitSetLatchPos);
+}
+
+void
+ShutdownLatchSupport(void)
+{
+#if defined(WAIT_USE_POLL)
+	pqsignal(SIGURG, SIG_IGN);
+#endif
+
+	if (LatchWaitSet)
+	{
+		FreeWaitEventSet(LatchWaitSet);
+		LatchWaitSet = NULL;
+	}
+
+#if defined(WAIT_USE_SELF_PIPE)
+	close(selfpipe_readfd);
+	close(selfpipe_writefd);
+	selfpipe_readfd = -1;
+	selfpipe_writefd = -1;
+	selfpipe_owner_pid = InvalidPid;
+#endif
+
+#if defined(WAIT_USE_SIGNALFD)
+	close(signal_fd);
+	signal_fd = -1;
 #endif
 }
 
@@ -249,13 +394,17 @@ void
 InitLatch(Latch *latch)
 {
 	latch->is_set = false;
+	latch->maybe_sleeping = false;
 	latch->owner_pid = MyProcPid;
 	latch->is_shared = false;
 
-#ifndef WIN32
+#if defined(WAIT_USE_SELF_PIPE)
 	/* Assert InitializeLatchSupport has been called in this process */
 	Assert(selfpipe_readfd >= 0 && selfpipe_owner_pid == MyProcPid);
-#else
+#elif defined(WAIT_USE_SIGNALFD)
+	/* Assert InitializeLatchSupport has been called in this process */
+	Assert(signal_fd >= 0);
+#elif defined(WAIT_USE_WIN32)
 	latch->event = CreateEvent(NULL, TRUE, FALSE, NULL);
 	if (latch->event == NULL)
 		elog(ERROR, "CreateEvent failed: error code %lu", GetLastError());
@@ -296,6 +445,7 @@ InitSharedLatch(Latch *latch)
 #endif
 
 	latch->is_set = false;
+	latch->maybe_sleeping = false;
 	latch->owner_pid = 0;
 	latch->is_shared = true;
 }
@@ -308,24 +458,26 @@ InitSharedLatch(Latch *latch)
  * any sort of locking here, meaning that we could fail to detect the error
  * if two processes try to own the same latch at about the same time.  If
  * there is any risk of that, caller must provide an interlock to prevent it.
- *
- * In any process that calls OwnLatch(), make sure that
- * latch_sigusr1_handler() is called from the SIGUSR1 signal handler,
- * as shared latches use SIGUSR1 for inter-process communication.
  */
 void
 OwnLatch(Latch *latch)
 {
+	int			owner_pid;
+
 	/* Sanity checks */
 	Assert(latch->is_shared);
 
-#ifndef WIN32
+#if defined(WAIT_USE_SELF_PIPE)
 	/* Assert InitializeLatchSupport has been called in this process */
 	Assert(selfpipe_readfd >= 0 && selfpipe_owner_pid == MyProcPid);
+#elif defined(WAIT_USE_SIGNALFD)
+	/* Assert InitializeLatchSupport has been called in this process */
+	Assert(signal_fd >= 0);
 #endif
 
-	if (latch->owner_pid != 0)
-		elog(ERROR, "latch already owned");
+	owner_pid = latch->owner_pid;
+	if (owner_pid != 0)
+		elog(PANIC, "latch already owned by PID %d", owner_pid);
 
 	latch->owner_pid = MyProcPid;
 }
@@ -365,8 +517,31 @@ int
 WaitLatch(Latch *latch, int wakeEvents, long timeout,
 		  uint32 wait_event_info)
 {
-	return WaitLatchOrSocket(latch, wakeEvents, PGINVALID_SOCKET, timeout,
-							 wait_event_info);
+	WaitEvent	event;
+
+	/* Postmaster-managed callers must handle postmaster death somehow. */
+	Assert(!IsUnderPostmaster ||
+		   (wakeEvents & WL_EXIT_ON_PM_DEATH) ||
+		   (wakeEvents & WL_POSTMASTER_DEATH));
+
+	/*
+	 * Some callers may have a latch other than MyLatch, or no latch at all,
+	 * or want to handle postmaster death differently.  It's cheap to assign
+	 * those, so just do it every time.
+	 */
+	if (!(wakeEvents & WL_LATCH_SET))
+		latch = NULL;
+	ModifyWaitEvent(LatchWaitSet, LatchWaitSetLatchPos, WL_LATCH_SET, latch);
+	LatchWaitSet->exit_on_postmaster_death =
+		((wakeEvents & WL_EXIT_ON_PM_DEATH) != 0);
+
+	if (WaitEventSetWait(LatchWaitSet,
+						 (wakeEvents & WL_TIMEOUT) ? timeout : -1,
+						 &event, 1,
+						 wait_event_info) == 0)
+		return WL_TIMEOUT;
+	else
+		return event.events;
 }
 
 /*
@@ -393,7 +568,7 @@ WaitLatchOrSocket(Latch *latch, int wakeEvents, pgsocket sock,
 	int			ret = 0;
 	int			rc;
 	WaitEvent	event;
-	WaitEventSet *set = CreateWaitEventSet(CurrentMemoryContext, 3);
+	WaitEventSet *set = CreateWaitEventSet(CurrentResourceOwner, 3);
 
 	if (wakeEvents & WL_TIMEOUT)
 		Assert(timeout >= 0);
@@ -475,13 +650,17 @@ SetLatch(Latch *latch)
 
 	latch->is_set = true;
 
+	pg_memory_barrier();
+	if (!latch->maybe_sleeping)
+		return;
+
 #ifndef WIN32
 
 	/*
 	 * See if anyone's waiting for the latch. It can be the current process if
-	 * we're in a signal handler. We use the self-pipe to wake up the
-	 * poll()/epoll_wait() in that case. If it's another process, send a
-	 * signal.
+	 * we're in a signal handler. We use the self-pipe or SIGURG to ourselves
+	 * to wake up WaitEventSetWaitBlock() without races in that case. If it's
+	 * another process, send a signal.
 	 *
 	 * Fetch owner_pid only once, in case the latch is concurrently getting
 	 * owned or disowned. XXX: This assumes that pid_t is atomic, which isn't
@@ -504,11 +683,17 @@ SetLatch(Latch *latch)
 		return;
 	else if (owner_pid == MyProcPid)
 	{
+#if defined(WAIT_USE_SELF_PIPE)
 		if (waiting)
 			sendSelfPipeByte();
+#else
+		if (waiting)
+			kill(MyProcPid, SIGURG);
+#endif
 	}
 	else
-		kill(owner_pid, SIGUSR1);
+		kill(owner_pid, SIGURG);
+
 #else
 
 	/*
@@ -529,7 +714,6 @@ SetLatch(Latch *latch)
 		 */
 	}
 #endif
-
 }
 
 /*
@@ -541,6 +725,7 @@ ResetLatch(Latch *latch)
 {
 	/* Only the owner should reset the latch */
 	Assert(latch->owner_pid == MyProcPid);
+	Assert(latch->maybe_sleeping == false);
 
 	latch->is_set = false;
 
@@ -558,9 +743,12 @@ ResetLatch(Latch *latch)
  *
  * These events can then be efficiently waited upon together, using
  * WaitEventSetWait().
+ *
+ * The WaitEventSet is tracked by the given 'resowner'.  Use NULL for session
+ * lifetime.
  */
 WaitEventSet *
-CreateWaitEventSet(MemoryContext context, int nevents)
+CreateWaitEventSet(ResourceOwner resowner, int nevents)
 {
 	WaitEventSet *set;
 	char	   *data;
@@ -570,7 +758,7 @@ CreateWaitEventSet(MemoryContext context, int nevents)
 	 * Use MAXALIGN size/alignment to guarantee that later uses of memory are
 	 * aligned correctly. E.g. epoll_event might need 8 byte alignment on some
 	 * platforms, but earlier allocations like WaitEventSet and WaitEvent
-	 * might not sized to guarantee that when purely using sizeof().
+	 * might not be sized to guarantee that when purely using sizeof().
 	 */
 	sz += MAXALIGN(sizeof(WaitEventSet));
 	sz += MAXALIGN(sizeof(WaitEvent) * nevents);
@@ -586,7 +774,10 @@ CreateWaitEventSet(MemoryContext context, int nevents)
 	sz += MAXALIGN(sizeof(HANDLE) * (nevents + 1));
 #endif
 
-	data = (char *) MemoryContextAllocZero(context, sz);
+	if (resowner != NULL)
+		ResourceOwnerEnlarge(resowner);
+
+	data = (char *) MemoryContextAllocZero(TopMemoryContext, sz);
 
 	set = (WaitEventSet *) data;
 	data += MAXALIGN(sizeof(WaitEventSet));
@@ -612,37 +803,24 @@ CreateWaitEventSet(MemoryContext context, int nevents)
 	set->nevents_space = nevents;
 	set->exit_on_postmaster_death = false;
 
+	if (resowner != NULL)
+	{
+		ResourceOwnerRememberWaitEventSet(resowner, set);
+		set->owner = resowner;
+	}
+
 #if defined(WAIT_USE_EPOLL)
 	if (!AcquireExternalFD())
 	{
 		/* treat this as though epoll_create1 itself returned EMFILE */
 		elog(ERROR, "epoll_create1 failed: %m");
 	}
-#ifdef EPOLL_CLOEXEC
 	set->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
 	if (set->epoll_fd < 0)
 	{
 		ReleaseExternalFD();
 		elog(ERROR, "epoll_create1 failed: %m");
 	}
-#else
-	/* cope with ancient glibc lacking epoll_create1 (e.g., RHEL5) */
-	set->epoll_fd = epoll_create(nevents);
-	if (set->epoll_fd < 0)
-	{
-		ReleaseExternalFD();
-		elog(ERROR, "epoll_create failed: %m");
-	}
-	if (fcntl(set->epoll_fd, F_SETFD, FD_CLOEXEC) == -1)
-	{
-		int			save_errno = errno;
-
-		close(set->epoll_fd);
-		ReleaseExternalFD();
-		errno = save_errno;
-		elog(ERROR, "fcntl(F_SETFD) failed on epoll descriptor: %m");
-	}
-#endif							/* EPOLL_CLOEXEC */
 #elif defined(WAIT_USE_KQUEUE)
 	if (!AcquireExternalFD())
 	{
@@ -688,13 +866,19 @@ CreateWaitEventSet(MemoryContext context, int nevents)
  *
  * Note: preferably, this shouldn't have to free any resources that could be
  * inherited across an exec().  If it did, we'd likely leak those resources in
- * many scenarios.  For the epoll case, we ensure that by setting FD_CLOEXEC
+ * many scenarios.  For the epoll case, we ensure that by setting EPOLL_CLOEXEC
  * when the FD is created.  For the Windows case, we assume that the handles
  * involved are non-inheritable.
  */
 void
 FreeWaitEventSet(WaitEventSet *set)
 {
+	if (set->owner)
+	{
+		ResourceOwnerForgetWaitEventSet(set->owner, set);
+		set->owner = NULL;
+	}
+
 #if defined(WAIT_USE_EPOLL)
 	close(set->epoll_fd);
 	ReleaseExternalFD();
@@ -702,9 +886,7 @@ FreeWaitEventSet(WaitEventSet *set)
 	close(set->kqueue_fd);
 	ReleaseExternalFD();
 #elif defined(WAIT_USE_WIN32)
-	WaitEvent  *cur_event;
-
-	for (cur_event = set->events;
+	for (WaitEvent *cur_event = set->events;
 		 cur_event < (set->events + set->nevents);
 		 cur_event++)
 	{
@@ -728,6 +910,23 @@ FreeWaitEventSet(WaitEventSet *set)
 	pfree(set);
 }
 
+/*
+ * Free a previously created WaitEventSet in a child process after a fork().
+ */
+void
+FreeWaitEventSetAfterFork(WaitEventSet *set)
+{
+#if defined(WAIT_USE_EPOLL)
+	close(set->epoll_fd);
+	ReleaseExternalFD();
+#elif defined(WAIT_USE_KQUEUE)
+	/* kqueues are not normally inherited by child processes */
+	ReleaseExternalFD();
+#endif
+
+	pfree(set);
+}
+
 /* ---
  * Add an event to the set. Possible events are:
  * - WL_LATCH_SET: Wait for the latch to be set
@@ -739,6 +938,10 @@ FreeWaitEventSet(WaitEventSet *set)
  * - WL_SOCKET_CONNECTED: Wait for socket connection to be established,
  *	 can be combined with other WL_SOCKET_* events (on non-Windows
  *	 platforms, this is the same as WL_SOCKET_WRITEABLE)
+ * - WL_SOCKET_ACCEPT: Wait for new connection to a server socket,
+ *	 can be combined with other WL_SOCKET_* events (on non-Windows
+ *	 platforms, this is the same as WL_SOCKET_READABLE)
+ * - WL_SOCKET_CLOSED: Wait for socket to be closed by remote peer.
  * - WL_EXIT_ON_PM_DEATH: Exit immediately if the postmaster dies
  *
  * Returns the offset in WaitEventSet->events (starting from 0), which can be
@@ -748,7 +951,7 @@ FreeWaitEventSet(WaitEventSet *set)
  * i.e. it must be a process-local latch initialized with InitLatch, or a
  * shared latch associated with the current process by calling OwnLatch.
  *
- * In the WL_SOCKET_READABLE/WRITEABLE/CONNECTED cases, EOF and error
+ * In the WL_SOCKET_READABLE/WRITEABLE/CONNECTED/ACCEPT cases, EOF and error
  * conditions cause the socket to be reported as readable/writable/connected,
  * so that the caller can deal with the condition.
  *
@@ -803,8 +1006,15 @@ AddWaitEventToSet(WaitEventSet *set, uint32 events, pgsocket fd, Latch *latch,
 	{
 		set->latch = latch;
 		set->latch_pos = event->pos;
-#ifndef WIN32
+#if defined(WAIT_USE_SELF_PIPE)
 		event->fd = selfpipe_readfd;
+#elif defined(WAIT_USE_SIGNALFD)
+		event->fd = signal_fd;
+#else
+		event->fd = PGINVALID_SOCKET;
+#ifdef WAIT_USE_EPOLL
+		return event->pos;
+#endif
 #endif
 	}
 	else if (events == WL_POSTMASTER_DEATH)
@@ -830,7 +1040,8 @@ AddWaitEventToSet(WaitEventSet *set, uint32 events, pgsocket fd, Latch *latch,
 
 /*
  * Change the event mask and, in the WL_LATCH_SET case, the latch associated
- * with the WaitEvent.
+ * with the WaitEvent.  The latch may be changed to NULL to disable the latch
+ * temporarily, and then set back to a latch later.
  *
  * 'pos' is the id returned by AddWaitEventToSet.
  */
@@ -862,7 +1073,6 @@ ModifyWaitEvent(WaitEventSet *set, int pos, uint32 events, Latch *latch)
 	if (event->events & WL_LATCH_SET &&
 		events != event->events)
 	{
-		/* we could allow to disable latch events for a while */
 		elog(ERROR, "cannot modify latch event");
 	}
 
@@ -876,7 +1086,23 @@ ModifyWaitEvent(WaitEventSet *set, int pos, uint32 events, Latch *latch)
 
 	if (events == WL_LATCH_SET)
 	{
+		if (latch && latch->owner_pid != MyProcPid)
+			elog(ERROR, "cannot wait on a latch owned by another process");
 		set->latch = latch;
+
+		/*
+		 * On Unix, we don't need to modify the kernel object because the
+		 * underlying pipe (if there is one) is the same for all latches so we
+		 * can return immediately.  On Windows, we need to update our array of
+		 * handles, but we leave the old one in place and tolerate spurious
+		 * wakeups if the latch is disabled.
+		 */
+#if defined(WAIT_USE_WIN32)
+		if (!latch)
+			return;
+#else
+		return;
+#endif
 	}
 
 #if defined(WAIT_USE_EPOLL)
@@ -918,12 +1144,16 @@ WaitEventAdjustEpoll(WaitEventSet *set, WaitEvent *event, int action)
 	else
 	{
 		Assert(event->fd != PGINVALID_SOCKET);
-		Assert(event->events & (WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE));
+		Assert(event->events & (WL_SOCKET_READABLE |
+								WL_SOCKET_WRITEABLE |
+								WL_SOCKET_CLOSED));
 
 		if (event->events & WL_SOCKET_READABLE)
 			epoll_ev.events |= EPOLLIN;
 		if (event->events & WL_SOCKET_WRITEABLE)
 			epoll_ev.events |= EPOLLOUT;
+		if (event->events & WL_SOCKET_CLOSED)
+			epoll_ev.events |= EPOLLRDHUP;
 	}
 
 	/*
@@ -936,9 +1166,8 @@ WaitEventAdjustEpoll(WaitEventSet *set, WaitEvent *event, int action)
 	if (rc < 0)
 		ereport(ERROR,
 				(errcode_for_socket_access(),
-		/* translator: %s is a syscall name, such as "poll()" */
-				 errmsg("%s failed: %m",
-						"epoll_ctl()")));
+				 errmsg("%s() failed: %m",
+						"epoll_ctl")));
 }
 #endif
 
@@ -963,12 +1192,18 @@ WaitEventAdjustPoll(WaitEventSet *set, WaitEvent *event)
 	}
 	else
 	{
-		Assert(event->events & (WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE));
+		Assert(event->events & (WL_SOCKET_READABLE |
+								WL_SOCKET_WRITEABLE |
+								WL_SOCKET_CLOSED));
 		pollfd->events = 0;
 		if (event->events & WL_SOCKET_READABLE)
 			pollfd->events |= POLLIN;
 		if (event->events & WL_SOCKET_WRITEABLE)
 			pollfd->events |= POLLOUT;
+#ifdef POLLRDHUP
+		if (event->events & WL_SOCKET_CLOSED)
+			pollfd->events |= POLLRDHUP;
+#endif
 	}
 
 	Assert(event->fd != PGINVALID_SOCKET);
@@ -1009,6 +1244,18 @@ WaitEventAdjustKqueueAddPostmaster(struct kevent *k_ev, WaitEvent *event)
 	AccessWaitEvent(k_ev) = event;
 }
 
+static inline void
+WaitEventAdjustKqueueAddLatch(struct kevent *k_ev, WaitEvent *event)
+{
+	/* For now latch can only be added, not removed. */
+	k_ev->ident = SIGURG;
+	k_ev->filter = EVFILT_SIGNAL;
+	k_ev->flags = EV_ADD;
+	k_ev->fflags = 0;
+	k_ev->data = 0;
+	AccessWaitEvent(k_ev) = event;
+}
+
 /*
  * old_events is the previous event mask, used to compute what has changed.
  */
@@ -1029,7 +1276,9 @@ WaitEventAdjustKqueue(WaitEventSet *set, WaitEvent *event, int old_events)
 	Assert(event->events != WL_LATCH_SET || set->latch != NULL);
 	Assert(event->events == WL_LATCH_SET ||
 		   event->events == WL_POSTMASTER_DEATH ||
-		   (event->events & (WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE)));
+		   (event->events & (WL_SOCKET_READABLE |
+							 WL_SOCKET_WRITEABLE |
+							 WL_SOCKET_CLOSED)));
 
 	if (event->events == WL_POSTMASTER_DEATH)
 	{
@@ -1040,6 +1289,11 @@ WaitEventAdjustKqueue(WaitEventSet *set, WaitEvent *event, int old_events)
 		 */
 		WaitEventAdjustKqueueAddPostmaster(&k_ev[count++], event);
 	}
+	else if (event->events == WL_LATCH_SET)
+	{
+		/* We detect latch wakeup using a signal event. */
+		WaitEventAdjustKqueueAddLatch(&k_ev[count++], event);
+	}
 	else
 	{
 		/*
@@ -1047,11 +1301,9 @@ WaitEventAdjustKqueue(WaitEventSet *set, WaitEvent *event, int old_events)
 		 * old event mask to the new event mask, since kevent treats readable
 		 * and writable as separate events.
 		 */
-		if (old_events == WL_LATCH_SET ||
-			(old_events & WL_SOCKET_READABLE))
+		if (old_events & (WL_SOCKET_READABLE | WL_SOCKET_CLOSED))
 			old_filt_read = true;
-		if (event->events == WL_LATCH_SET ||
-			(event->events & WL_SOCKET_READABLE))
+		if (event->events & (WL_SOCKET_READABLE | WL_SOCKET_CLOSED))
 			new_filt_read = true;
 		if (old_events & WL_SOCKET_WRITEABLE)
 			old_filt_write = true;
@@ -1071,7 +1323,10 @@ WaitEventAdjustKqueue(WaitEventSet *set, WaitEvent *event, int old_events)
 									 event);
 	}
 
-	Assert(count > 0);
+	/* For WL_SOCKET_READ -> WL_SOCKET_CLOSED, no change needed. */
+	if (count == 0)
+		return;
+
 	Assert(count <= 2);
 
 	rc = kevent(set->kqueue_fd, &k_ev[0], count, NULL, 0, NULL);
@@ -1085,14 +1340,14 @@ WaitEventAdjustKqueue(WaitEventSet *set, WaitEvent *event, int old_events)
 
 	if (rc < 0)
 	{
-		if (event->events == WL_POSTMASTER_DEATH && errno == ESRCH)
+		if (event->events == WL_POSTMASTER_DEATH &&
+			(errno == ESRCH || errno == EACCES))
 			set->report_postmaster_not_running = true;
 		else
 			ereport(ERROR,
 					(errcode_for_socket_access(),
-			/* translator: %s is a syscall name, such as "poll()" */
-					 errmsg("%s failed: %m",
-							"kevent()")));
+					 errmsg("%s() failed: %m",
+							"kevent")));
 	}
 	else if (event->events == WL_POSTMASTER_DEATH &&
 			 PostmasterPid != getppid() &&
@@ -1134,16 +1389,18 @@ WaitEventAdjustWin32(WaitEventSet *set, WaitEvent *event)
 			flags |= FD_WRITE;
 		if (event->events & WL_SOCKET_CONNECTED)
 			flags |= FD_CONNECT;
+		if (event->events & WL_SOCKET_ACCEPT)
+			flags |= FD_ACCEPT;
 
 		if (*handle == WSA_INVALID_EVENT)
 		{
 			*handle = WSACreateEvent();
 			if (*handle == WSA_INVALID_EVENT)
-				elog(ERROR, "failed to create event for socket: error code %u",
+				elog(ERROR, "failed to create event for socket: error code %d",
 					 WSAGetLastError());
 		}
 		if (WSAEventSelect(event->fd, *handle, flags) != 0)
-			elog(ERROR, "failed to set up event for socket: error code %u",
+			elog(ERROR, "failed to set up event for socket: error code %d",
 				 WSAGetLastError());
 
 		Assert(event->fd != PGINVALID_SOCKET);
@@ -1185,6 +1442,8 @@ WaitEventSetWait(WaitEventSet *set, long timeout,
 		Assert(timeout >= 0 && timeout <= INT_MAX);
 		cur_timeout = timeout;
 	}
+	else
+		INSTR_TIME_SET_ZERO(start_time);
 
 	pgstat_report_wait_start(wait_event_info);
 
@@ -1214,7 +1473,7 @@ WaitEventSetWait(WaitEventSet *set, long timeout,
 		 * the pipe-buffer fill up we're still ok, because the pipe is in
 		 * nonblocking mode. It's unlikely for that to happen, because the
 		 * self pipe isn't filled unless we're blocking (waiting = true), or
-		 * from inside a signal handler in latch_sigusr1_handler().
+		 * from inside a signal handler in latch_sigurg_handler().
 		 *
 		 * On windows, we'll also notice if there's a pending event for the
 		 * latch when blocking, but there's no danger of anything filling up,
@@ -1225,6 +1484,14 @@ WaitEventSetWait(WaitEventSet *set, long timeout,
 		 * ordering, so that we cannot miss seeing is_set if a notification
 		 * has already been queued.
 		 */
+		if (set->latch && !set->latch->is_set)
+		{
+			/* about to sleep on a latch */
+			set->latch->maybe_sleeping = true;
+			pg_memory_barrier();
+			/* and recheck */
+		}
+
 		if (set->latch && set->latch->is_set)
 		{
 			occurred_events->fd = PGINVALID_SOCKET;
@@ -1234,6 +1501,9 @@ WaitEventSetWait(WaitEventSet *set, long timeout,
 			occurred_events->events = WL_LATCH_SET;
 			occurred_events++;
 			returned_events++;
+
+			/* could have been set above */
+			set->latch->maybe_sleeping = false;
 
 			break;
 		}
@@ -1245,6 +1515,12 @@ WaitEventSetWait(WaitEventSet *set, long timeout,
 		 */
 		rc = WaitEventSetWaitBlock(set, cur_timeout,
 								   occurred_events, nevents);
+
+		if (set->latch)
+		{
+			Assert(set->latch->maybe_sleeping);
+			set->latch->maybe_sleeping = false;
+		}
 
 		if (rc == -1)
 			break;				/* timeout occurred */
@@ -1292,7 +1568,7 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 
 	/* Sleep */
 	rc = epoll_wait(set->epoll_fd, set->epoll_ret_events,
-					nevents, cur_timeout);
+					Min(nevents, set->nevents_space), cur_timeout);
 
 	/* Check return code */
 	if (rc < 0)
@@ -1303,9 +1579,8 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 			waiting = false;
 			ereport(ERROR,
 					(errcode_for_socket_access(),
-			/* translator: %s is a syscall name, such as "poll()" */
-					 errmsg("%s failed: %m",
-							"epoll_wait()")));
+					 errmsg("%s() failed: %m",
+							"epoll_wait")));
 		}
 		return 0;
 	}
@@ -1335,10 +1610,10 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 		if (cur_event->events == WL_LATCH_SET &&
 			cur_epoll_event->events & (EPOLLIN | EPOLLERR | EPOLLHUP))
 		{
-			/* There's data in the self-pipe, clear it. */
-			drainSelfPipe();
+			/* Drain the signalfd. */
+			drain();
 
-			if (set->latch->is_set)
+			if (set->latch && set->latch->is_set)
 			{
 				occurred_events->fd = PGINVALID_SOCKET;
 				occurred_events->events = WL_LATCH_SET;
@@ -1370,7 +1645,9 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 				returned_events++;
 			}
 		}
-		else if (cur_event->events & (WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE))
+		else if (cur_event->events & (WL_SOCKET_READABLE |
+									  WL_SOCKET_WRITEABLE |
+									  WL_SOCKET_CLOSED))
 		{
 			Assert(cur_event->fd != PGINVALID_SOCKET);
 
@@ -1386,6 +1663,13 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 			{
 				/* writable, or EOF */
 				occurred_events->events |= WL_SOCKET_WRITEABLE;
+			}
+
+			if ((cur_event->events & WL_SOCKET_CLOSED) &&
+				(cur_epoll_event->events & (EPOLLRDHUP | EPOLLERR | EPOLLHUP)))
+			{
+				/* remote peer shut down, or error */
+				occurred_events->events |= WL_SOCKET_CLOSED;
 			}
 
 			if (occurred_events->events != 0)
@@ -1429,7 +1713,10 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 		timeout_p = &timeout;
 	}
 
-	/* Report events discovered by WaitEventAdjustKqueue(). */
+	/*
+	 * Report postmaster events discovered by WaitEventAdjustKqueue() or an
+	 * earlier call to WaitEventSetWait().
+	 */
 	if (unlikely(set->report_postmaster_not_running))
 	{
 		if (set->exit_on_postmaster_death)
@@ -1441,7 +1728,8 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 
 	/* Sleep */
 	rc = kevent(set->kqueue_fd, NULL, 0,
-				set->kqueue_ret_events, nevents,
+				set->kqueue_ret_events,
+				Min(nevents, set->nevents_space),
 				timeout_p);
 
 	/* Check return code */
@@ -1453,9 +1741,8 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 			waiting = false;
 			ereport(ERROR,
 					(errcode_for_socket_access(),
-			/* translator: %s is a syscall name, such as "poll()" */
-					 errmsg("%s failed: %m",
-							"kevent()")));
+					 errmsg("%s() failed: %m",
+							"kevent")));
 		}
 		return 0;
 	}
@@ -1483,12 +1770,9 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 		occurred_events->events = 0;
 
 		if (cur_event->events == WL_LATCH_SET &&
-			cur_kqueue_event->filter == EVFILT_READ)
+			cur_kqueue_event->filter == EVFILT_SIGNAL)
 		{
-			/* There's data in the self-pipe, clear it. */
-			drainSelfPipe();
-
-			if (set->latch->is_set)
+			if (set->latch && set->latch->is_set)
 			{
 				occurred_events->fd = PGINVALID_SOCKET;
 				occurred_events->events = WL_LATCH_SET;
@@ -1500,6 +1784,13 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 				 cur_kqueue_event->filter == EVFILT_PROC &&
 				 (cur_kqueue_event->fflags & NOTE_EXIT) != 0)
 		{
+			/*
+			 * The kernel will tell this kqueue object only once about the
+			 * exit of the postmaster, so let's remember that for next time so
+			 * that we provide level-triggered semantics.
+			 */
+			set->report_postmaster_not_running = true;
+
 			if (set->exit_on_postmaster_death)
 				proc_exit(1);
 			occurred_events->fd = PGINVALID_SOCKET;
@@ -1507,7 +1798,9 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 			occurred_events++;
 			returned_events++;
 		}
-		else if (cur_event->events & (WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE))
+		else if (cur_event->events & (WL_SOCKET_READABLE |
+									  WL_SOCKET_WRITEABLE |
+									  WL_SOCKET_CLOSED))
 		{
 			Assert(cur_event->fd >= 0);
 
@@ -1516,6 +1809,14 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 			{
 				/* readable, or EOF */
 				occurred_events->events |= WL_SOCKET_READABLE;
+			}
+
+			if ((cur_event->events & WL_SOCKET_CLOSED) &&
+				(cur_kqueue_event->filter == EVFILT_READ) &&
+				(cur_kqueue_event->flags & EV_EOF))
+			{
+				/* the remote peer has shut down */
+				occurred_events->events |= WL_SOCKET_CLOSED;
 			}
 
 			if ((cur_event->events & WL_SOCKET_WRITEABLE) &&
@@ -1566,9 +1867,8 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 			waiting = false;
 			ereport(ERROR,
 					(errcode_for_socket_access(),
-			/* translator: %s is a syscall name, such as "poll()" */
-					 errmsg("%s failed: %m",
-							"poll()")));
+					 errmsg("%s() failed: %m",
+							"poll")));
 		}
 		return 0;
 	}
@@ -1595,9 +1895,9 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 			(cur_pollfd->revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)))
 		{
 			/* There's data in the self-pipe, clear it. */
-			drainSelfPipe();
+			drain();
 
-			if (set->latch->is_set)
+			if (set->latch && set->latch->is_set)
 			{
 				occurred_events->fd = PGINVALID_SOCKET;
 				occurred_events->events = WL_LATCH_SET;
@@ -1629,7 +1929,9 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 				returned_events++;
 			}
 		}
-		else if (cur_event->events & (WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE))
+		else if (cur_event->events & (WL_SOCKET_READABLE |
+									  WL_SOCKET_WRITEABLE |
+									  WL_SOCKET_CLOSED))
 		{
 			int			errflags = POLLHUP | POLLERR | POLLNVAL;
 
@@ -1649,6 +1951,15 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 				occurred_events->events |= WL_SOCKET_WRITEABLE;
 			}
 
+#ifdef POLLRDHUP
+			if ((cur_event->events & WL_SOCKET_CLOSED) &&
+				(cur_pollfd->revents & (POLLRDHUP | errflags)))
+			{
+				/* remote peer closed, or error */
+				occurred_events->events |= WL_SOCKET_CLOSED;
+			}
+#endif
+
 			if (occurred_events->events != 0)
 			{
 				occurred_events->fd = cur_event->fd;
@@ -1663,14 +1974,11 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 #elif defined(WAIT_USE_WIN32)
 
 /*
- * Wait using Windows' WaitForMultipleObjects().
+ * Wait using Windows' WaitForMultipleObjects().  Each call only "consumes" one
+ * event, so we keep calling until we've filled up our output buffer to match
+ * the behavior of the other implementations.
  *
- * Unfortunately this will only ever return a single readiness notification at
- * a time.  Note that while the official documentation for
- * WaitForMultipleObjects is ambiguous about multiple events being "consumed"
- * with a single bWaitAll = FALSE call,
- * https://blogs.msdn.microsoft.com/oldnewthing/20150409-00/?p=44273 confirms
- * that only one event is "consumed".
+ * https://blogs.msdn.microsoft.com/oldnewthing/20150409-00/?p=44273
  */
 static inline int
 WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
@@ -1755,96 +2063,145 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 	 */
 	cur_event = (WaitEvent *) &set->events[rc - WAIT_OBJECT_0 - 1];
 
-	occurred_events->pos = cur_event->pos;
-	occurred_events->user_data = cur_event->user_data;
-	occurred_events->events = 0;
-
-	if (cur_event->events == WL_LATCH_SET)
+	for (;;)
 	{
-		if (!ResetEvent(set->latch->event))
-			elog(ERROR, "ResetEvent failed: error code %lu", GetLastError());
+		int			next_pos;
+		int			count;
 
-		if (set->latch->is_set)
+		occurred_events->pos = cur_event->pos;
+		occurred_events->user_data = cur_event->user_data;
+		occurred_events->events = 0;
+
+		if (cur_event->events == WL_LATCH_SET)
 		{
-			occurred_events->fd = PGINVALID_SOCKET;
-			occurred_events->events = WL_LATCH_SET;
-			occurred_events++;
-			returned_events++;
-		}
-	}
-	else if (cur_event->events == WL_POSTMASTER_DEATH)
-	{
-		/*
-		 * Postmaster apparently died.  Since the consequences of falsely
-		 * returning WL_POSTMASTER_DEATH could be pretty unpleasant, we take
-		 * the trouble to positively verify this with PostmasterIsAlive(),
-		 * even though there is no known reason to think that the event could
-		 * be falsely set on Windows.
-		 */
-		if (!PostmasterIsAliveInternal())
-		{
-			if (set->exit_on_postmaster_death)
-				proc_exit(1);
-			occurred_events->fd = PGINVALID_SOCKET;
-			occurred_events->events = WL_POSTMASTER_DEATH;
-			occurred_events++;
-			returned_events++;
-		}
-	}
-	else if (cur_event->events & WL_SOCKET_MASK)
-	{
-		WSANETWORKEVENTS resEvents;
-		HANDLE		handle = set->handles[cur_event->pos + 1];
-
-		Assert(cur_event->fd);
-
-		occurred_events->fd = cur_event->fd;
-
-		ZeroMemory(&resEvents, sizeof(resEvents));
-		if (WSAEnumNetworkEvents(cur_event->fd, handle, &resEvents) != 0)
-			elog(ERROR, "failed to enumerate network events: error code %u",
-				 WSAGetLastError());
-		if ((cur_event->events & WL_SOCKET_READABLE) &&
-			(resEvents.lNetworkEvents & FD_READ))
-		{
-			/* data available in socket */
-			occurred_events->events |= WL_SOCKET_READABLE;
-
-			/*------
-			 * WaitForMultipleObjects doesn't guarantee that a read event will
-			 * be returned if the latch is set at the same time.  Even if it
-			 * did, the caller might drop that event expecting it to reoccur
-			 * on next call.  So, we must force the event to be reset if this
-			 * WaitEventSet is used again in order to avoid an indefinite
-			 * hang.  Refer https://msdn.microsoft.com/en-us/library/windows/desktop/ms741576(v=vs.85).aspx
-			 * for the behavior of socket events.
-			 *------
+			/*
+			 * We cannot use set->latch->event to reset the fired event if we
+			 * aren't waiting on this latch now.
 			 */
-			cur_event->reset = true;
+			if (!ResetEvent(set->handles[cur_event->pos + 1]))
+				elog(ERROR, "ResetEvent failed: error code %lu", GetLastError());
+
+			if (set->latch && set->latch->is_set)
+			{
+				occurred_events->fd = PGINVALID_SOCKET;
+				occurred_events->events = WL_LATCH_SET;
+				occurred_events++;
+				returned_events++;
+			}
 		}
-		if ((cur_event->events & WL_SOCKET_WRITEABLE) &&
-			(resEvents.lNetworkEvents & FD_WRITE))
+		else if (cur_event->events == WL_POSTMASTER_DEATH)
 		{
-			/* writeable */
-			occurred_events->events |= WL_SOCKET_WRITEABLE;
+			/*
+			 * Postmaster apparently died.  Since the consequences of falsely
+			 * returning WL_POSTMASTER_DEATH could be pretty unpleasant, we
+			 * take the trouble to positively verify this with
+			 * PostmasterIsAlive(), even though there is no known reason to
+			 * think that the event could be falsely set on Windows.
+			 */
+			if (!PostmasterIsAliveInternal())
+			{
+				if (set->exit_on_postmaster_death)
+					proc_exit(1);
+				occurred_events->fd = PGINVALID_SOCKET;
+				occurred_events->events = WL_POSTMASTER_DEATH;
+				occurred_events++;
+				returned_events++;
+			}
 		}
-		if ((cur_event->events & WL_SOCKET_CONNECTED) &&
-			(resEvents.lNetworkEvents & FD_CONNECT))
+		else if (cur_event->events & WL_SOCKET_MASK)
 		{
-			/* connected */
-			occurred_events->events |= WL_SOCKET_CONNECTED;
-		}
-		if (resEvents.lNetworkEvents & FD_CLOSE)
-		{
-			/* EOF/error, so signal all caller-requested socket flags */
-			occurred_events->events |= (cur_event->events & WL_SOCKET_MASK);
+			WSANETWORKEVENTS resEvents;
+			HANDLE		handle = set->handles[cur_event->pos + 1];
+
+			Assert(cur_event->fd);
+
+			occurred_events->fd = cur_event->fd;
+
+			ZeroMemory(&resEvents, sizeof(resEvents));
+			if (WSAEnumNetworkEvents(cur_event->fd, handle, &resEvents) != 0)
+				elog(ERROR, "failed to enumerate network events: error code %d",
+					 WSAGetLastError());
+			if ((cur_event->events & WL_SOCKET_READABLE) &&
+				(resEvents.lNetworkEvents & FD_READ))
+			{
+				/* data available in socket */
+				occurred_events->events |= WL_SOCKET_READABLE;
+
+				/*------
+				 * WaitForMultipleObjects doesn't guarantee that a read event
+				 * will be returned if the latch is set at the same time.  Even
+				 * if it did, the caller might drop that event expecting it to
+				 * reoccur on next call.  So, we must force the event to be
+				 * reset if this WaitEventSet is used again in order to avoid
+				 * an indefinite hang.
+				 *
+				 * Refer
+				 * https://msdn.microsoft.com/en-us/library/windows/desktop/ms741576(v=vs.85).aspx
+				 * for the behavior of socket events.
+				 *------
+				 */
+				cur_event->reset = true;
+			}
+			if ((cur_event->events & WL_SOCKET_WRITEABLE) &&
+				(resEvents.lNetworkEvents & FD_WRITE))
+			{
+				/* writeable */
+				occurred_events->events |= WL_SOCKET_WRITEABLE;
+			}
+			if ((cur_event->events & WL_SOCKET_CONNECTED) &&
+				(resEvents.lNetworkEvents & FD_CONNECT))
+			{
+				/* connected */
+				occurred_events->events |= WL_SOCKET_CONNECTED;
+			}
+			if ((cur_event->events & WL_SOCKET_ACCEPT) &&
+				(resEvents.lNetworkEvents & FD_ACCEPT))
+			{
+				/* incoming connection could be accepted */
+				occurred_events->events |= WL_SOCKET_ACCEPT;
+			}
+			if (resEvents.lNetworkEvents & FD_CLOSE)
+			{
+				/* EOF/error, so signal all caller-requested socket flags */
+				occurred_events->events |= (cur_event->events & WL_SOCKET_MASK);
+			}
+
+			if (occurred_events->events != 0)
+			{
+				occurred_events++;
+				returned_events++;
+			}
 		}
 
-		if (occurred_events->events != 0)
-		{
-			occurred_events++;
-			returned_events++;
-		}
+		/* Is the output buffer full? */
+		if (returned_events == nevents)
+			break;
+
+		/* Have we run out of possible events? */
+		next_pos = cur_event->pos + 1;
+		if (next_pos == set->nevents)
+			break;
+
+		/*
+		 * Poll the rest of the event handles in the array starting at
+		 * next_pos being careful to skip over the initial signal handle too.
+		 * This time we use a zero timeout.
+		 */
+		count = set->nevents - next_pos;
+		rc = WaitForMultipleObjects(count,
+									set->handles + 1 + next_pos,
+									false,
+									0);
+
+		/*
+		 * We don't distinguish between errors and WAIT_TIMEOUT here because
+		 * we already have events to report.
+		 */
+		if (rc < WAIT_OBJECT_0 || rc >= WAIT_OBJECT_0 + count)
+			break;
+
+		/* We have another event to decode. */
+		cur_event = &set->events[next_pos + (rc - WAIT_OBJECT_0)];
 	}
 
 	return returned_events;
@@ -1852,26 +2209,44 @@ WaitEventSetWaitBlock(WaitEventSet *set, int cur_timeout,
 #endif
 
 /*
- * SetLatch uses SIGUSR1 to wake up the process waiting on the latch.
- *
- * Wake up WaitLatch, if we're waiting.  (We might not be, since SIGUSR1 is
- * overloaded for multiple purposes; or we might not have reached WaitLatch
- * yet, in which case we don't need to fill the pipe either.)
- *
- * NB: when calling this in a signal handler, be sure to save and restore
- * errno around it.
+ * Return whether the current build options can report WL_SOCKET_CLOSED.
  */
-#ifndef WIN32
-void
-latch_sigusr1_handler(void)
+bool
+WaitEventSetCanReportClosed(void)
+{
+#if (defined(WAIT_USE_POLL) && defined(POLLRDHUP)) || \
+	defined(WAIT_USE_EPOLL) || \
+	defined(WAIT_USE_KQUEUE)
+	return true;
+#else
+	return false;
+#endif
+}
+
+/*
+ * Get the number of wait events registered in a given WaitEventSet.
+ */
+int
+GetNumRegisteredWaitEvents(WaitEventSet *set)
+{
+	return set->nevents;
+}
+
+#if defined(WAIT_USE_SELF_PIPE)
+
+/*
+ * SetLatch uses SIGURG to wake up the process waiting on the latch.
+ *
+ * Wake up WaitLatch, if we're waiting.
+ */
+static void
+latch_sigurg_handler(SIGNAL_ARGS)
 {
 	if (waiting)
 		sendSelfPipeByte();
 }
-#endif							/* !WIN32 */
 
 /* Send one byte to the self-pipe, to wake up WaitLatch */
-#ifndef WIN32
 static void
 sendSelfPipeByte(void)
 {
@@ -1901,45 +2276,58 @@ retry:
 		return;
 	}
 }
-#endif							/* !WIN32 */
+
+#endif
+
+#if defined(WAIT_USE_SELF_PIPE) || defined(WAIT_USE_SIGNALFD)
 
 /*
- * Read all available data from the self-pipe
+ * Read all available data from self-pipe or signalfd.
  *
  * Note: this is only called when waiting = true.  If it fails and doesn't
  * return, it must reset that flag first (though ideally, this will never
  * happen).
  */
-#ifndef WIN32
 static void
-drainSelfPipe(void)
+drain(void)
 {
-	/*
-	 * There shouldn't normally be more than one byte in the pipe, or maybe a
-	 * few bytes if multiple processes run SetLatch at the same instant.
-	 */
-	char		buf[16];
+	char		buf[1024];
 	int			rc;
+	int			fd;
+
+#ifdef WAIT_USE_SELF_PIPE
+	fd = selfpipe_readfd;
+#else
+	fd = signal_fd;
+#endif
 
 	for (;;)
 	{
-		rc = read(selfpipe_readfd, buf, sizeof(buf));
+		rc = read(fd, buf, sizeof(buf));
 		if (rc < 0)
 		{
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				break;			/* the pipe is empty */
+				break;			/* the descriptor is empty */
 			else if (errno == EINTR)
 				continue;		/* retry */
 			else
 			{
 				waiting = false;
+#ifdef WAIT_USE_SELF_PIPE
 				elog(ERROR, "read() on self-pipe failed: %m");
+#else
+				elog(ERROR, "read() on signalfd failed: %m");
+#endif
 			}
 		}
 		else if (rc == 0)
 		{
 			waiting = false;
+#ifdef WAIT_USE_SELF_PIPE
 			elog(ERROR, "unexpected EOF on self-pipe");
+#else
+			elog(ERROR, "unexpected EOF on signalfd");
+#endif
 		}
 		else if (rc < sizeof(buf))
 		{
@@ -1949,4 +2337,15 @@ drainSelfPipe(void)
 		/* else buffer wasn't big enough, so read again */
 	}
 }
-#endif							/* !WIN32 */
+
+#endif
+
+static void
+ResOwnerReleaseWaitEventSet(Datum res)
+{
+	WaitEventSet *set = (WaitEventSet *) DatumGetPointer(res);
+
+	Assert(set->owner != NULL);
+	set->owner = NULL;
+	FreeWaitEventSet(set);
+}

@@ -7,6 +7,11 @@ SELECT '"abc
 def"'::json;					-- ERROR, unescaped newline in string constant
 SELECT '"\n\"\\"'::json;		-- OK, legal escapes
 SELECT '"\v"'::json;			-- ERROR, not a valid JSON escape
+
+-- Check fast path for longer strings (at least 16 bytes long)
+SELECT ('"'||repeat('.', 12)||'abc"')::json; -- OK
+SELECT ('"'||repeat('.', 12)||'abc\n"')::json; -- OK, legal escapes
+
 -- see json_encoding test for input with unicode escapes
 
 -- Numbers.
@@ -58,6 +63,28 @@ SELECT 'truf'::json;			-- ERROR, not a keyword
 SELECT 'trues'::json;			-- ERROR, not a keyword
 SELECT ''::json;				-- ERROR, no value
 SELECT '    '::json;			-- ERROR, no value
+
+-- Multi-line JSON input to check ERROR reporting
+SELECT '{
+		"one": 1,
+		"two":"two",
+		"three":
+		true}'::json; -- OK
+SELECT '{
+		"one": 1,
+		"two":,"two",  -- ERROR extraneous comma before field "two"
+		"three":
+		true}'::json;
+SELECT '{
+		"one": 1,
+		"two":"two",
+		"averyveryveryveryveryveryveryveryveryverylongfieldname":}'::json;
+-- ERROR missing value for last field
+
+-- test non-error-throwing input
+select pg_input_is_valid('{"a":true}', 'json');
+select pg_input_is_valid('{"a":true', 'json');
+select * from pg_input_error_info('{"a":true', 'json');
 
 --constructors
 -- array_to_json

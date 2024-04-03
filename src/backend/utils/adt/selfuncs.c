@@ -10,7 +10,7 @@
  *	  Index cost functions are located via the index AM's API struct,
  *	  which is obtained from the handler function registered in pg_am.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -119,10 +119,12 @@
 #include "optimizer/paths.h"
 #include "optimizer/plancat.h"
 #include "parser/parse_clause.h"
+#include "parser/parse_relation.h"
 #include "parser/parsetree.h"
 #include "statistics/statistics.h"
 #include "storage/bufmgr.h"
 #include "utils/acl.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datum.h"
@@ -139,6 +141,7 @@
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
 
+#define DEFAULT_PAGE_CPU_MULTIPLIER 50.0
 
 /* Hooks for plugins to get control when we ask for stats */
 get_relation_stats_hook_type get_relation_stats_hook = NULL;
@@ -289,7 +292,7 @@ eqsel_internal(PG_FUNCTION_ARGS, bool negate)
  * This is exported so that some other estimation functions can use it.
  */
 double
-var_eq_const(VariableStatData *vardata, Oid operator, Oid collation,
+var_eq_const(VariableStatData *vardata, Oid oproid, Oid collation,
 			 Datum constval, bool constisnull,
 			 bool varonleft, bool negate)
 {
@@ -330,7 +333,7 @@ var_eq_const(VariableStatData *vardata, Oid operator, Oid collation,
 	}
 	else if (HeapTupleIsValid(vardata->statsTuple) &&
 			 statistic_proc_security_check(vardata,
-										   (opfuncoid = get_opcode(operator))))
+										   (opfuncoid = get_opcode(oproid))))
 	{
 		AttStatsSlot sslot;
 		bool		match = false;
@@ -460,7 +463,7 @@ var_eq_const(VariableStatData *vardata, Oid operator, Oid collation,
  * This is exported so that some other estimation functions can use it.
  */
 double
-var_eq_non_const(VariableStatData *vardata, Oid operator, Oid collation,
+var_eq_non_const(VariableStatData *vardata, Oid oproid, Oid collation,
 				 Node *other,
 				 bool varonleft, bool negate)
 {
@@ -645,7 +648,7 @@ scalarineqsel(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
 
 			/*
 			 * The calculation so far gave us a selectivity for the "<=" case.
-			 * We'll have one less tuple for "<" and one additional tuple for
+			 * We'll have one fewer tuple for "<" and one additional tuple for
 			 * ">=", the latter of which we'll reverse the selectivity for
 			 * below, so we can simply subtract one tuple for both cases.  The
 			 * cases that need this adjustment can be identified by iseq being
@@ -2126,10 +2129,11 @@ scalararraysel(PlannerInfo *root,
 /*
  * Estimate number of elements in the array yielded by an expression.
  *
- * It's important that this agree with scalararraysel.
+ * Note: the result is integral, but we use "double" to avoid overflow
+ * concerns.  Most callers will use it in double-type expressions anyway.
  */
-int
-estimate_array_length(Node *arrayexpr)
+double
+estimate_array_length(PlannerInfo *root, Node *arrayexpr)
 {
 	/* look through any binary-compatible relabeling of arrayexpr */
 	arrayexpr = strip_array_coercion(arrayexpr);
@@ -2150,11 +2154,39 @@ estimate_array_length(Node *arrayexpr)
 	{
 		return list_length(((ArrayExpr *) arrayexpr)->elements);
 	}
-	else
+	else if (arrayexpr)
 	{
-		/* default guess --- see also scalararraysel */
-		return 10;
+		/* See if we can find any statistics about it */
+		VariableStatData vardata;
+		AttStatsSlot sslot;
+		double		nelem = 0;
+
+		examine_variable(root, arrayexpr, 0, &vardata);
+		if (HeapTupleIsValid(vardata.statsTuple))
+		{
+			/*
+			 * Found stats, so use the average element count, which is stored
+			 * in the last stanumbers element of the DECHIST statistics.
+			 * Actually that is the average count of *distinct* elements;
+			 * perhaps we should scale it up somewhat?
+			 */
+			if (get_attstatsslot(&sslot, vardata.statsTuple,
+								 STATISTIC_KIND_DECHIST, InvalidOid,
+								 ATTSTATSSLOT_NUMBERS))
+			{
+				if (sslot.nnumbers > 0)
+					nelem = clamp_row_est(sslot.numbers[sslot.nnumbers - 1]);
+				free_attstatsslot(&sslot);
+			}
+		}
+		ReleaseVariableStats(vardata);
+
+		if (nelem > 0)
+			return nelem;
 	}
+
+	/* Else use a default guess --- this should match scalararraysel */
+	return 10;
 }
 
 /*
@@ -2204,9 +2236,9 @@ rowcomparesel(PlannerInfo *root,
 	else
 	{
 		/*
-		 * Otherwise, it's a join if there's more than one relation used.
+		 * Otherwise, it's a join if there's more than one base relation used.
 		 */
-		is_join_clause = (NumRelids((Node *) opargs) > 1);
+		is_join_clause = (NumRelids(root, (Node *) opargs) > 1);
 	}
 
 	if (is_join_clause)
@@ -2260,6 +2292,7 @@ eqjoinsel(PG_FUNCTION_ARGS)
 	Form_pg_statistic stats2 = NULL;
 	bool		have_mcvs1 = false;
 	bool		have_mcvs2 = false;
+	bool		get_mcv_stats;
 	bool		join_is_reversed;
 	RelOptInfo *inner_rel;
 
@@ -2274,11 +2307,25 @@ eqjoinsel(PG_FUNCTION_ARGS)
 	memset(&sslot1, 0, sizeof(sslot1));
 	memset(&sslot2, 0, sizeof(sslot2));
 
+	/*
+	 * There is no use in fetching one side's MCVs if we lack MCVs for the
+	 * other side, so do a quick check to verify that both stats exist.
+	 */
+	get_mcv_stats = (HeapTupleIsValid(vardata1.statsTuple) &&
+					 HeapTupleIsValid(vardata2.statsTuple) &&
+					 get_attstatsslot(&sslot1, vardata1.statsTuple,
+									  STATISTIC_KIND_MCV, InvalidOid,
+									  0) &&
+					 get_attstatsslot(&sslot2, vardata2.statsTuple,
+									  STATISTIC_KIND_MCV, InvalidOid,
+									  0));
+
 	if (HeapTupleIsValid(vardata1.statsTuple))
 	{
 		/* note we allow use of nullfrac regardless of security check */
 		stats1 = (Form_pg_statistic) GETSTRUCT(vardata1.statsTuple);
-		if (statistic_proc_security_check(&vardata1, opfuncoid))
+		if (get_mcv_stats &&
+			statistic_proc_security_check(&vardata1, opfuncoid))
 			have_mcvs1 = get_attstatsslot(&sslot1, vardata1.statsTuple,
 										  STATISTIC_KIND_MCV, InvalidOid,
 										  ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS);
@@ -2288,7 +2335,8 @@ eqjoinsel(PG_FUNCTION_ARGS)
 	{
 		/* note we allow use of nullfrac regardless of security check */
 		stats2 = (Form_pg_statistic) GETSTRUCT(vardata2.statsTuple);
-		if (statistic_proc_security_check(&vardata2, opfuncoid))
+		if (get_mcv_stats &&
+			statistic_proc_security_check(&vardata2, opfuncoid))
 			have_mcvs2 = get_attstatsslot(&sslot2, vardata2.statsTuple,
 										  STATISTIC_KIND_MCV, InvalidOid,
 										  ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS);
@@ -2775,6 +2823,7 @@ neqjoinsel(PG_FUNCTION_ARGS)
 	List	   *args = (List *) PG_GETARG_POINTER(2);
 	JoinType	jointype = (JoinType) PG_GETARG_INT16(3);
 	SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) PG_GETARG_POINTER(4);
+	Oid			collation = PG_GET_COLLATION();
 	float8		result;
 
 	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI)
@@ -2821,12 +2870,14 @@ neqjoinsel(PG_FUNCTION_ARGS)
 
 		if (eqop)
 		{
-			result = DatumGetFloat8(DirectFunctionCall5(eqjoinsel,
-														PointerGetDatum(root),
-														ObjectIdGetDatum(eqop),
-														PointerGetDatum(args),
-														Int16GetDatum(jointype),
-														PointerGetDatum(sjinfo)));
+			result =
+				DatumGetFloat8(DirectFunctionCall5Coll(eqjoinsel,
+													   collation,
+													   PointerGetDatum(root),
+													   ObjectIdGetDatum(eqop),
+													   PointerGetDatum(args),
+													   Int16GetDatum(jointype),
+													   PointerGetDatum(sjinfo)));
 		}
 		else
 		{
@@ -3238,6 +3289,7 @@ typedef struct
 	Node	   *var;			/* might be an expression, not just a Var */
 	RelOptInfo *rel;			/* relation it belongs to */
 	double		ndistinct;		/* # distinct values */
+	bool		isdefault;		/* true if DEFAULT_NUM_DISTINCT was used */
 } GroupVarInfo;
 
 static List *
@@ -3284,6 +3336,7 @@ add_unique_group_var(PlannerInfo *root, List *varinfos,
 	varinfo->var = var;
 	varinfo->rel = vardata->rel;
 	varinfo->ndistinct = ndistinct;
+	varinfo->isdefault = isdefault;
 	varinfos = lappend(varinfos, varinfo);
 	return varinfos;
 }
@@ -3307,6 +3360,12 @@ add_unique_group_var(PlannerInfo *root, List *varinfos,
  *		filter step
  *	pgset - NULL, or a List** pointing to a grouping set to filter the
  *		groupExprs against
+ *
+ * Outputs:
+ *	estinfo - When passed as non-NULL, the function will set bits in the
+ *		"flags" field in order to provide callers with additional information
+ *		about the estimation.  Currently, we only set the SELFLAG_USED_DEFAULT
+ *		bit if we used any default values in the estimation.
  *
  * Given the lack of any cross-correlation statistics in the system, it's
  * impossible to do anything really trustworthy with GROUP BY conditions
@@ -3355,13 +3414,17 @@ add_unique_group_var(PlannerInfo *root, List *varinfos,
  */
 double
 estimate_num_groups(PlannerInfo *root, List *groupExprs, double input_rows,
-					List **pgset)
+					List **pgset, EstimationInfo *estinfo)
 {
 	List	   *varinfos = NIL;
 	double		srf_multiplier = 1.0;
 	double		numdistinct;
 	ListCell   *l;
 	int			i;
+
+	/* Zero the estinfo output parameter, if non-NULL */
+	if (estinfo != NULL)
+		memset(estinfo, 0, sizeof(EstimationInfo));
 
 	/*
 	 * We don't ever want to return an estimate of zero groups, as that tends
@@ -3376,7 +3439,7 @@ estimate_num_groups(PlannerInfo *root, List *groupExprs, double input_rows,
 	 * for normal cases with GROUP BY or DISTINCT, but it is possible for
 	 * corner cases with set operations.)
 	 */
-	if (groupExprs == NIL || (pgset && list_length(*pgset) < 1))
+	if (groupExprs == NIL || (pgset && *pgset == NIL))
 		return 1.0;
 
 	/*
@@ -3427,6 +3490,14 @@ estimate_num_groups(PlannerInfo *root, List *groupExprs, double input_rows,
 		 * If examine_variable is able to deduce anything about the GROUP BY
 		 * expression, treat it as a single variable even if it's really more
 		 * complicated.
+		 *
+		 * XXX This has the consequence that if there's a statistics object on
+		 * the expression, we don't split it into individual Vars. This
+		 * affects our selection of statistics in
+		 * estimate_multivariate_ndistinct, because it's probably better to
+		 * use more accurate estimate for each expression and treat them as
+		 * independent, than to combine estimates for the extracted variables
+		 * when we don't know how that relates to the expressions.
 		 */
 		examine_variable(root, groupexpr, 0, &vardata);
 		if (HeapTupleIsValid(vardata.statsTuple) || vardata.isunique)
@@ -3516,7 +3587,7 @@ estimate_num_groups(PlannerInfo *root, List *groupExprs, double input_rows,
 		 * for remaining Vars on other rels.
 		 */
 		relvarinfos = lappend(relvarinfos, varinfo1);
-		for_each_cell(l, varinfos, list_second_cell(varinfos))
+		for_each_from(l, varinfos, 1)
 		{
 			GroupVarInfo *varinfo2 = (GroupVarInfo *) lfirst(l);
 
@@ -3566,6 +3637,13 @@ estimate_num_groups(PlannerInfo *root, List *groupExprs, double input_rows,
 					if (relmaxndistinct < varinfo2->ndistinct)
 						relmaxndistinct = varinfo2->ndistinct;
 					relvarcount++;
+
+					/*
+					 * When varinfo2's isdefault is set then we'd better set
+					 * the SELFLAG_USED_DEFAULT bit in the EstimationInfo.
+					 */
+					if (estinfo != NULL && varinfo2->isdefault)
+						estinfo->flags |= SELFLAG_USED_DEFAULT;
 				}
 
 				/* we're done with this relation */
@@ -3836,12 +3914,14 @@ estimate_hash_bucket_stats(PlannerInfo *root, Node *hashkey, double nbuckets,
  * won't store them.  Is this a problem?
  */
 double
-estimate_hashagg_tablesize(Path *path, const AggClauseCosts *agg_costs,
-						   double dNumGroups)
+estimate_hashagg_tablesize(PlannerInfo *root, Path *path,
+						   const AggClauseCosts *agg_costs, double dNumGroups)
 {
-	Size		hashentrysize = hash_agg_entry_size(agg_costs->numAggs,
-													path->pathtarget->width,
-													agg_costs->transitionSpace);
+	Size		hashentrysize;
+
+	hashentrysize = hash_agg_entry_size(list_length(root->aggtransinfos),
+										path->pathtarget->width,
+										agg_costs->transitionSpace);
 
 	/*
 	 * Note that this disregards the effect of fill-factor and growth policy
@@ -3875,50 +3955,82 @@ estimate_multivariate_ndistinct(PlannerInfo *root, RelOptInfo *rel,
 								List **varinfos, double *ndistinct)
 {
 	ListCell   *lc;
-	Bitmapset  *attnums = NULL;
-	int			nmatches;
+	int			nmatches_vars;
+	int			nmatches_exprs;
 	Oid			statOid = InvalidOid;
 	MVNDistinct *stats;
-	Bitmapset  *matched = NULL;
+	StatisticExtInfo *matched_info = NULL;
+	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
 
 	/* bail out immediately if the table has no extended statistics */
 	if (!rel->statlist)
 		return false;
 
-	/* Determine the attnums we're looking for */
-	foreach(lc, *varinfos)
-	{
-		GroupVarInfo *varinfo = (GroupVarInfo *) lfirst(lc);
-		AttrNumber	attnum;
-
-		Assert(varinfo->rel == rel);
-
-		if (!IsA(varinfo->var, Var))
-			continue;
-
-		attnum = ((Var *) varinfo->var)->varattno;
-
-		if (!AttrNumberIsForUserDefinedAttr(attnum))
-			continue;
-
-		attnums = bms_add_member(attnums, attnum);
-	}
-
-	/* look for the ndistinct statistics matching the most vars */
-	nmatches = 1;				/* we require at least two matches */
+	/* look for the ndistinct statistics object matching the most vars */
+	nmatches_vars = 0;			/* we require at least two matches */
+	nmatches_exprs = 0;
 	foreach(lc, rel->statlist)
 	{
+		ListCell   *lc2;
 		StatisticExtInfo *info = (StatisticExtInfo *) lfirst(lc);
-		Bitmapset  *shared;
-		int			nshared;
+		int			nshared_vars = 0;
+		int			nshared_exprs = 0;
 
 		/* skip statistics of other kinds */
 		if (info->kind != STATS_EXT_NDISTINCT)
 			continue;
 
-		/* compute attnums shared by the vars and the statistics object */
-		shared = bms_intersect(info->keys, attnums);
-		nshared = bms_num_members(shared);
+		/* skip statistics with mismatching stxdinherit value */
+		if (info->inherit != rte->inh)
+			continue;
+
+		/*
+		 * Determine how many expressions (and variables in non-matched
+		 * expressions) match. We'll then use these numbers to pick the
+		 * statistics object that best matches the clauses.
+		 */
+		foreach(lc2, *varinfos)
+		{
+			ListCell   *lc3;
+			GroupVarInfo *varinfo = (GroupVarInfo *) lfirst(lc2);
+			AttrNumber	attnum;
+
+			Assert(varinfo->rel == rel);
+
+			/* simple Var, search in statistics keys directly */
+			if (IsA(varinfo->var, Var))
+			{
+				attnum = ((Var *) varinfo->var)->varattno;
+
+				/*
+				 * Ignore system attributes - we don't support statistics on
+				 * them, so can't match them (and it'd fail as the values are
+				 * negative).
+				 */
+				if (!AttrNumberIsForUserDefinedAttr(attnum))
+					continue;
+
+				if (bms_is_member(attnum, info->keys))
+					nshared_vars++;
+
+				continue;
+			}
+
+			/* expression - see if it's in the statistics object */
+			foreach(lc3, info->exprs)
+			{
+				Node	   *expr = (Node *) lfirst(lc3);
+
+				if (equal(varinfo->var, expr))
+				{
+					nshared_exprs++;
+					break;
+				}
+			}
+		}
+
+		if (nshared_vars + nshared_exprs < 2)
+			continue;
 
 		/*
 		 * Does this statistics object match more columns than the currently
@@ -3927,20 +4039,23 @@ estimate_multivariate_ndistinct(PlannerInfo *root, RelOptInfo *rel,
 		 * XXX This should break ties using name of the object, or something
 		 * like that, to make the outcome stable.
 		 */
-		if (nshared > nmatches)
+		if ((nshared_exprs > nmatches_exprs) ||
+			(((nshared_exprs == nmatches_exprs)) && (nshared_vars > nmatches_vars)))
 		{
 			statOid = info->statOid;
-			nmatches = nshared;
-			matched = shared;
+			nmatches_vars = nshared_vars;
+			nmatches_exprs = nshared_exprs;
+			matched_info = info;
 		}
 	}
 
 	/* No match? */
 	if (statOid == InvalidOid)
 		return false;
-	Assert(nmatches > 1 && matched != NULL);
 
-	stats = statext_ndistinct_load(statOid);
+	Assert(nmatches_vars + nmatches_exprs > 1);
+
+	stats = statext_ndistinct_load(statOid, rte->inh);
 
 	/*
 	 * If we have a match, search it for the specific item that matches (there
@@ -3951,20 +4066,135 @@ estimate_multivariate_ndistinct(PlannerInfo *root, RelOptInfo *rel,
 		int			i;
 		List	   *newlist = NIL;
 		MVNDistinctItem *item = NULL;
+		ListCell   *lc2;
+		Bitmapset  *matched = NULL;
+		AttrNumber	attnum_offset;
+
+		/*
+		 * How much we need to offset the attnums? If there are no
+		 * expressions, no offset is needed. Otherwise offset enough to move
+		 * the lowest one (which is equal to number of expressions) to 1.
+		 */
+		if (matched_info->exprs)
+			attnum_offset = (list_length(matched_info->exprs) + 1);
+		else
+			attnum_offset = 0;
+
+		/* see what actually matched */
+		foreach(lc2, *varinfos)
+		{
+			ListCell   *lc3;
+			int			idx;
+			bool		found = false;
+
+			GroupVarInfo *varinfo = (GroupVarInfo *) lfirst(lc2);
+
+			/*
+			 * Process a simple Var expression, by matching it to keys
+			 * directly. If there's a matching expression, we'll try matching
+			 * it later.
+			 */
+			if (IsA(varinfo->var, Var))
+			{
+				AttrNumber	attnum = ((Var *) varinfo->var)->varattno;
+
+				/*
+				 * Ignore expressions on system attributes. Can't rely on the
+				 * bms check for negative values.
+				 */
+				if (!AttrNumberIsForUserDefinedAttr(attnum))
+					continue;
+
+				/* Is the variable covered by the statistics object? */
+				if (!bms_is_member(attnum, matched_info->keys))
+					continue;
+
+				attnum = attnum + attnum_offset;
+
+				/* ensure sufficient offset */
+				Assert(AttrNumberIsForUserDefinedAttr(attnum));
+
+				matched = bms_add_member(matched, attnum);
+
+				found = true;
+			}
+
+			/*
+			 * XXX Maybe we should allow searching the expressions even if we
+			 * found an attribute matching the expression? That would handle
+			 * trivial expressions like "(a)" but it seems fairly useless.
+			 */
+			if (found)
+				continue;
+
+			/* expression - see if it's in the statistics object */
+			idx = 0;
+			foreach(lc3, matched_info->exprs)
+			{
+				Node	   *expr = (Node *) lfirst(lc3);
+
+				if (equal(varinfo->var, expr))
+				{
+					AttrNumber	attnum = -(idx + 1);
+
+					attnum = attnum + attnum_offset;
+
+					/* ensure sufficient offset */
+					Assert(AttrNumberIsForUserDefinedAttr(attnum));
+
+					matched = bms_add_member(matched, attnum);
+
+					/* there should be just one matching expression */
+					break;
+				}
+
+				idx++;
+			}
+		}
 
 		/* Find the specific item that exactly matches the combination */
 		for (i = 0; i < stats->nitems; i++)
 		{
+			int			j;
 			MVNDistinctItem *tmpitem = &stats->items[i];
 
-			if (bms_subset_compare(tmpitem->attrs, matched) == BMS_EQUAL)
+			if (tmpitem->nattributes != bms_num_members(matched))
+				continue;
+
+			/* assume it's the right item */
+			item = tmpitem;
+
+			/* check that all item attributes/expressions fit the match */
+			for (j = 0; j < tmpitem->nattributes; j++)
 			{
-				item = tmpitem;
-				break;
+				AttrNumber	attnum = tmpitem->attributes[j];
+
+				/*
+				 * Thanks to how we constructed the matched bitmap above, we
+				 * can just offset all attnums the same way.
+				 */
+				attnum = attnum + attnum_offset;
+
+				if (!bms_is_member(attnum, matched))
+				{
+					/* nah, it's not this item */
+					item = NULL;
+					break;
+				}
 			}
+
+			/*
+			 * If the item has all the matched attributes, we know it's the
+			 * right one - there can't be a better one. matching more.
+			 */
+			if (item)
+				break;
 		}
 
-		/* make sure we found an item */
+		/*
+		 * Make sure we found an item. There has to be one, because ndistinct
+		 * statistics includes all combinations of attributes.
+		 */
 		if (!item)
 			elog(ERROR, "corrupt MVNDistinct entry");
 
@@ -3972,21 +4202,66 @@ estimate_multivariate_ndistinct(PlannerInfo *root, RelOptInfo *rel,
 		foreach(lc, *varinfos)
 		{
 			GroupVarInfo *varinfo = (GroupVarInfo *) lfirst(lc);
-			AttrNumber	attnum;
+			ListCell   *lc3;
+			bool		found = false;
 
-			if (!IsA(varinfo->var, Var))
+			/*
+			 * Let's look at plain variables first, because it's the most
+			 * common case and the check is quite cheap. We can simply get the
+			 * attnum and check (with an offset) matched bitmap.
+			 */
+			if (IsA(varinfo->var, Var))
 			{
-				newlist = lappend(newlist, varinfo);
+				AttrNumber	attnum = ((Var *) varinfo->var)->varattno;
+
+				/*
+				 * If it's a system attribute, we're done. We don't support
+				 * extended statistics on system attributes, so it's clearly
+				 * not matched. Just keep the expression and continue.
+				 */
+				if (!AttrNumberIsForUserDefinedAttr(attnum))
+				{
+					newlist = lappend(newlist, varinfo);
+					continue;
+				}
+
+				/* apply the same offset as above */
+				attnum += attnum_offset;
+
+				/* if it's not matched, keep the varinfo */
+				if (!bms_is_member(attnum, matched))
+					newlist = lappend(newlist, varinfo);
+
+				/* The rest of the loop deals with complex expressions. */
 				continue;
 			}
 
-			attnum = ((Var *) varinfo->var)->varattno;
+			/*
+			 * Process complex expressions, not just simple Vars.
+			 *
+			 * First, we search for an exact match of an expression. If we
+			 * find one, we can just discard the whole GroupVarInfo, with all
+			 * the variables we extracted from it.
+			 *
+			 * Otherwise we inspect the individual vars, and try matching it
+			 * to variables in the item.
+			 */
+			foreach(lc3, matched_info->exprs)
+			{
+				Node	   *expr = (Node *) lfirst(lc3);
 
-			if (!AttrNumberIsForUserDefinedAttr(attnum))
+				if (equal(varinfo->var, expr))
+				{
+					found = true;
+					break;
+				}
+			}
+
+			/* found exact match, skip */
+			if (found)
 				continue;
 
-			if (!bms_is_member(attnum, matched))
-				newlist = lappend(newlist, varinfo);
+			newlist = lappend(newlist, varinfo);
 		}
 
 		*varinfos = newlist;
@@ -4070,6 +4345,7 @@ convert_to_scalar(Datum value, Oid valuetypid, Oid collid, double *scaledvalue,
 		case REGOPERATOROID:
 		case REGCLASSOID:
 		case REGTYPEOID:
+		case REGCOLLATIONOID:
 		case REGCONFIGOID:
 		case REGDICTIONARYOID:
 		case REGROLEOID:
@@ -4201,6 +4477,7 @@ convert_numeric_to_scalar(Datum value, Oid typid, bool *failure)
 		case REGOPERATOROID:
 		case REGCLASSOID:
 		case REGTYPEOID:
+		case REGCOLLATIONOID:
 		case REGCONFIGOID:
 		case REGDICTIONARYOID:
 		case REGROLEOID:
@@ -4555,6 +4832,10 @@ convert_timevalue_to_scalar(Datum value, Oid typid, bool *failure)
 				 * Convert the month part of Interval to days using assumed
 				 * average month length of 365.25/12.0 days.  Not too
 				 * accurate, but plenty good enough for our purposes.
+				 *
+				 * This also works for infinite intervals, which just have all
+				 * fields set to INT_MIN/INT_MAX, and so will produce a result
+				 * smaller/larger than any finite interval.
 				 */
 				return interval->time + interval->day * (double) USECS_PER_DAY +
 					interval->month * ((DAYS_PER_YEAR / (double) MONTHS_PER_YEAR) * USECS_PER_DAY);
@@ -4685,6 +4966,13 @@ get_join_variables(PlannerInfo *root, List *args, SpecialJoinInfo *sjinfo,
 		*join_is_reversed = false;
 }
 
+/* statext_expressions_load copies the tuple, so just pfree it. */
+static void
+ReleaseDummy(HeapTuple tuple)
+{
+	pfree(tuple);
+}
+
 /*
  * examine_variable
  *		Try to look up statistical data about an expression.
@@ -4766,26 +5054,31 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 	 * membership.  Note that when varRelid isn't zero, only vars of that
 	 * relation are considered "real" vars.
 	 */
-	varnos = pull_varnos(basenode);
+	varnos = pull_varnos(root, basenode);
 
 	onerel = NULL;
 
-	switch (bms_membership(varnos))
+	if (bms_is_empty(varnos))
 	{
-		case BMS_EMPTY_SET:
-			/* No Vars at all ... must be pseudo-constant clause */
-			break;
-		case BMS_SINGLETON:
-			if (varRelid == 0 || bms_is_member(varRelid, varnos))
+		/* No Vars at all ... must be pseudo-constant clause */
+	}
+	else
+	{
+		int			relid;
+
+		if (bms_get_singleton_member(varnos, &relid))
+		{
+			if (varRelid == 0 || varRelid == relid)
 			{
-				onerel = find_base_rel(root,
-									   (varRelid ? varRelid : bms_singleton_member(varnos)));
+				onerel = find_base_rel(root, relid);
 				vardata->rel = onerel;
 				node = basenode;	/* strip any relabeling */
 			}
 			/* else treat it as a constant */
-			break;
-		case BMS_MULTIPLE:
+		}
+		else
+		{
+			/* varnos has multiple relids */
 			if (varRelid == 0)
 			{
 				/* treat it as a variable of a join relation */
@@ -4800,7 +5093,7 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 				/* note: no point in expressional-index search here */
 			}
 			/* else treat it as a constant */
-			break;
+		}
 	}
 
 	bms_free(varnos);
@@ -4825,6 +5118,19 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 		 * operator we are estimating for.  FIXME later.
 		 */
 		ListCell   *ilist;
+		ListCell   *slist;
+		Oid			userid;
+
+		/*
+		 * Determine the user ID to use for privilege checks: either
+		 * onerel->userid if it's set (e.g., in case we're accessing the table
+		 * via a view), or the current user otherwise.
+		 *
+		 * If we drill down to child relations, we keep using the same userid:
+		 * it's going to be the same anyway, due to how we set up the relation
+		 * tree (q.v. build_simple_rel).
+		 */
+		userid = OidIsValid(onerel->userid) ? onerel->userid : GetUserId();
 
 		foreach(ilist, onerel->indexlist)
 		{
@@ -4895,16 +5201,9 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 							{
 								/* Get index's table for permission check */
 								RangeTblEntry *rte;
-								Oid			userid;
 
 								rte = planner_rt_fetch(index->rel->relid, root);
 								Assert(rte->rtekind == RTE_RELATION);
-
-								/*
-								 * Use checkAsUser if it's set, in case we're
-								 * accessing the table via a view.
-								 */
-								userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
 
 								/*
 								 * For simplicity, we insist on the whole
@@ -4956,8 +5255,6 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 										rte = planner_rt_fetch(varno, root);
 										Assert(rte->rtekind == RTE_RELATION);
 
-										userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
-
 										vardata->acl_ok =
 											rte->securityQuals == NIL &&
 											(pg_class_aclcheck(rte->relid,
@@ -4981,6 +5278,118 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 			if (vardata->statsTuple)
 				break;
 		}
+
+		/*
+		 * Search extended statistics for one with a matching expression.
+		 * There might be multiple ones, so just grab the first one. In the
+		 * future, we might consider the statistics target (and pick the most
+		 * accurate statistics) and maybe some other parameters.
+		 */
+		foreach(slist, onerel->statlist)
+		{
+			StatisticExtInfo *info = (StatisticExtInfo *) lfirst(slist);
+			RangeTblEntry *rte = planner_rt_fetch(onerel->relid, root);
+			ListCell   *expr_item;
+			int			pos;
+
+			/*
+			 * Stop once we've found statistics for the expression (either
+			 * from extended stats, or for an index in the preceding loop).
+			 */
+			if (vardata->statsTuple)
+				break;
+
+			/* skip stats without per-expression stats */
+			if (info->kind != STATS_EXT_EXPRESSIONS)
+				continue;
+
+			/* skip stats with mismatching stxdinherit value */
+			if (info->inherit != rte->inh)
+				continue;
+
+			pos = 0;
+			foreach(expr_item, info->exprs)
+			{
+				Node	   *expr = (Node *) lfirst(expr_item);
+
+				Assert(expr);
+
+				/* strip RelabelType before comparing it */
+				if (expr && IsA(expr, RelabelType))
+					expr = (Node *) ((RelabelType *) expr)->arg;
+
+				/* found a match, see if we can extract pg_statistic row */
+				if (equal(node, expr))
+				{
+					/*
+					 * XXX Not sure if we should cache the tuple somewhere.
+					 * Now we just create a new copy every time.
+					 */
+					vardata->statsTuple =
+						statext_expressions_load(info->statOid, rte->inh, pos);
+
+					vardata->freefunc = ReleaseDummy;
+
+					/*
+					 * For simplicity, we insist on the whole table being
+					 * selectable, rather than trying to identify which
+					 * column(s) the statistics object depends on.  Also
+					 * require all rows to be selectable --- there must be no
+					 * securityQuals from security barrier views or RLS
+					 * policies.
+					 */
+					vardata->acl_ok =
+						rte->securityQuals == NIL &&
+						(pg_class_aclcheck(rte->relid, userid,
+										   ACL_SELECT) == ACLCHECK_OK);
+
+					/*
+					 * If the user doesn't have permissions to access an
+					 * inheritance child relation, check the permissions of
+					 * the table actually mentioned in the query, since most
+					 * likely the user does have that permission.  Note that
+					 * whole-table select privilege on the parent doesn't
+					 * quite guarantee that the user could read all columns of
+					 * the child. But in practice it's unlikely that any
+					 * interesting security violation could result from
+					 * allowing access to the expression stats, so we allow it
+					 * anyway.  See similar code in examine_simple_variable()
+					 * for additional comments.
+					 */
+					if (!vardata->acl_ok &&
+						root->append_rel_array != NULL)
+					{
+						AppendRelInfo *appinfo;
+						Index		varno = onerel->relid;
+
+						appinfo = root->append_rel_array[varno];
+						while (appinfo &&
+							   planner_rt_fetch(appinfo->parent_relid,
+												root)->rtekind == RTE_RELATION)
+						{
+							varno = appinfo->parent_relid;
+							appinfo = root->append_rel_array[varno];
+						}
+						if (varno != onerel->relid)
+						{
+							/* Repeat access check on this rel */
+							rte = planner_rt_fetch(varno, root);
+							Assert(rte->rtekind == RTE_RELATION);
+
+							vardata->acl_ok =
+								rte->securityQuals == NIL &&
+								(pg_class_aclcheck(rte->relid,
+												   userid,
+												   ACL_SELECT) == ACLCHECK_OK);
+						}
+					}
+
+					break;
+				}
+
+				pos++;
+			}
+		}
 	}
 }
 
@@ -4989,7 +5398,7 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
  *		Handle a simple Var for examine_variable
  *
  * This is split out as a subroutine so that we can recurse to deal with
- * Vars referencing subqueries.
+ * Vars referencing subqueries (either sub-SELECT-in-FROM or CTE style).
  *
  * We already filled in all the fields of *vardata except for the stats tuple.
  */
@@ -5026,15 +5435,30 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 
 		if (HeapTupleIsValid(vardata->statsTuple))
 		{
+			RelOptInfo *onerel = find_base_rel_noerr(root, var->varno);
 			Oid			userid;
 
 			/*
 			 * Check if user has permission to read this column.  We require
 			 * all rows to be accessible, so there must be no securityQuals
-			 * from security barrier views or RLS policies.  Use checkAsUser
-			 * if it's set, in case we're accessing the table via a view.
+			 * from security barrier views or RLS policies.
+			 *
+			 * Normally the Var will have an associated RelOptInfo from which
+			 * we can find out which userid to do the check as; but it might
+			 * not if it's a RETURNING Var for an INSERT target relation.  In
+			 * that case use the RTEPermissionInfo associated with the RTE.
 			 */
-			userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+			if (onerel)
+				userid = onerel->userid;
+			else
+			{
+				RTEPermissionInfo *perminfo;
+
+				perminfo = getRTEPermissionInfo(root->parse->rteperminfos, rte);
+				userid = perminfo->checkAsUser;
+			}
+			if (!OidIsValid(userid))
+				userid = GetUserId();
 
 			vardata->acl_ok =
 				rte->securityQuals == NIL &&
@@ -5103,8 +5527,10 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 				rte = planner_rt_fetch(varno, root);
 				Assert(rte->rtekind == RTE_RELATION);
 
-				userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
-
+				/*
+				 * Fine to use the same userid as it's the same in all
+				 * relations of a given inheritance tree.
+				 */
 				vardata->acl_ok =
 					rte->securityQuals == NIL &&
 					((pg_class_aclcheck(rte->relid, userid,
@@ -5119,13 +5545,19 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 			vardata->acl_ok = true;
 		}
 	}
-	else if (rte->rtekind == RTE_SUBQUERY && !rte->inh)
+	else if ((rte->rtekind == RTE_SUBQUERY && !rte->inh) ||
+			 (rte->rtekind == RTE_CTE && !rte->self_reference))
 	{
 		/*
-		 * Plain subquery (not one that was converted to an appendrel).
+		 * Plain subquery (not one that was converted to an appendrel) or
+		 * non-recursive CTE.  In either case, we can try to find out what the
+		 * Var refers to within the subquery.  We skip this for appendrel and
+		 * recursive-CTE cases because any column stats we did find would
+		 * likely not be very relevant.
 		 */
-		Query	   *subquery = rte->subquery;
-		RelOptInfo *rel;
+		PlannerInfo *subroot;
+		Query	   *subquery;
+		List	   *subtlist;
 		TargetEntry *ste;
 
 		/*
@@ -5133,6 +5565,85 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 		 */
 		if (var->varattno == InvalidAttrNumber)
 			return;
+
+		/*
+		 * Otherwise, find the subquery's planner subroot.
+		 */
+		if (rte->rtekind == RTE_SUBQUERY)
+		{
+			RelOptInfo *rel;
+
+			/*
+			 * Fetch RelOptInfo for subquery.  Note that we don't change the
+			 * rel returned in vardata, since caller expects it to be a rel of
+			 * the caller's query level.  Because we might already be
+			 * recursing, we can't use that rel pointer either, but have to
+			 * look up the Var's rel afresh.
+			 */
+			rel = find_base_rel(root, var->varno);
+
+			subroot = rel->subroot;
+		}
+		else
+		{
+			/* CTE case is more difficult */
+			PlannerInfo *cteroot;
+			Index		levelsup;
+			int			ndx;
+			int			plan_id;
+			ListCell   *lc;
+
+			/*
+			 * Find the referenced CTE, and locate the subroot previously made
+			 * for it.
+			 */
+			levelsup = rte->ctelevelsup;
+			cteroot = root;
+			while (levelsup-- > 0)
+			{
+				cteroot = cteroot->parent_root;
+				if (!cteroot)	/* shouldn't happen */
+					elog(ERROR, "bad levelsup for CTE \"%s\"", rte->ctename);
+			}
+
+			/*
+			 * Note: cte_plan_ids can be shorter than cteList, if we are still
+			 * working on planning the CTEs (ie, this is a side-reference from
+			 * another CTE).  So we mustn't use forboth here.
+			 */
+			ndx = 0;
+			foreach(lc, cteroot->parse->cteList)
+			{
+				CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+
+				if (strcmp(cte->ctename, rte->ctename) == 0)
+					break;
+				ndx++;
+			}
+			if (lc == NULL)		/* shouldn't happen */
+				elog(ERROR, "could not find CTE \"%s\"", rte->ctename);
+			if (ndx >= list_length(cteroot->cte_plan_ids))
+				elog(ERROR, "could not find plan for CTE \"%s\"", rte->ctename);
+			plan_id = list_nth_int(cteroot->cte_plan_ids, ndx);
+			if (plan_id <= 0)
+				elog(ERROR, "no plan was made for CTE \"%s\"", rte->ctename);
+			subroot = list_nth(root->glob->subroots, plan_id - 1);
+		}
+
+		/* If the subquery hasn't been planned yet, we have to punt */
+		if (subroot == NULL)
+			return;
+		Assert(IsA(subroot, PlannerInfo));
+
+		/*
+		 * We must use the subquery parsetree as mangled by the planner, not
+		 * the raw version from the RTE, because we need a Var that will refer
+		 * to the subroot's live RelOptInfos.  For instance, if any subquery
+		 * pullup happened during planning, Vars in the targetlist might have
+		 * gotten replaced, and we need to see the replacement expressions.
+		 */
+		subquery = subroot->parse;
+		Assert(IsA(subquery, Query));
 
 		/*
 		 * Punt if subquery uses set operations or GROUP BY, as these will
@@ -5143,36 +5654,16 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 		 * of learning something even with it.
 		 */
 		if (subquery->setOperations ||
-			subquery->groupClause)
+			subquery->groupClause ||
+			subquery->groupingSets)
 			return;
-
-		/*
-		 * OK, fetch RelOptInfo for subquery.  Note that we don't change the
-		 * rel returned in vardata, since caller expects it to be a rel of the
-		 * caller's query level.  Because we might already be recursing, we
-		 * can't use that rel pointer either, but have to look up the Var's
-		 * rel afresh.
-		 */
-		rel = find_base_rel(root, var->varno);
-
-		/* If the subquery hasn't been planned yet, we have to punt */
-		if (rel->subroot == NULL)
-			return;
-		Assert(IsA(rel->subroot, PlannerInfo));
-
-		/*
-		 * Switch our attention to the subquery as mangled by the planner. It
-		 * was okay to look at the pre-planning version for the tests above,
-		 * but now we need a Var that will refer to the subroot's live
-		 * RelOptInfos.  For instance, if any subquery pullup happened during
-		 * planning, Vars in the targetlist might have gotten replaced, and we
-		 * need to see the replacement expressions.
-		 */
-		subquery = rel->subroot->parse;
-		Assert(IsA(subquery, Query));
 
 		/* Get the subquery output expression referenced by the upper Var */
-		ste = get_tle_by_resno(subquery->targetList, var->varattno);
+		if (subquery->returningList)
+			subtlist = subquery->returningList;
+		else
+			subtlist = subquery->targetList;
+		ste = get_tle_by_resno(subtlist, var->varattno);
 		if (ste == NULL || ste->resjunk)
 			elog(ERROR, "subquery %s does not have attribute %d",
 				 rte->eref->aliasname, var->varattno);
@@ -5220,16 +5711,16 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 			 * if the underlying column is unique, the subquery may have
 			 * joined to other tables in a way that creates duplicates.
 			 */
-			examine_simple_variable(rel->subroot, var, vardata);
+			examine_simple_variable(subroot, var, vardata);
 		}
 	}
 	else
 	{
 		/*
-		 * Otherwise, the Var comes from a FUNCTION, VALUES, or CTE RTE.  (We
-		 * won't see RTE_JOIN here because join alias Vars have already been
+		 * Otherwise, the Var comes from a FUNCTION or VALUES RTE.  (We won't
+		 * see RTE_JOIN here because join alias Vars have already been
 		 * flattened.)	There's not much we can do with function outputs, but
-		 * maybe someday try to be smarter about VALUES and/or CTEs.
+		 * maybe someday try to be smarter about VALUES.
 		 */
 	}
 }
@@ -5486,15 +5977,35 @@ get_variable_range(PlannerInfo *root, VariableStatData *vardata,
 	/*
 	 * If we have most-common-values info, look for extreme MCVs.  This is
 	 * needed even if we also have a histogram, since the histogram excludes
-	 * the MCVs.
+	 * the MCVs.  However, if we *only* have MCVs and no histogram, we should
+	 * be pretty wary of deciding that that is a full representation of the
+	 * data.  Proceed only if the MCVs represent the whole table (to within
+	 * roundoff error).
 	 */
 	if (get_attstatsslot(&sslot, vardata->statsTuple,
 						 STATISTIC_KIND_MCV, InvalidOid,
-						 ATTSTATSSLOT_VALUES))
+						 have_data ? ATTSTATSSLOT_VALUES :
+						 (ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS)))
 	{
-		get_stats_slot_range(&sslot, opfuncoid, &opproc,
-							 collation, typLen, typByVal,
-							 &tmin, &tmax, &have_data);
+		bool		use_mcvs = have_data;
+
+		if (!have_data)
+		{
+			double		sumcommon = 0.0;
+			double		nullfrac;
+			int			i;
+
+			for (i = 0; i < sslot.nnumbers; i++)
+				sumcommon += sslot.numbers[i];
+			nullfrac = ((Form_pg_statistic) GETSTRUCT(vardata->statsTuple))->stanullfrac;
+			if (sumcommon + nullfrac > 0.99999)
+				use_mcvs = true;
+		}
+
+		if (use_mcvs)
+			get_stats_slot_range(&sslot, opfuncoid, &opproc,
+								 collation, typLen, typByVal,
+								 &tmin, &tmax, &have_data);
 		free_attstatsslot(&sslot);
 	}
 
@@ -5567,7 +6078,7 @@ get_stats_slot_range(AttStatsSlot *sslot, Oid opfuncoid, FmgrInfo *opproc,
  *		and fetching its low and/or high values.
  *		If successful, store values in *min and *max, and return true.
  *		(Either pointer can be NULL if that endpoint isn't needed.)
- *		If no data available, return false.
+ *		If unsuccessful, return false.
  *
  * sortop is the "<" comparison operator to use.
  * collation is the required collation.
@@ -5588,6 +6099,10 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
 	/* If it has indexes it must be a plain relation */
 	rte = root->simple_rte_array[rel->relid];
 	Assert(rte->rtekind == RTE_RELATION);
+
+	/* ignore partitioned tables.  Any indexes here are not real indexes */
+	if (rte->relkind == RELKIND_PARTITIONED_TABLE)
+		return false;
 
 	/* Search through the indexes to see if any match our problem */
 	foreach(lc, rel->indexlist)
@@ -5696,11 +6211,11 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
 			}
 			else
 			{
-				/* If min not requested, assume index is nonempty */
+				/* If min not requested, still want to fetch max */
 				have_data = true;
 			}
 
-			/* If max is requested, and we didn't find the index is empty */
+			/* If max is requested, and we didn't already fail ... */
 			if (max && have_data)
 			{
 				/* scan in the opposite direction; all else is the same */
@@ -5734,7 +6249,7 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
 
 /*
  * Get one endpoint datum (min or max depending on indexscandir) from the
- * specified index.  Return true if successful, false if index is empty.
+ * specified index.  Return true if successful, false if not.
  * On success, endpoint value is stored to *endpointDatum (and copied into
  * outercontext).
  *
@@ -5744,6 +6259,9 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
  * to probe the heap.
  * (We could compute these values locally, but that would mean computing them
  * twice when get_actual_variable_range needs both the min and the max.)
+ *
+ * Failure occurs either when the index is empty, or we decide that it's
+ * taking too long to find a suitable tuple.
  */
 static bool
 get_actual_variable_endpoint(Relation heapRel,
@@ -5760,6 +6278,8 @@ get_actual_variable_endpoint(Relation heapRel,
 	SnapshotData SnapshotNonVacuumable;
 	IndexScanDesc index_scan;
 	Buffer		vmbuffer = InvalidBuffer;
+	BlockNumber last_heap_block = InvalidBlockNumber;
+	int			n_visited_heap_pages = 0;
 	ItemPointer tid;
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
@@ -5783,14 +6303,15 @@ get_actual_variable_endpoint(Relation heapRel,
 	 * recent); that case motivates not using SnapshotAny here.
 	 *
 	 * A crucial point here is that SnapshotNonVacuumable, with
-	 * RecentGlobalXmin as horizon, yields the inverse of the condition that
-	 * the indexscan will use to decide that index entries are killable (see
-	 * heap_hot_search_buffer()).  Therefore, if the snapshot rejects a tuple
-	 * (or more precisely, all tuples of a HOT chain) and we have to continue
-	 * scanning past it, we know that the indexscan will mark that index entry
-	 * killed.  That means that the next get_actual_variable_endpoint() call
-	 * will not have to re-consider that index entry.  In this way we avoid
-	 * repetitive work when this function is used a lot during planning.
+	 * GlobalVisTestFor(heapRel) as horizon, yields the inverse of the
+	 * condition that the indexscan will use to decide that index entries are
+	 * killable (see heap_hot_search_buffer()).  Therefore, if the snapshot
+	 * rejects a tuple (or more precisely, all tuples of a HOT chain) and we
+	 * have to continue scanning past it, we know that the indexscan will mark
+	 * that index entry killed.  That means that the next
+	 * get_actual_variable_endpoint() call will not have to re-consider that
+	 * index entry.  In this way we avoid repetitive work when this function
+	 * is used a lot during planning.
 	 *
 	 * But using SnapshotNonVacuumable creates a hazard of its own.  In a
 	 * recently-created index, some index entries may point at "broken" HOT
@@ -5801,8 +6322,15 @@ get_actual_variable_endpoint(Relation heapRel,
 	 * might get a bogus answer that's not close to the index extremal value,
 	 * or could even be NULL.  We avoid this hazard because we take the data
 	 * from the index entry not the heap.
+	 *
+	 * Despite all this care, there are situations where we might find many
+	 * non-visible tuples near the end of the index.  We don't want to expend
+	 * a huge amount of time here, so we give up once we've read too many heap
+	 * pages.  When we fail for that reason, the caller will end up using
+	 * whatever extremal value is recorded in pg_statistic.
 	 */
-	InitNonVacuumableSnapshot(SnapshotNonVacuumable, RecentGlobalXmin);
+	InitNonVacuumableSnapshot(SnapshotNonVacuumable,
+							  GlobalVisTestFor(heapRel));
 
 	index_scan = index_beginscan(heapRel, indexRel,
 								 &SnapshotNonVacuumable,
@@ -5814,13 +6342,37 @@ get_actual_variable_endpoint(Relation heapRel,
 	/* Fetch first/next tuple in specified direction */
 	while ((tid = index_getnext_tid(index_scan, indexscandir)) != NULL)
 	{
+		BlockNumber block = ItemPointerGetBlockNumber(tid);
+
 		if (!VM_ALL_VISIBLE(heapRel,
-							ItemPointerGetBlockNumber(tid),
+							block,
 							&vmbuffer))
 		{
 			/* Rats, we have to visit the heap to check visibility */
 			if (!index_fetch_heap(index_scan, tableslot))
+			{
+				/*
+				 * No visible tuple for this index entry, so we need to
+				 * advance to the next entry.  Before doing so, count heap
+				 * page fetches and give up if we've done too many.
+				 *
+				 * We don't charge a page fetch if this is the same heap page
+				 * as the previous tuple.  This is on the conservative side,
+				 * since other recently-accessed pages are probably still in
+				 * buffers too; but it's good enough for this heuristic.
+				 */
+#define VISITED_PAGES_LIMIT 100
+
+				if (block != last_heap_block)
+				{
+					last_heap_block = block;
+					n_visited_heap_pages++;
+					if (n_visited_heap_pages > VISITED_PAGES_LIMIT)
+						break;
+				}
+
 				continue;		/* no visible tuple, try next index entry */
+			}
 
 			/* We don't actually need the heap tuple for anything */
 			ExecClearTuple(tableslot);
@@ -5877,17 +6429,14 @@ find_join_input_rel(PlannerInfo *root, Relids relids)
 {
 	RelOptInfo *rel = NULL;
 
-	switch (bms_membership(relids))
+	if (!bms_is_empty(relids))
 	{
-		case BMS_EMPTY_SET:
-			/* should not happen */
-			break;
-		case BMS_SINGLETON:
-			rel = find_base_rel(root, bms_singleton_member(relids));
-			break;
-		case BMS_MULTIPLE:
+		int			relid;
+
+		if (bms_get_singleton_member(relids, &relid))
+			rel = find_base_rel(root, relid);
+		else
 			rel = find_join_rel(root, relids);
-			break;
 	}
 
 	if (rel == NULL)
@@ -6034,7 +6583,7 @@ genericcostestimate(PlannerInfo *root,
 		if (IsA(rinfo->clause, ScalarArrayOpExpr))
 		{
 			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) rinfo->clause;
-			int			alength = estimate_array_length(lsecond(saop->args));
+			double		alength = estimate_array_length(root, lsecond(saop->args));
 
 			if (alength > 1)
 				num_sa_scans *= alength;
@@ -6237,10 +6786,10 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			   double *indexPages)
 {
 	IndexOptInfo *index = path->indexinfo;
-	GenericCosts costs;
+	GenericCosts costs = {0};
 	Oid			relid;
 	AttrNumber	colnum;
-	VariableStatData vardata;
+	VariableStatData vardata = {0};
 	double		numIndexTuples;
 	Cost		descentCost;
 	List	   *indexBoundQuals;
@@ -6314,7 +6863,7 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			{
 				ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
 				Node	   *other_operand = (Node *) lsecond(saop->args);
-				int			alength = estimate_array_length(other_operand);
+				double		alength = estimate_array_length(root, other_operand);
 
 				clause_op = saop->opno;
 				found_saop = true;
@@ -6392,7 +6941,6 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	/*
 	 * Now do generic index cost estimation.
 	 */
-	MemSet(&costs, 0, sizeof(costs));
 	costs.numIndexTuples = numIndexTuples;
 
 	genericcostestimate(root, path, loop_count, &costs);
@@ -6425,7 +6973,7 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	 * touched.  The number of such pages is btree tree height plus one (ie,
 	 * we charge for the leaf page too).  As above, charge once per SA scan.
 	 */
-	descentCost = (index->tree_height + 1) * 50.0 * cpu_operator_cost;
+	descentCost = (index->tree_height + 1) * DEFAULT_PAGE_CPU_MULTIPLIER * cpu_operator_cost;
 	costs.indexStartupCost += descentCost;
 	costs.indexTotalCost += costs.num_sa_scans * descentCost;
 
@@ -6437,8 +6985,6 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	 * ordering, but don't negate it entirely.  Before 8.0 we divided the
 	 * correlation by the number of columns, but that seems too strong.)
 	 */
-	MemSet(&vardata, 0, sizeof(vardata));
-
 	if (index->indexkeys[0] != 0)
 	{
 		/* Simple variable --- look to stats for the underlying table */
@@ -6542,9 +7088,7 @@ hashcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				 Selectivity *indexSelectivity, double *indexCorrelation,
 				 double *indexPages)
 {
-	GenericCosts costs;
-
-	MemSet(&costs, 0, sizeof(costs));
+	GenericCosts costs = {0};
 
 	genericcostestimate(root, path, loop_count, &costs);
 
@@ -6587,10 +7131,8 @@ gistcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				 double *indexPages)
 {
 	IndexOptInfo *index = path->indexinfo;
-	GenericCosts costs;
+	GenericCosts costs = {0};
 	Cost		descentCost;
-
-	MemSet(&costs, 0, sizeof(costs));
 
 	genericcostestimate(root, path, loop_count, &costs);
 
@@ -6626,7 +7168,7 @@ gistcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	/*
 	 * Likewise add a per-page charge, calculated the same as for btrees.
 	 */
-	descentCost = (index->tree_height + 1) * 50.0 * cpu_operator_cost;
+	descentCost = (index->tree_height + 1) * DEFAULT_PAGE_CPU_MULTIPLIER * cpu_operator_cost;
 	costs.indexStartupCost += descentCost;
 	costs.indexTotalCost += costs.num_sa_scans * descentCost;
 
@@ -6644,10 +7186,8 @@ spgcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				double *indexPages)
 {
 	IndexOptInfo *index = path->indexinfo;
-	GenericCosts costs;
+	GenericCosts costs = {0};
 	Cost		descentCost;
-
-	MemSet(&costs, 0, sizeof(costs));
 
 	genericcostestimate(root, path, loop_count, &costs);
 
@@ -6683,7 +7223,7 @@ spgcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	/*
 	 * Likewise add a per-page charge, calculated the same as for btrees.
 	 */
-	descentCost = (index->tree_height + 1) * 50.0 * cpu_operator_cost;
+	descentCost = (index->tree_height + 1) * DEFAULT_PAGE_CPU_MULTIPLIER * cpu_operator_cost;
 	costs.indexStartupCost += descentCost;
 	costs.indexTotalCost += costs.num_sa_scans * descentCost;
 
@@ -6917,7 +7457,7 @@ gincost_scalararrayopexpr(PlannerInfo *root,
 	{
 		counts->exactEntries++;
 		counts->searchEntries++;
-		counts->arrayScans *= estimate_array_length(rightop);
+		counts->arrayScans *= estimate_array_length(root, rightop);
 		return true;
 	}
 
@@ -7020,6 +7560,7 @@ gincostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				qual_arg_cost,
 				spc_random_page_cost,
 				outer_scans;
+	Cost		descentCost;
 	Relation	indexRel;
 	GinStatsData ginStats;
 	ListCell   *lc;
@@ -7244,6 +7785,47 @@ gincostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	 */
 	dataPagesFetched = ceil(numDataPages * partialScale);
 
+	*indexStartupCost = 0;
+	*indexTotalCost = 0;
+
+	/*
+	 * Add a CPU-cost component to represent the costs of initial entry btree
+	 * descent.  We don't charge any I/O cost for touching upper btree levels,
+	 * since they tend to stay in cache, but we still have to do about log2(N)
+	 * comparisons to descend a btree of N leaf tuples.  We charge one
+	 * cpu_operator_cost per comparison.
+	 *
+	 * If there are ScalarArrayOpExprs, charge this once per SA scan.  The
+	 * ones after the first one are not startup cost so far as the overall
+	 * plan is concerned, so add them only to "total" cost.
+	 */
+	if (numEntries > 1)			/* avoid computing log(0) */
+	{
+		descentCost = ceil(log(numEntries) / log(2.0)) * cpu_operator_cost;
+		*indexStartupCost += descentCost * counts.searchEntries;
+		*indexTotalCost += counts.arrayScans * descentCost * counts.searchEntries;
+	}
+
+	/*
+	 * Add a cpu cost per entry-page fetched. This is not amortized over a
+	 * loop.
+	 */
+	*indexStartupCost += entryPagesFetched * DEFAULT_PAGE_CPU_MULTIPLIER * cpu_operator_cost;
+	*indexTotalCost += entryPagesFetched * counts.arrayScans * DEFAULT_PAGE_CPU_MULTIPLIER * cpu_operator_cost;
+
+	/*
+	 * Add a cpu cost per data-page fetched. This is also not amortized over a
+	 * loop. Since those are the data pages from the partial match algorithm,
+	 * charge them as startup cost.
+	 */
+	*indexStartupCost += DEFAULT_PAGE_CPU_MULTIPLIER * cpu_operator_cost * dataPagesFetched;
+
+	/*
+	 * Since we add the startup cost to the total cost later on, remove the
+	 * initial arrayscan from the total.
+	 */
+	*indexTotalCost += dataPagesFetched * (counts.arrayScans - 1) * DEFAULT_PAGE_CPU_MULTIPLIER * cpu_operator_cost;
+
 	/*
 	 * Calculate cache effects if more than one scan due to nestloops or array
 	 * quals.  The result is pro-rated per nestloop scan, but the array qual
@@ -7267,7 +7849,7 @@ gincostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	 * Here we use random page cost because logically-close pages could be far
 	 * apart on disk.
 	 */
-	*indexStartupCost = (entryPagesFetched + dataPagesFetched) * spc_random_page_cost;
+	*indexStartupCost += (entryPagesFetched + dataPagesFetched) * spc_random_page_cost;
 
 	/*
 	 * Now compute the number of data pages fetched during the scan.
@@ -7295,6 +7877,15 @@ gincostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	if (dataPagesFetchedBySel > dataPagesFetched)
 		dataPagesFetched = dataPagesFetchedBySel;
 
+	/* Add one page cpu-cost to the startup cost */
+	*indexStartupCost += DEFAULT_PAGE_CPU_MULTIPLIER * cpu_operator_cost * counts.searchEntries;
+
+	/*
+	 * Add once again a CPU-cost for those data pages, before amortizing for
+	 * cache.
+	 */
+	*indexTotalCost += dataPagesFetched * counts.arrayScans * DEFAULT_PAGE_CPU_MULTIPLIER * cpu_operator_cost;
+
 	/* Account for cache effects, the same as above */
 	if (outer_scans > 1 || counts.arrayScans > 1)
 	{
@@ -7306,19 +7897,27 @@ gincostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	}
 
 	/* And apply random_page_cost as the cost per page */
-	*indexTotalCost = *indexStartupCost +
+	*indexTotalCost += *indexStartupCost +
 		dataPagesFetched * spc_random_page_cost;
 
 	/*
-	 * Add on index qual eval costs, much as in genericcostestimate.  But we
-	 * can disregard indexorderbys, since GIN doesn't support those.
+	 * Add on index qual eval costs, much as in genericcostestimate. We charge
+	 * cpu but we can disregard indexorderbys, since GIN doesn't support
+	 * those.
 	 */
 	qual_arg_cost = index_other_operands_eval_cost(root, indexQuals);
 	qual_op_cost = cpu_operator_cost * list_length(indexQuals);
 
 	*indexStartupCost += qual_arg_cost;
 	*indexTotalCost += qual_arg_cost;
-	*indexTotalCost += (numTuples * *indexSelectivity) * (cpu_index_tuple_cost + qual_op_cost);
+
+	/*
+	 * Add a cpu cost per search entry, corresponding to the actual visited
+	 * entries.
+	 */
+	*indexTotalCost += (counts.searchEntries * counts.arrayScans) * (qual_op_cost);
+	/* Now add a cpu cost per tuple in the posting lists / trees */
+	*indexTotalCost += (numTuples * *indexSelectivity) * (cpu_index_tuple_cost);
 	*indexPages = dataPagesFetched;
 }
 
@@ -7468,7 +8067,7 @@ brincostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				double		varCorrelation = 0.0;
 
 				if (sslot.nnumbers > 0)
-					varCorrelation = Abs(sslot.numbers[0]);
+					varCorrelation = fabs(sslot.numbers[0]);
 
 				if (varCorrelation > *indexCorrelation)
 					*indexCorrelation = varCorrelation;

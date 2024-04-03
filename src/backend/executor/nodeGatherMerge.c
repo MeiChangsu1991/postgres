@@ -3,7 +3,7 @@
  * nodeGatherMerge.c
  *		Scan a plan in multiple workers, and do order-preserving merge.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,18 +14,13 @@
 
 #include "postgres.h"
 
-#include "access/relscan.h"
-#include "access/xact.h"
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/execParallel.h"
 #include "executor/nodeGatherMerge.h"
-#include "executor/nodeSubplan.h"
 #include "executor/tqueue.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
-#include "utils/memutils.h"
-#include "utils/rel.h"
 
 /*
  * When we read tuples from workers, it's a good idea to read several at once
@@ -212,13 +207,13 @@ ExecGatherMerge(PlanState *pstate)
 
 			/* Initialize, or re-initialize, shared state needed by workers. */
 			if (!node->pei)
-				node->pei = ExecInitParallelPlan(node->ps.lefttree,
+				node->pei = ExecInitParallelPlan(outerPlanState(node),
 												 estate,
 												 gm->initParam,
 												 gm->num_workers,
 												 node->tuples_needed);
 			else
-				ExecParallelReinitialize(node->ps.lefttree,
+				ExecParallelReinitialize(outerPlanState(node),
 										 node->pei,
 										 gm->initParam);
 
@@ -290,9 +285,6 @@ ExecEndGatherMerge(GatherMergeState *node)
 {
 	ExecEndNode(outerPlanState(node));	/* let children clean up first */
 	ExecShutdownGatherMerge(node);
-	ExecFreeExprContext(&node->ps);
-	if (node->ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ps.ps_ResultTupleSlot);
 }
 
 /* ----------------------------------------------------------------
@@ -430,6 +422,7 @@ gather_merge_setup(GatherMergeState *gm_state)
 	/* Allocate the resources for the merge */
 	gm_state->gm_heap = binaryheap_allocate(nreaders + 1,
 											heap_compare_slots,
+											false,
 											gm_state);
 }
 
@@ -700,9 +693,9 @@ gather_merge_readnext(GatherMergeState *gm_state, int reader, bool nowait)
 	Assert(tup);
 
 	/* Build the TupleTableSlot for the given tuple */
-	ExecStoreMinimalTuple(tup,		/* tuple to store */
-						  gm_state->gm_slots[reader],	/* slot in which to store
-														 * the tuple */
+	ExecStoreMinimalTuple(tup,	/* tuple to store */
+						  gm_state->gm_slots[reader],	/* slot in which to
+														 * store the tuple */
 						  true);	/* pfree tuple when done with it */
 
 	return true;

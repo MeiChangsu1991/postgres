@@ -4,7 +4,7 @@
  *	  routines for scanning SP-GiST indexes
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,6 +19,7 @@
 #include "access/relscan.h"
 #include "access/spgist_private.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "utils/datum.h"
 #include "utils/float.h"
@@ -27,7 +28,8 @@
 #include "utils/rel.h"
 
 typedef void (*storeRes_func) (SpGistScanOpaque so, ItemPointer heapPtr,
-							   Datum leafValue, bool isNull, bool recheck,
+							   Datum leafValue, bool isNull,
+							   SpGistLeafTuple leafTuple, bool recheck,
 							   bool recheckDistances, double *distances);
 
 /*
@@ -81,9 +83,15 @@ pairingheap_SpGistSearchItem_cmp(const pairingheap_node *a,
 static void
 spgFreeSearchItem(SpGistScanOpaque so, SpGistSearchItem *item)
 {
-	if (!so->state.attLeafType.attbyval &&
+	/* value is of type attType if isLeaf, else of type attLeafType */
+	/* (no, that is not backwards; yes, it's confusing) */
+	if (!(item->isLeaf ? so->state.attType.attbyval :
+		  so->state.attLeafType.attbyval) &&
 		DatumGetPointer(item->value) != NULL)
 		pfree(DatumGetPointer(item->value));
+
+	if (item->leafTuple)
+		pfree(item->leafTuple);
 
 	if (item->traversalValue)
 		pfree(item->traversalValue);
@@ -107,7 +115,7 @@ spgAllocSearchItem(SpGistScanOpaque so, bool isnull, double *distances)
 {
 	/* allocate distance array only for non-NULL items */
 	SpGistSearchItem *item =
-	palloc(SizeOfSpGistSearchItem(isnull ? 0 : so->numberOfNonNullOrderBys));
+		palloc(SizeOfSpGistSearchItem(isnull ? 0 : so->numberOfNonNullOrderBys));
 
 	item->isNull = isnull;
 
@@ -122,7 +130,7 @@ static void
 spgAddStartItem(SpGistScanOpaque so, bool isnull)
 {
 	SpGistSearchItem *startEntry =
-	spgAllocSearchItem(so, isnull, so->zeroDistances);
+		spgAllocSearchItem(so, isnull, so->zeroDistances);
 
 	ItemPointerSet(&startEntry->heapPtr,
 				   isnull ? SPGIST_NULL_BLKNO : SPGIST_ROOT_BLKNO,
@@ -130,6 +138,7 @@ spgAddStartItem(SpGistScanOpaque so, bool isnull)
 	startEntry->isLeaf = false;
 	startEntry->level = 0;
 	startEntry->value = (Datum) 0;
+	startEntry->leafTuple = NULL;
 	startEntry->traversalValue = NULL;
 	startEntry->recheck = false;
 	startEntry->recheckDistances = false;
@@ -314,8 +323,14 @@ spgbeginscan(Relation rel, int keysz, int orderbysz)
 											 "SP-GiST traversal-value context",
 											 ALLOCSET_DEFAULT_SIZES);
 
-	/* Set up indexTupDesc and xs_hitupdesc in case it's an index-only scan */
-	so->indexTupDesc = scan->xs_hitupdesc = RelationGetDescr(rel);
+	/*
+	 * Set up reconTupDesc and xs_hitupdesc in case it's an index-only scan,
+	 * making sure that the key column is shown as being of type attType.
+	 * (It's rather annoying to do this work when it might be wasted, but for
+	 * most opclasses we can re-use the index reldesc instead of making one.)
+	 */
+	so->reconTupDesc = scan->xs_hitupdesc =
+		getSpGistTupleDesc(rel, &so->state.attType);
 
 	/* Allocate various arrays needed for order-by scans */
 	if (scan->numberOfOrderBys > 0)
@@ -405,6 +420,9 @@ spgrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 
 	/* set up starting queue entries */
 	resetSpGistScanOpaque(so);
+
+	/* count an indexscan for stats */
+	pgstat_count_index_scan(scan->indexRelation);
 }
 
 void
@@ -417,6 +435,10 @@ spgendscan(IndexScanDesc scan)
 
 	if (so->keyData)
 		pfree(so->keyData);
+
+	if (so->state.leafTupDesc &&
+		so->state.leafTupDesc != RelationGetDescr(so->state.index))
+		FreeTupleDesc(so->state.leafTupDesc);
 
 	if (so->state.deadTupleStorage)
 		pfree(so->state.deadTupleStorage);
@@ -438,18 +460,44 @@ spgendscan(IndexScanDesc scan)
  * Leaf SpGistSearchItem constructor, called in queue context
  */
 static SpGistSearchItem *
-spgNewHeapItem(SpGistScanOpaque so, int level, ItemPointer heapPtr,
+spgNewHeapItem(SpGistScanOpaque so, int level, SpGistLeafTuple leafTuple,
 			   Datum leafValue, bool recheck, bool recheckDistances,
 			   bool isnull, double *distances)
 {
 	SpGistSearchItem *item = spgAllocSearchItem(so, isnull, distances);
 
 	item->level = level;
-	item->heapPtr = *heapPtr;
-	/* copy value to queue cxt out of tmp cxt */
-	item->value = isnull ? (Datum) 0 :
-		datumCopy(leafValue, so->state.attLeafType.attbyval,
-				  so->state.attLeafType.attlen);
+	item->heapPtr = leafTuple->heapPtr;
+
+	/*
+	 * If we need the reconstructed value, copy it to queue cxt out of tmp
+	 * cxt.  Caution: the leaf_consistent method may not have supplied a value
+	 * if we didn't ask it to, and mildly-broken methods might supply one of
+	 * the wrong type.  The correct leafValue type is attType not leafType.
+	 */
+	if (so->want_itup)
+	{
+		item->value = isnull ? (Datum) 0 :
+			datumCopy(leafValue, so->state.attType.attbyval,
+					  so->state.attType.attlen);
+
+		/*
+		 * If we're going to need to reconstruct INCLUDE attributes, store the
+		 * whole leaf tuple so we can get the INCLUDE attributes out of it.
+		 */
+		if (so->state.leafTupDesc->natts > 1)
+		{
+			item->leafTuple = palloc(leafTuple->size);
+			memcpy(item->leafTuple, leafTuple, leafTuple->size);
+		}
+		else
+			item->leafTuple = NULL;
+	}
+	else
+	{
+		item->value = (Datum) 0;
+		item->leafTuple = NULL;
+	}
 	item->traversalValue = NULL;
 	item->isLeaf = true;
 	item->recheck = recheck;
@@ -497,6 +545,7 @@ spgLeafTest(SpGistScanOpaque so, SpGistSearchItem *item,
 		in.nkeys = so->numberOfKeys;
 		in.orderbys = so->orderByData;
 		in.norderbys = so->numberOfNonNullOrderBys;
+		Assert(!item->isLeaf);	/* else reconstructedValue would be wrong type */
 		in.reconstructedValue = item->value;
 		in.traversalValue = item->traversalValue;
 		in.level = item->level;
@@ -528,7 +577,7 @@ spgLeafTest(SpGistScanOpaque so, SpGistSearchItem *item,
 			/* the scan is ordered -> add the item to the queue */
 			MemoryContext oldCxt = MemoryContextSwitchTo(so->traversalCxt);
 			SpGistSearchItem *heapItem = spgNewHeapItem(so, item->level,
-														&leafTuple->heapPtr,
+														leafTuple,
 														leafValue,
 														recheck,
 														recheckDistances,
@@ -544,7 +593,7 @@ spgLeafTest(SpGistScanOpaque so, SpGistSearchItem *item,
 			/* non-ordered scan, so report the item right away */
 			Assert(!recheckDistances);
 			storeRes(so, &leafTuple->heapPtr, leafValue, isnull,
-					 recheck, false, NULL);
+					 leafTuple, recheck, false, NULL);
 			*reportedSome = true;
 		}
 	}
@@ -563,6 +612,7 @@ spgInitInnerConsistentIn(spgInnerConsistentIn *in,
 	in->orderbys = so->orderByData;
 	in->nkeys = so->numberOfKeys;
 	in->norderbys = so->numberOfNonNullOrderBys;
+	Assert(!item->isLeaf);		/* else reconstructedValue would be wrong type */
 	in->reconstructedValue = item->value;
 	in->traversalMemoryContext = so->traversalCxt;
 	in->traversalValue = item->traversalValue;
@@ -589,11 +639,14 @@ spgMakeInnerItem(SpGistScanOpaque so,
 		: parentItem->level;
 
 	/* Must copy value out of temp context */
+	/* (recall that reconstructed values are of type leafType) */
 	item->value = out->reconstructedValues
 		? datumCopy(out->reconstructedValues[i],
 					so->state.attLeafType.attbyval,
 					so->state.attLeafType.attlen)
 		: (Datum) 0;
+
+	item->leafTuple = NULL;
 
 	/*
 	 * Elements of out.traversalValues should be allocated in
@@ -703,7 +756,7 @@ enum SpGistSpecialOffsetNumbers
 {
 	SpGistBreakOffsetNumber = InvalidOffsetNumber,
 	SpGistRedirectOffsetNumber = MaxOffsetNumber + 1,
-	SpGistErrorOffsetNumber = MaxOffsetNumber + 2
+	SpGistErrorOffsetNumber = MaxOffsetNumber + 2,
 };
 
 static OffsetNumber
@@ -715,7 +768,7 @@ spgTestLeafTuple(SpGistScanOpaque so,
 				 storeRes_func storeRes)
 {
 	SpGistLeafTuple leafTuple = (SpGistLeafTuple)
-	PageGetItem(page, PageGetItemId(page, offset));
+		PageGetItem(page, PageGetItemId(page, offset));
 
 	if (leafTuple->tupstate != SPGIST_LIVE)
 	{
@@ -736,7 +789,7 @@ spgTestLeafTuple(SpGistScanOpaque so,
 				/* dead tuple should be first in chain */
 				Assert(offset == ItemPointerGetOffsetNumber(&item->heapPtr));
 				/* No live entries on this page */
-				Assert(leafTuple->nextOffset == InvalidOffsetNumber);
+				Assert(SGLT_GET_NEXTOFFSET(leafTuple) == InvalidOffsetNumber);
 				return SpGistBreakOffsetNumber;
 			}
 		}
@@ -750,7 +803,7 @@ spgTestLeafTuple(SpGistScanOpaque so,
 
 	spgLeafTest(so, item, leafTuple, isnull, reportedSome, storeRes);
 
-	return leafTuple->nextOffset;
+	return SGLT_GET_NEXTOFFSET(leafTuple);
 }
 
 /*
@@ -762,7 +815,7 @@ spgTestLeafTuple(SpGistScanOpaque so,
  */
 static void
 spgWalk(Relation index, SpGistScanOpaque so, bool scanWholeIndex,
-		storeRes_func storeRes, Snapshot snapshot)
+		storeRes_func storeRes)
 {
 	Buffer		buffer = InvalidBuffer;
 	bool		reportedSome = false;
@@ -783,7 +836,8 @@ redirect:
 			/* We store heap items in the queue only in case of ordered search */
 			Assert(so->numberOfNonNullOrderBys > 0);
 			storeRes(so, &item->heapPtr, item->value, item->isNull,
-					 item->recheck, item->recheckDistances, item->distances);
+					 item->leafTuple, item->recheck,
+					 item->recheckDistances, item->distances);
 			reportedSome = true;
 		}
 		else
@@ -808,7 +862,6 @@ redirect:
 			/* else new pointer points to the same page, no work needed */
 
 			page = BufferGetPage(buffer);
-			TestForOldSnapshot(snapshot, index, page);
 
 			isnull = SpGistPageStoresNulls(page) ? true : false;
 
@@ -842,7 +895,7 @@ redirect:
 			else				/* page is inner */
 			{
 				SpGistInnerTuple innerTuple = (SpGistInnerTuple)
-				PageGetItem(page, PageGetItemId(page, offset));
+					PageGetItem(page, PageGetItemId(page, offset));
 
 				if (innerTuple->tupstate != SPGIST_LIVE)
 				{
@@ -876,8 +929,9 @@ redirect:
 /* storeRes subroutine for getbitmap case */
 static void
 storeBitmap(SpGistScanOpaque so, ItemPointer heapPtr,
-			Datum leafValue, bool isnull, bool recheck, bool recheckDistances,
-			double *distances)
+			Datum leafValue, bool isnull,
+			SpGistLeafTuple leafTuple, bool recheck,
+			bool recheckDistances, double *distances)
 {
 	Assert(!recheckDistances && !distances);
 	tbm_add_tuples(so->tbm, heapPtr, 1, recheck);
@@ -895,7 +949,7 @@ spggetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	so->tbm = tbm;
 	so->ntids = 0;
 
-	spgWalk(scan->indexRelation, so, true, storeBitmap, scan->xs_snapshot);
+	spgWalk(scan->indexRelation, so, true, storeBitmap);
 
 	return so->ntids;
 }
@@ -903,8 +957,9 @@ spggetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 /* storeRes subroutine for gettuple case */
 static void
 storeGettuple(SpGistScanOpaque so, ItemPointer heapPtr,
-			  Datum leafValue, bool isnull, bool recheck, bool recheckDistances,
-			  double *nonNullDistances)
+			  Datum leafValue, bool isnull,
+			  SpGistLeafTuple leafTuple, bool recheck,
+			  bool recheckDistances, double *nonNullDistances)
 {
 	Assert(so->nPtrs < MaxIndexTuplesPerPage);
 	so->heapPtrs[so->nPtrs] = *heapPtr;
@@ -918,7 +973,7 @@ storeGettuple(SpGistScanOpaque so, ItemPointer heapPtr,
 		else
 		{
 			IndexOrderByDistance *distances =
-			palloc(sizeof(distances[0]) * so->numberOfOrderBys);
+				palloc(sizeof(distances[0]) * so->numberOfOrderBys);
 			int			i;
 
 			for (i = 0; i < so->numberOfOrderBys; i++)
@@ -949,9 +1004,20 @@ storeGettuple(SpGistScanOpaque so, ItemPointer heapPtr,
 		 * Reconstruct index data.  We have to copy the datum out of the temp
 		 * context anyway, so we may as well create the tuple here.
 		 */
-		so->reconTups[so->nPtrs] = heap_form_tuple(so->indexTupDesc,
-												   &leafValue,
-												   &isnull);
+		Datum		leafDatums[INDEX_MAX_KEYS];
+		bool		leafIsnulls[INDEX_MAX_KEYS];
+
+		/* We only need to deform the old tuple if it has INCLUDE attributes */
+		if (so->state.leafTupDesc->natts > 1)
+			spgDeformLeafTuple(leafTuple, so->state.leafTupDesc,
+							   leafDatums, leafIsnulls, isnull);
+
+		leafDatums[spgKeyColumn] = leafValue;
+		leafIsnulls[spgKeyColumn] = isnull;
+
+		so->reconTups[so->nPtrs] = heap_form_tuple(so->reconTupDesc,
+												   leafDatums,
+												   leafIsnulls);
 	}
 	so->nPtrs++;
 }
@@ -1004,8 +1070,7 @@ spggettuple(IndexScanDesc scan, ScanDirection dir)
 		}
 		so->iPtr = so->nPtrs = 0;
 
-		spgWalk(scan->indexRelation, so, false, storeGettuple,
-				scan->xs_snapshot);
+		spgWalk(scan->indexRelation, so, false, storeGettuple);
 
 		if (so->nPtrs == 0)
 			break;				/* must have completed scan */
@@ -1018,6 +1083,10 @@ bool
 spgcanreturn(Relation index, int attno)
 {
 	SpGistCache *cache;
+
+	/* INCLUDE attributes can always be fetched for index-only scans */
+	if (attno > 1)
+		return true;
 
 	/* We can do it if the opclass config function says so */
 	cache = spgGetCache(index);
